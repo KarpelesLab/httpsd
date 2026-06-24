@@ -46,6 +46,24 @@ fn run() -> httpsd::Result<()> {
         }
     };
 
+    // Optionally serve HTTP/3 on UDP alongside the TCP server. It runs on its
+    // own thread; the TCP server (HTTP/1.1 + HTTP/2) stays in the foreground.
+    #[cfg(feature = "h3")]
+    if opts.http3 {
+        let h3 = opts.build_server()?;
+        let addr = opts.listen.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = h3.run_h3() {
+                eprintln!("httpsd: http/3 disabled: {e}");
+            }
+        });
+        eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
+    }
+    #[cfg(not(feature = "h3"))]
+    if opts.http3 {
+        eprintln!("httpsd: warning: built without the `h3` feature; --http3 ignored");
+    }
+
     let server = opts.build_server()?;
     let addr = opts.listen.clone();
     let scheme = if opts.is_tls() { "https" } else { "http" };
@@ -67,6 +85,7 @@ OPTIONS:
         --tls-key FILE      PEM private key
         --self-signed[=H]   generate a self-signed certificate (default host localhost)
         --workers N         number of worker threads
+        --http3             also serve HTTP/3 over QUIC/UDP (requires TLS)
         --no-compress       disable response compression
     -h, --help              print this help
 ";
@@ -79,6 +98,7 @@ struct Options {
     tls_key: Option<String>,
     self_signed: Option<String>,
     workers: Option<usize>,
+    http3: bool,
     no_compress: bool,
 }
 
@@ -92,6 +112,7 @@ impl Options {
             tls_key: None,
             self_signed: None,
             workers: None,
+            http3: false,
             no_compress: false,
         };
         let mut saw_dir = false;
@@ -109,6 +130,7 @@ impl Options {
                 "--tls-cert" => opts.tls_cert = Some(take_value(args, &mut i, arg)?),
                 "--tls-key" => opts.tls_key = Some(take_value(args, &mut i, arg)?),
                 "--self-signed" => opts.self_signed = Some("localhost".to_owned()),
+                "--http3" => opts.http3 = true,
                 "--workers" => {
                     let v = take_value(args, &mut i, arg)?;
                     opts.workers = Some(v.parse().map_err(|_| format!("invalid --workers: {v}"))?);

@@ -30,6 +30,8 @@ mod threadpool;
 mod tokio;
 #[cfg(feature = "rt-mio")]
 mod mio;
+#[cfg(feature = "h3")]
+mod quic;
 
 /// A default handler used when none is configured: replies `404` to everything.
 fn not_found(_req: &Request) -> Response {
@@ -164,6 +166,19 @@ impl Server {
             #[cfg(feature = "tls")]
             self.tls,
         )
+    }
+
+    /// Run an HTTP/3 server on a QUIC/UDP event loop, listening on the same
+    /// address(es) as the TCP server (but over UDP). Requires TLS to be
+    /// configured (HTTP/3 is always encrypted). Blocks the calling thread.
+    #[cfg(feature = "h3")]
+    pub fn run_h3(self) -> Result<()> {
+        let acceptor = self
+            .tls
+            .clone()
+            .ok_or_else(|| Error::Config("HTTP/3 requires TLS (set an acceptor via .tls())".into()))?;
+        let cfg = self.session_config();
+        quic::run(self.addrs.clone(), cfg, acceptor)
     }
 }
 

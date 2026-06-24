@@ -30,7 +30,7 @@ compress = ["dep:compcol"]
 h2 = ["tls", "dep:compcol", "compcol/hpack"]
 # HTTP/3 (RFC 9114) over QUIC/UDP. QUIC comes from `purecrypto`, QPACK from
 # `compcol`. Brings its own UDP server loop (see `Server::run_h3`).
-h3 = ["tls", "dep:compcol", "compcol/qpack"]
+h3 = ["tls", "dep:compcol", "compcol/qpack", "compcol/hpack"]
 # TOML configuration file loading.
 config = ["dep:serde", "dep:toml"]
 # The `httpsd` command-line binary. Pulls in config + the thread-pool runtime

@@ -50,6 +50,9 @@ pub mod tls;
 #[cfg(feature = "h2")]
 pub mod h2;
 
+#[cfg(feature = "h3")]
+pub mod h3;
+
 pub mod session;
 
 #[cfg(feature = "config")]

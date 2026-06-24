@@ -27,6 +27,14 @@ fn tls_err<E: std::fmt::Debug>(e: E) -> Error {
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<Config>,
+    /// The certificate chain (DER, leaf first) and the key as PEM, retained so
+    /// the same identity can also mint per-connection QUIC configs for HTTP/3
+    /// (`QuicConfig`/`SigningKey` are neither `Clone` nor reusable across
+    /// connections, so the key PEM is re-parsed on demand).
+    #[cfg(feature = "h3")]
+    chain: Vec<Vec<u8>>,
+    #[cfg(feature = "h3")]
+    key_pem: Arc<String>,
 }
 
 impl TlsAcceptor {
@@ -40,8 +48,7 @@ impl TlsAcceptor {
         if chain.is_empty() {
             return Err(Error::Tls("no certificates found in PEM".into()));
         }
-        let key = load_signing_key(key_pem)?;
-        Ok(TlsAcceptor::from_identity(chain, key))
+        TlsAcceptor::build(chain, key_pem.to_owned())
     }
 
     /// Build an acceptor by reading a certificate file and a key file.
@@ -69,11 +76,11 @@ impl TlsAcceptor {
         let cert = Certificate::self_signed_with_sans(&key, &name, &validity, 1, false, hostnames)
             .map_err(tls_err)?;
         let chain = vec![cert.to_der().to_vec()];
-        let boxed = BoxedRsaPrivateKey::from_pkcs1_pem(&key.to_pkcs1_pem()).map_err(tls_err)?;
-        Ok(TlsAcceptor::from_identity(chain, SigningKey::Rsa(boxed)))
+        TlsAcceptor::build(chain, key.to_pkcs1_pem())
     }
 
-    fn from_identity(chain: Vec<Vec<u8>>, key: SigningKey) -> TlsAcceptor {
+    fn build(chain: Vec<Vec<u8>>, key_pem: String) -> Result<TlsAcceptor> {
+        let key = load_signing_key(&key_pem)?;
         // Offer HTTP/2 ahead of HTTP/1.1 when compiled in; the client picks.
         let alpn = if cfg!(feature = "h2") {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
@@ -83,12 +90,16 @@ impl TlsAcceptor {
         let config = Config::builder()
             .rng(Arc::new(OsRng))
             .tls_only()
-            .identity(chain, key)
+            .identity(chain.clone(), key)
             .alpn(alpn)
             .build();
-        TlsAcceptor {
+        Ok(TlsAcceptor {
             config: Arc::new(config),
-        }
+            #[cfg(feature = "h3")]
+            chain,
+            #[cfg(feature = "h3")]
+            key_pem: Arc::new(key_pem),
+        })
     }
 
     /// Begin a new server-side TLS connection. The handshake is driven by
@@ -96,6 +107,44 @@ impl TlsAcceptor {
     pub fn accept(&self) -> Result<TlsStream> {
         let conn = Connection::server(&self.config).map_err(tls_err)?;
         Ok(TlsStream { conn })
+    }
+
+    /// Build a fresh server [`QuicConfig`](purecrypto::quic::QuicConfig) for one
+    /// HTTP/3 connection, advertising the `h3` ALPN. A new config (and freshly
+    /// parsed signing key) is needed per connection because neither type is
+    /// reusable.
+    // `QuicConfig` is `#[non_exhaustive]`, so it can only be built by mutating
+    // a `default()` — hence the field reassignment.
+    #[cfg(feature = "h3")]
+    #[allow(clippy::field_reassign_with_default)]
+    pub fn quic_config(&self) -> Result<purecrypto::quic::QuicConfig> {
+        use purecrypto::quic::{QuicConfig, TransportParameters};
+
+        let key = load_signing_key(&self.key_pem)?;
+        let tls = Config::builder()
+            .rng(Arc::new(OsRng))
+            .tls_only()
+            .identity(self.chain.clone(), key)
+            .alpn(vec![b"h3".to_vec()])
+            .build();
+
+        let transport_params = TransportParameters {
+            max_idle_timeout_ms: Some(30_000),
+            max_udp_payload_size: Some(1500),
+            initial_max_data: Some(8 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 20),
+            initial_max_stream_data_bidi_remote: Some(1 << 20),
+            initial_max_stream_data_uni: Some(1 << 20),
+            initial_max_streams_bidi: Some(128),
+            initial_max_streams_uni: Some(8),
+            active_connection_id_limit: Some(2),
+            ..TransportParameters::default()
+        };
+
+        let mut cfg = QuicConfig::default();
+        cfg.tls = tls;
+        cfg.transport_params = transport_params;
+        Ok(cfg)
     }
 }
 

@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use compcol::hpack::{HeaderField, HpackDecoder, HpackEncoder};
 
 use super::frame::{self, errcode, flag, ftype, settings, FrameHeader, CLIENT_PREFACE};
-use crate::proto::{Headers, Limits, Method, Request, Response, StatusCode, Version};
+use crate::proto::{
+    request_head, Headers, Limits, Request, RequestHead, Response, StatusCode, Version,
+};
 
 const DEFAULT_WINDOW: i64 = 65_535;
 const DEFAULT_MAX_FRAME: usize = 16_384;
@@ -92,7 +94,7 @@ pub struct H2Conn {
     ready: std::collections::VecDeque<(u32, Request)>,
     /// Decoded request heads for streams whose body is still arriving (kept off
     /// `Stream` to avoid borrow conflicts inside the frame loop).
-    pending_heads: BTreeMap<u32, RequestParts>,
+    pending_heads: BTreeMap<u32, RequestHead>,
 
     goaway_sent: bool,
     closed: bool,
@@ -358,7 +360,8 @@ impl H2Conn {
         };
 
         let end_stream = self.streams.get(&sid).map(|s| s.end_stream_recv).unwrap_or(false);
-        match build_request(&fields) {
+        let head = request_head(fields.iter().map(|f| (f.name.as_slice(), f.value.as_slice())));
+        match head {
             Ok(parts) => {
                 if end_stream {
                     self.deliver(sid, parts, Vec::new());
@@ -415,11 +418,11 @@ impl H2Conn {
             }
     }
 
-    fn deliver(&mut self, sid: u32, parts: RequestParts, body: Vec<u8>) {
+    fn deliver(&mut self, sid: u32, head: RequestHead, body: Vec<u8>) {
         if let Some(s) = self.streams.get_mut(&sid) {
             s.delivered = true;
         }
-        let req = Request::new(parts.method, parts.target, Version::Http2, parts.headers, body);
+        let req = Request::new(head.method, head.target, Version::Http2, head.headers, body);
         self.ready.push_back((sid, req));
     }
 
@@ -552,82 +555,10 @@ impl H2Conn {
     }
 }
 
-/// The parsed pseudo/regular headers of a request, before the body is known.
-struct RequestParts {
-    method: Method,
-    target: String,
-    headers: Headers,
-}
-
-/// Build request parts from a decoded HPACK field list, validating the
-/// HTTP/2 pseudo-header rules (RFC 9113 §8.3).
-fn build_request(fields: &[HeaderField]) -> Result<RequestParts, ()> {
-    let mut method: Option<String> = None;
-    let mut path: Option<String> = None;
-    let mut authority: Option<String> = None;
-    let mut scheme: Option<String> = None;
-    let mut headers = Headers::new();
-    let mut seen_regular = false;
-
-    for f in fields {
-        if f.name.first() == Some(&b':') {
-            if seen_regular {
-                return Err(()); // pseudo-header after a regular header
-            }
-            let val = String::from_utf8_lossy(&f.value).into_owned();
-            match f.name.as_slice() {
-                b":method" => set_once(&mut method, val)?,
-                b":path" => set_once(&mut path, val)?,
-                b":authority" => set_once(&mut authority, val)?,
-                b":scheme" => set_once(&mut scheme, val)?,
-                _ => return Err(()), // unknown/invalid pseudo-header
-            }
-        } else {
-            // Field names must be lowercase, and connection-specific headers
-            // are forbidden in HTTP/2 (RFC 9113 §8.2.2).
-            if f.name.iter().any(|b| b.is_ascii_uppercase()) {
-                return Err(());
-            }
-            match f.name.as_slice() {
-                b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
-                | b"upgrade" => return Err(()),
-                b"te" if f.value.as_slice() != b"trailers" => return Err(()),
-                _ => {}
-            }
-            seen_regular = true;
-            let name = String::from_utf8_lossy(&f.name).into_owned();
-            let value = String::from_utf8_lossy(&f.value).into_owned();
-            headers.append(name, value);
-        }
-    }
-
-    let method = Method::parse(&method.ok_or(())?);
-    // CONNECT aside, :scheme and :path are required.
-    let target = path.ok_or(())?;
-    if target.is_empty() {
-        return Err(());
-    }
-    if let Some(auth) = authority {
-        headers.set_if_absent("host", auth);
-    }
-    Ok(RequestParts {
-        method,
-        target,
-        headers,
-    })
-}
-
-fn set_once(slot: &mut Option<String>, value: String) -> Result<(), ()> {
-    if slot.is_some() {
-        return Err(());
-    }
-    *slot = Some(value);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::Method;
 
     /// Walk a buffer of frames, returning the concatenated HEADERS blocks and
     /// DATA payloads for `want_stream`.
@@ -731,27 +662,11 @@ mod tests {
     }
 }
 
-/// Build the HPACK field list for a response: `:status` first, then the
-/// (lowercased) regular headers, dropping anything forbidden in HTTP/2.
+/// Build the HPACK field list for a response from the shared response-header
+/// rules (`:status` first, hop-by-hop dropped, `server` defaulted).
 fn response_fields(status: StatusCode, headers: &Headers, server: Option<&str>) -> Vec<HeaderField> {
-    let mut fields = Vec::with_capacity(headers.len() + 2);
-    fields.push(HeaderField::new(b":status", status.code().to_string().as_bytes()));
-
-    let mut has_server = false;
-    for (name, value) in headers.iter() {
-        let lower = name.to_ascii_lowercase();
-        match lower.as_str() {
-            // Hop-by-hop / connection-specific headers are illegal in HTTP/2.
-            "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding"
-            | "upgrade" => continue,
-            "server" => has_server = true,
-            _ => {}
-        }
-        fields.push(HeaderField::new(lower.as_bytes(), value.as_bytes()));
-    }
-    if !has_server
-        && let Some(s) = server {
-            fields.push(HeaderField::new(b"server", s.as_bytes()));
-        }
-    fields
+    crate::proto::response_fields(status, headers, server)
+        .iter()
+        .map(|(n, v)| HeaderField::new(n, v))
+        .collect()
 }

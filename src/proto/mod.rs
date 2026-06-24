@@ -6,6 +6,8 @@
 //! the sockets.
 
 mod conn;
+#[cfg(any(feature = "h2", feature = "h3"))]
+mod fields;
 mod headers;
 mod method;
 mod request;
@@ -22,3 +24,5 @@ pub use status::StatusCode;
 pub use version::Version;
 
 pub(crate) use conn::http_date;
+#[cfg(any(feature = "h2", feature = "h3"))]
+pub(crate) use fields::{request_head, response_fields, RequestHead};
