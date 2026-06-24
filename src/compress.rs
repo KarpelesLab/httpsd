@@ -67,10 +67,10 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
         return resp;
     }
     // Skip already-compressed media types.
-    if let Some(ct) = resp.headers().get("content-type") {
-        if crate::mime::is_precompressed(ct) {
-            return resp;
-        }
+    if let Some(ct) = resp.headers().get("content-type")
+        && crate::mime::is_precompressed(ct)
+    {
+        return resp;
     }
 
     let accept = req.headers().get("accept-encoding").unwrap_or("");

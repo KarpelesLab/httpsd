@@ -100,18 +100,14 @@ impl Session {
 
     /// Run the handler for every fully-received request, serializing each reply.
     fn pump(&mut self) -> Result<()> {
-        loop {
-            match self.conn.poll_request() {
-                Ok(Some(req)) => {
-                    let resp = self.cfg.handler.handle(&req);
-                    #[cfg(feature = "compress")]
-                    let resp = compress::compress_response(&req, resp, &self.cfg.compression);
-                    self.conn.respond(resp);
-                }
-                // A protocol error has already queued an error response and
-                // marked the connection for close; stop pumping.
-                Ok(None) | Err(_) => break,
-            }
+        // `poll_request` yields `Ok(None)` when more bytes are needed and
+        // `Err(..)` after queueing an error response (and marking close); both
+        // simply end the pump.
+        while let Ok(Some(req)) = self.conn.poll_request() {
+            let resp = self.cfg.handler.handle(&req);
+            #[cfg(feature = "compress")]
+            let resp = compress::compress_response(&req, resp, &self.cfg.compression);
+            self.conn.respond(resp);
         }
         Ok(())
     }

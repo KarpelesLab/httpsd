@@ -62,7 +62,9 @@ impl StatusCode {
 
 impl From<u16> for StatusCode {
     /// Map a bare numeric code to a known reason phrase, falling back to a
-    /// generic phrase for the class.
+    /// generic phrase for the class. The specific arms intentionally precede
+    /// the class-range fallbacks.
+    #[allow(clippy::match_overlapping_arm)]
     fn from(code: u16) -> StatusCode {
         let reason = match code {
             100 => "Continue",

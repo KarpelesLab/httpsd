@@ -52,6 +52,7 @@ mio = { version = "1", optional = true, features = ["os-poll", "net"] }
 
 [dev-dependencies]
 purecrypto = { path = "../purecrypto" }
+compcol = { path = "../compcol", default-features = false, features = ["std", "gzip"] }
 
 [package.metadata.docs.rs]
 all-features = true
