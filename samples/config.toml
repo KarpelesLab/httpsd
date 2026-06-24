@@ -1,0 +1,26 @@
+# Example httpsd configuration. Run with: httpsd -c samples/config.toml
+
+# One address, or a list: listen = ["127.0.0.1:8080", "[::1]:8080"]
+listen = "127.0.0.1:8080"
+
+# Directory to serve static files from.
+root = "./public"
+
+# Optional: the value sent in the `Server` response header.
+server_name = "httpsd"
+
+# Optional: worker thread count (thread-pool runtime). Defaults to CPU count.
+# workers = 8
+
+# Uncomment to enable HTTPS with a real certificate:
+# [tls]
+# cert = "cert.pem"   # PEM chain, leaf first
+# key  = "key.pem"    # PEM private key (PKCS#8, PKCS#1 RSA, or SEC1 EC)
+
+# ...or generate an ephemeral self-signed cert for local development:
+# [tls]
+# self_signed = ["localhost"]
+
+[compress]
+enabled = true
+min_size = 256

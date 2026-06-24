@@ -1,0 +1,57 @@
+[package]
+name = "httpsd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A pure-Rust HTTP/HTTPS server — usable as a sans-I/O library with pluggable runtimes (thread pool, tokio, mio) or as a CLI that serves a directory or a TOML config."
+repository = "https://github.com/KarpelesLab/httpsd"
+license = "MIT"
+keywords = ["http", "https", "server", "tls", "sans-io"]
+categories = ["network-programming", "web-programming::http-server"]
+readme = "README.md"
+
+[lib]
+name = "httpsd"
+
+[[bin]]
+name = "httpsd"
+required-features = ["cli"]
+
+[features]
+# The default build is a complete, self-contained HTTPS server CLI: a worker
+# thread pool, TLS, response compression, and TOML config loading.
+default = ["cli", "rt-threadpool", "tls", "compress"]
+
+# TLS / HTTPS support, built on the sans-I/O `purecrypto::tls` engine.
+tls = ["dep:purecrypto"]
+# Response compression (gzip / deflate / zlib) via `compcol`.
+compress = ["dep:compcol"]
+# TOML configuration file loading.
+config = ["dep:serde", "dep:toml"]
+# The `httpsd` command-line binary. Pulls in config + the thread-pool runtime
+# unless another runtime is selected.
+cli = ["config", "rt-threadpool"]
+
+# --- runtime drivers (pick one or more; all drive the same sans-I/O core) ---
+# Blocking std::net listener backed by a fixed worker thread pool.
+rt-threadpool = []
+# Asynchronous runtime built on tokio.
+rt-tokio = ["dep:tokio"]
+# Single-/few-thread readiness event loop built on mio.
+rt-mio = ["dep:mio"]
+
+[dependencies]
+# purecrypto's `tls` module pulls in DTLS/QUIC paths that are wired to the
+# default feature set, so we use its defaults rather than cherry-picking.
+purecrypto = { path = "../purecrypto", optional = true }
+compcol = { path = "../compcol", optional = true, default-features = false, features = ["std", "gzip", "deflate", "zlib"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+toml = { version = "0.8", optional = true }
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
+mio = { version = "1", optional = true, features = ["os-poll", "net"] }
+
+[dev-dependencies]
+purecrypto = { path = "../purecrypto" }
+
+[package.metadata.docs.rs]
+all-features = true
