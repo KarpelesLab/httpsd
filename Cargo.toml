@@ -19,13 +19,18 @@ required-features = ["cli"]
 
 [features]
 # The default build is a complete, self-contained HTTPS server CLI: a worker
-# thread pool, TLS, response compression, and TOML config loading.
-default = ["cli", "rt-threadpool", "tls", "compress"]
+# thread pool, TLS, HTTP/2, response compression, and TOML config loading.
+default = ["cli", "rt-threadpool", "tls", "compress", "h2"]
 
 # TLS / HTTPS support, built on the sans-I/O `purecrypto::tls` engine.
 tls = ["dep:purecrypto"]
 # Response compression (gzip / deflate / zlib) via `compcol`.
 compress = ["dep:compcol"]
+# HTTP/2 (RFC 9113) over TLS, negotiated via ALPN. HPACK comes from `compcol`.
+h2 = ["tls", "dep:compcol", "compcol/hpack"]
+# HTTP/3 (RFC 9114) over QUIC/UDP. QUIC comes from `purecrypto`, QPACK from
+# `compcol`. Brings its own UDP server loop (see `Server::run_h3`).
+h3 = ["tls", "dep:compcol", "compcol/qpack"]
 # TOML configuration file loading.
 config = ["dep:serde", "dep:toml"]
 # The `httpsd` command-line binary. Pulls in config + the thread-pool runtime

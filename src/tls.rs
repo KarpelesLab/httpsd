@@ -74,11 +74,17 @@ impl TlsAcceptor {
     }
 
     fn from_identity(chain: Vec<Vec<u8>>, key: SigningKey) -> TlsAcceptor {
+        // Offer HTTP/2 ahead of HTTP/1.1 when compiled in; the client picks.
+        let alpn = if cfg!(feature = "h2") {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
         let config = Config::builder()
             .rng(Arc::new(OsRng))
             .tls_only()
             .identity(chain, key)
-            .alpn(vec![b"http/1.1".to_vec()])
+            .alpn(alpn)
             .build();
         TlsAcceptor {
             config: Arc::new(config),
@@ -157,6 +163,12 @@ impl TlsStream {
     /// Whether the TLS handshake has completed.
     pub fn is_handshake_complete(&self) -> bool {
         self.conn.is_handshake_complete()
+    }
+
+    /// The ALPN protocol negotiated during the handshake (e.g. `b"h2"` or
+    /// `b"http/1.1"`), once available.
+    pub fn alpn_protocol(&self) -> Option<Vec<u8>> {
+        self.conn.alpn_selected().map(|p| p.to_vec())
     }
 
     /// Begin a clean shutdown (queues a `close_notify`).

@@ -1,19 +1,22 @@
 //! [`Session`] — the sans-I/O glue between a socket's byte stream and a response.
 //!
-//! A `Session` owns the [`H1Conn`] HTTP engine, an optional TLS transport, and
-//! the shared [`Handler`]. Runtimes feed it the bytes that arrive on a socket
-//! and write back the bytes it produces; the session takes care of decrypting,
-//! parsing, invoking the handler (with optional compression), serializing, and
-//! re-encrypting. It performs no I/O itself.
+//! A `Session` owns an HTTP protocol engine (HTTP/1.x, or HTTP/2 when the TLS
+//! client negotiates `h2` via ALPN), an optional TLS transport, and the shared
+//! [`Handler`]. Runtimes feed it the bytes that arrive on a socket and write
+//! back the bytes it produces; the session decrypts, parses, invokes the
+//! handler (with optional compression), serializes, and re-encrypts. It
+//! performs no I/O itself.
 
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::handler::Handler;
-use crate::proto::{H1Conn, Limits};
+use crate::proto::{H1Conn, Limits, Request, Response};
 
 #[cfg(feature = "compress")]
 use crate::compress;
+#[cfg(feature = "h2")]
+use crate::h2::H2Conn;
 
 /// The transport beneath the HTTP engine: either a plain byte passthrough or a
 /// TLS layer.
@@ -21,6 +24,57 @@ enum Transport {
     Plain,
     #[cfg(feature = "tls")]
     Tls(Box<crate::tls::TlsStream>),
+}
+
+impl Transport {
+    /// Turn received wire bytes into plaintext (decrypting under TLS).
+    fn decrypt(&mut self, wire_in: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Transport::Plain => Ok(wire_in.to_vec()),
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => {
+                stream.feed(wire_in)?;
+                stream.recv_all()
+            }
+        }
+    }
+
+    /// Turn application bytes into wire bytes (encrypting under TLS, and
+    /// flushing any pending handshake records).
+    fn encrypt(&mut self, app: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Transport::Plain => Ok(app.to_vec()),
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => {
+                stream.send(app)?;
+                stream.pop_all()
+            }
+        }
+    }
+
+    fn handshaking(&self) -> bool {
+        match self {
+            Transport::Plain => false,
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => !stream.is_handshake_complete(),
+        }
+    }
+
+    #[allow(unused)]
+    fn alpn(&self) -> Option<Vec<u8>> {
+        match self {
+            Transport::Plain => None,
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => stream.alpn_protocol(),
+        }
+    }
+}
+
+/// The chosen application protocol engine for a connection.
+enum Engine {
+    H1(H1Conn),
+    #[cfg(feature = "h2")]
+    H2(Box<H2Conn>),
 }
 
 /// Shared, per-server settings a [`Session`] needs. Cheap to clone.
@@ -52,95 +106,127 @@ impl SessionConfig {
 
 /// A single HTTP(S) connection in progress.
 pub struct Session {
-    conn: H1Conn,
+    /// `None` until the protocol is known (after the TLS handshake).
+    engine: Option<Engine>,
     transport: Transport,
     cfg: SessionConfig,
 }
 
 impl Session {
-    /// Create a plaintext (HTTP) session.
+    /// Create a plaintext (HTTP/1.x) session.
     pub fn plain(cfg: SessionConfig) -> Session {
-        let mut conn = H1Conn::new(cfg.limits);
-        conn.set_server_name(cfg.server_name.clone());
+        let engine = Engine::H1(Self::new_h1(&cfg));
         Session {
-            conn,
+            engine: Some(engine),
             transport: Transport::Plain,
             cfg,
         }
     }
 
-    /// Create a TLS (HTTPS) session wrapping an accepted [`TlsStream`].
+    /// Create a TLS (HTTPS) session wrapping an accepted [`TlsStream`]. The
+    /// protocol (HTTP/1.1 or HTTP/2) is chosen once ALPN is known.
     #[cfg(feature = "tls")]
     pub fn tls(cfg: SessionConfig, stream: crate::tls::TlsStream) -> Session {
-        let mut conn = H1Conn::new(cfg.limits);
-        conn.set_server_name(cfg.server_name.clone());
         Session {
-            conn,
+            engine: None,
             transport: Transport::Tls(Box::new(stream)),
             cfg,
         }
     }
 
-    /// Feed bytes received from the socket. Decrypts (if TLS), parses any
-    /// complete requests, runs the handler, and queues serialized responses.
-    pub fn received(&mut self, wire_in: &[u8]) -> Result<()> {
-        let plaintext = match &mut self.transport {
-            Transport::Plain => wire_in.to_vec(),
-            #[cfg(feature = "tls")]
-            Transport::Tls(stream) => {
-                stream.feed(wire_in)?;
-                stream.recv_all()?
-            }
-        };
-        if !plaintext.is_empty() {
-            self.conn.feed(&plaintext);
-        }
-        self.pump()
+    fn new_h1(cfg: &SessionConfig) -> H1Conn {
+        let mut conn = H1Conn::new(cfg.limits);
+        conn.set_server_name(cfg.server_name.clone());
+        conn
     }
 
-    /// Run the handler for every fully-received request, serializing each reply.
-    fn pump(&mut self) -> Result<()> {
-        // `poll_request` yields `Ok(None)` when more bytes are needed and
-        // `Err(..)` after queueing an error response (and marking close); both
-        // simply end the pump.
-        while let Ok(Some(req)) = self.conn.poll_request() {
-            let resp = self.cfg.handler.handle(&req);
-            #[cfg(feature = "compress")]
-            let resp = compress::compress_response(&req, resp, &self.cfg.compression);
-            self.conn.respond(resp);
+    /// Feed bytes received from the socket: decrypt, (lazily) select the
+    /// protocol, parse requests, run the handler, and queue responses.
+    pub fn received(&mut self, wire_in: &[u8]) -> Result<()> {
+        let plaintext = self.transport.decrypt(wire_in)?;
+
+        // Choose the engine once the handshake exposes the ALPN protocol.
+        if self.engine.is_none() && !self.transport.handshaking() {
+            self.select_engine();
+        }
+
+        if plaintext.is_empty() || self.engine.is_none() {
+            return Ok(());
+        }
+        self.drive(&plaintext)
+    }
+
+    #[cfg(feature = "tls")]
+    fn select_engine(&mut self) {
+        #[cfg(feature = "h2")]
+        if self.transport.alpn().as_deref() == Some(b"h2") {
+            self.engine = Some(Engine::H2(Box::new(H2Conn::new(
+                self.cfg.limits,
+                self.cfg.server_name.clone(),
+            ))));
+            return;
+        }
+        self.engine = Some(Engine::H1(Self::new_h1(&self.cfg)));
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn select_engine(&mut self) {
+        self.engine = Some(Engine::H1(Self::new_h1(&self.cfg)));
+    }
+
+    fn drive(&mut self, plaintext: &[u8]) -> Result<()> {
+        match self.engine.as_mut().unwrap() {
+            Engine::H1(conn) => {
+                conn.feed(plaintext);
+                while let Ok(Some(req)) = conn.poll_request() {
+                    let resp = Self::run_handler(&self.cfg, &req);
+                    conn.respond(resp);
+                }
+            }
+            #[cfg(feature = "h2")]
+            Engine::H2(conn) => {
+                conn.received(plaintext);
+                while let Some((sid, req)) = conn.poll_request() {
+                    let resp = Self::run_handler(&self.cfg, &req);
+                    conn.respond(sid, resp);
+                }
+            }
         }
         Ok(())
     }
 
-    /// Produce the bytes that should be written to the socket: TLS handshake
-    /// records and/or encrypted (or plain) response data. May be empty.
+    /// Run the handler and apply response compression.
+    fn run_handler(cfg: &SessionConfig, req: &Request) -> Response {
+        let resp = cfg.handler.handle(req);
+        #[cfg(feature = "compress")]
+        let resp = compress::compress_response(req, resp, &cfg.compression);
+        resp
+    }
+
+    /// Produce the bytes to write to the socket: TLS handshake records and/or
+    /// (encrypted) response data. May be empty.
     pub fn to_send(&mut self) -> Result<Vec<u8>> {
-        let app = self.conn.take_out();
-        match &mut self.transport {
-            Transport::Plain => Ok(app),
-            #[cfg(feature = "tls")]
-            Transport::Tls(stream) => {
-                stream.send(&app)?;
-                // pop_all also drains pending handshake records, so this works
-                // before any application data exists.
-                stream.pop_all()
-            }
-        }
+        let app = match self.engine.as_mut() {
+            Some(Engine::H1(conn)) => conn.take_out(),
+            #[cfg(feature = "h2")]
+            Some(Engine::H2(conn)) => conn.take_out(),
+            None => Vec::new(),
+        };
+        self.transport.encrypt(&app)
     }
 
-    /// Whether the connection should be closed once all pending output has been
-    /// written.
+    /// Whether the connection should be closed once pending output is written.
     pub fn wants_close(&self) -> bool {
-        self.conn.wants_close()
+        match self.engine.as_ref() {
+            Some(Engine::H1(conn)) => conn.wants_close(),
+            #[cfg(feature = "h2")]
+            Some(Engine::H2(conn)) => conn.wants_close(),
+            None => false,
+        }
     }
 
-    /// Whether the session is mid-handshake and not yet ready for HTTP. For
-    /// plaintext sessions this is always `false`.
+    /// Whether the session is still completing the TLS handshake.
     pub fn handshaking(&self) -> bool {
-        match &self.transport {
-            Transport::Plain => false,
-            #[cfg(feature = "tls")]
-            Transport::Tls(stream) => !stream.is_handshake_complete(),
-        }
+        self.transport.handshaking()
     }
 }

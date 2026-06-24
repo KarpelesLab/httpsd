@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "purecrypto"
-version = "0.6.20"
+version = "0.6.21"
 dependencies = [
  "cacrt",
  "compcol 0.4.7",

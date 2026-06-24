@@ -12,6 +12,11 @@ pub enum Version {
     Http10,
     /// HTTP/1.1 — connections persist by default unless `Connection: close`.
     Http11,
+    /// HTTP/2 (RFC 9113) — binary, multiplexed; framing replaces the textual
+    /// request line. Carried on a connection negotiated via ALPN.
+    Http2,
+    /// HTTP/3 (RFC 9114) — like HTTP/2 but carried over QUIC streams.
+    Http3,
 }
 
 impl Version {
@@ -29,12 +34,14 @@ impl Version {
         match self {
             Version::Http10 => "HTTP/1.0",
             Version::Http11 => "HTTP/1.1",
+            Version::Http2 => "HTTP/2",
+            Version::Http3 => "HTTP/3",
         }
     }
 
     /// Whether persistent connections are the default for this version.
     pub fn default_keep_alive(self) -> bool {
-        matches!(self, Version::Http11)
+        matches!(self, Version::Http11 | Version::Http2 | Version::Http3)
     }
 }
 

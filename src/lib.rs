@@ -47,6 +47,9 @@ pub mod compress;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+#[cfg(feature = "h2")]
+pub mod h2;
+
 pub mod session;
 
 #[cfg(feature = "config")]
