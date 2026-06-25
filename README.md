@@ -207,6 +207,7 @@ See [`samples/config.toml`](samples/config.toml).
 | `h2`            |   ✓     | HTTP/2 over TLS (ALPN); HPACK via `compcol`.             |
 | `h3`            |   ✓     | HTTP/3 over QUIC/UDP; QPACK via `compcol`, QUIC via `purecrypto`. |
 | `router`        |   ✓     | `Router` (method/path matching, `:id` params) + `IntoResponse`; dependency-free. |
+| `http`          |         | `From`/`TryFrom` interop with the [`http`](https://docs.rs/http) crate's types. |
 | `acme`          |         | Automatic certificates (ACME); ACME HTTP client via `rsurl`. |
 | `config`        |         | TOML configuration loading (pulled in by `cli`).         |
 | `rt-tokio`      |         | Asynchronous tokio runtime.                              |

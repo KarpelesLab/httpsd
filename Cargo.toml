@@ -40,6 +40,11 @@ acme = ["tls", "dep:rsurl"]
 # `&str` / `String` / `(StatusCode, _)` / `Result<_, _>` directly. Dependency-
 # free and additive — the low-level `Handler` trait is unchanged.
 router = []
+# Interop with the `http` crate: `From`/`TryFrom` conversions between httpsd's
+# `Method`/`StatusCode`/`Version`/`Headers`/`Request`/`Response` and the
+# ecosystem-standard `http` types (and `IntoResponse for http::Response` when
+# `router` is also on). Opt-in, since it adds the `http` dependency.
+http = ["dep:http"]
 # TOML configuration file loading.
 config = ["dep:serde", "dep:toml"]
 # The `httpsd` command-line binary. Pulls in config + the thread-pool runtime
@@ -59,6 +64,7 @@ rt-mio = ["dep:mio"]
 # default feature set, so we use its defaults rather than cherry-picking.
 purecrypto = { version = "0.6.25", optional = true }
 compcol = { version = "0.6.5", optional = true, default-features = false, features = ["std", "gzip", "deflate", "zlib"] }
+http = { version = "1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 toml = { version = "0.8", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }

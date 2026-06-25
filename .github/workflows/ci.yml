@@ -69,6 +69,9 @@ jobs:
       - name: Router (no TLS, dependency-free)
         run: cargo build --no-default-features --features rt-threadpool,router
 
+      - name: http-crate interop (with router)
+        run: cargo build --no-default-features --features rt-threadpool,http,router
+
       - name: ACME without HTTP/3
         run: cargo build --no-default-features --features cli,tls,acme
 

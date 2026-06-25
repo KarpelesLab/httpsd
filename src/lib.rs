@@ -30,6 +30,8 @@
 //! - `compress` — gzip/deflate/zlib response compression via `compcol`.
 //! - `router` — a [`Router`] with method/path matching plus the
 //!   [`IntoResponse`] trait (dependency-free).
+//! - `http` — `From`/`TryFrom` interop with the [`http`](https://docs.rs/http)
+//!   crate's `Request`/`Response`/`Method`/`StatusCode`/`Headers` types.
 //! - `config` — load a [`ServerConfig`] from a TOML file.
 //! - `cli` — build the `httpsd` binary.
 //! - `rt-threadpool` (default), `rt-tokio`, `rt-mio` — runtime drivers.
@@ -61,6 +63,9 @@ pub mod acme;
 
 #[cfg(feature = "router")]
 pub mod router;
+
+#[cfg(feature = "http")]
+pub mod interop;
 
 pub mod session;
 
