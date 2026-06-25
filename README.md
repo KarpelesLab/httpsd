@@ -81,6 +81,28 @@ fn main() -> httpsd::Result<()> {
 }
 ```
 
+Routing (feature `router`, on by default) — match by method and path, with
+`:id` params and `*rest` wildcards. Handlers may return anything that
+implements `IntoResponse` (`&str`, `String`, `(StatusCode, _)`, `Result<_, _>`,
+…), so `?` works inside a handler:
+
+```rust
+use httpsd::{Server, Request, Response, StatusCode};
+use httpsd::router::Router;
+
+let app = Router::new()
+    .get("/", |_req: &Request| "hello world")
+    .get("/users/:id", |req: &Request| {
+        Response::text(format!("user {}", req.param("id").unwrap_or("?")))
+    })
+    .post("/users", |_req: &Request| (StatusCode::CREATED, "created"))
+    .get("/static/*path", |req: &Request| {
+        format!("file: {}", req.param("path").unwrap_or(""))
+    });
+
+Server::bind("127.0.0.1:8080")?.handler(app).run()?;
+```
+
 Serve static files:
 
 ```rust
@@ -184,6 +206,7 @@ See [`samples/config.toml`](samples/config.toml).
 | `compress`      |   ✓     | gzip/deflate response compression via `compcol`.         |
 | `h2`            |   ✓     | HTTP/2 over TLS (ALPN); HPACK via `compcol`.             |
 | `h3`            |   ✓     | HTTP/3 over QUIC/UDP; QPACK via `compcol`, QUIC via `purecrypto`. |
+| `router`        |   ✓     | `Router` (method/path matching, `:id` params) + `IntoResponse`; dependency-free. |
 | `acme`          |         | Automatic certificates (ACME); ACME HTTP client via `rsurl`. |
 | `config`        |         | TOML configuration loading (pulled in by `cli`).         |
 | `rt-tokio`      |         | Asynchronous tokio runtime.                              |

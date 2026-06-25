@@ -38,6 +38,8 @@ impl StatusCode {
 impl StatusCode {
     pub const CONTINUE: StatusCode = StatusCode::new(100, "Continue");
     pub const OK: StatusCode = StatusCode::new(200, "OK");
+    pub const CREATED: StatusCode = StatusCode::new(201, "Created");
+    pub const ACCEPTED: StatusCode = StatusCode::new(202, "Accepted");
     pub const NO_CONTENT: StatusCode = StatusCode::new(204, "No Content");
     pub const PARTIAL_CONTENT: StatusCode = StatusCode::new(206, "Partial Content");
     pub const MOVED_PERMANENTLY: StatusCode = StatusCode::new(301, "Moved Permanently");

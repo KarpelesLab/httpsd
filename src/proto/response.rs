@@ -135,6 +135,12 @@ impl Response {
         self
     }
 
+    /// Override the status code (builder style), keeping headers and body.
+    pub fn with_status(mut self, status: StatusCode) -> Response {
+        self.status = status;
+        self
+    }
+
     /// The status code.
     pub fn status_code(&self) -> StatusCode {
         self.status

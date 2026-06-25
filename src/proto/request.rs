@@ -15,6 +15,10 @@ pub struct Request {
     version: Version,
     headers: Headers,
     body: Vec<u8>,
+    /// Path parameters captured by the [`Router`](crate::router::Router) (e.g.
+    /// `:id`). Empty unless this request was dispatched through a router.
+    #[cfg(feature = "router")]
+    params: Vec<(String, String)>,
 }
 
 impl Request {
@@ -31,6 +35,8 @@ impl Request {
             version,
             headers,
             body,
+            #[cfg(feature = "router")]
+            params: Vec::new(),
         }
     }
 
@@ -86,5 +92,30 @@ impl Request {
     /// Consume the request and return the owned body bytes.
     pub fn into_body(self) -> Vec<u8> {
         self.body
+    }
+
+    /// The value of a path parameter captured by the
+    /// [`Router`](crate::router::Router), e.g. `req.param("id")` for a route
+    /// registered as `/users/:id`. Returns `None` if the request was not routed
+    /// or has no such parameter.
+    #[cfg(feature = "router")]
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// All captured path parameters, in match order.
+    #[cfg(feature = "router")]
+    pub fn params(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.params.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Replace the captured path parameters. Used by the router before
+    /// dispatching to a route handler.
+    #[cfg(feature = "router")]
+    pub(crate) fn set_params(&mut self, params: Vec<(String, String)>) {
+        self.params = params;
     }
 }

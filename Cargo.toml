@@ -20,7 +20,7 @@ required-features = ["cli"]
 [features]
 # The default build is a complete, self-contained HTTPS server CLI: a worker
 # thread pool, TLS, HTTP/2, response compression, and TOML config loading.
-default = ["cli", "rt-threadpool", "tls", "compress", "h2", "h3"]
+default = ["cli", "rt-threadpool", "tls", "compress", "h2", "h3", "router"]
 
 # TLS / HTTPS support, built on the sans-I/O `purecrypto::tls` engine.
 tls = ["dep:purecrypto"]
@@ -35,6 +35,11 @@ h3 = ["tls", "dep:compcol", "compcol/qpack", "compcol/hpack"]
 # issuance keyed on SNI, TLS-ALPN-01 + HTTP-01 challenges, on-disk persistence.
 # Uses `rsurl` as the ACME HTTP client.
 acme = ["tls", "dep:rsurl"]
+# Ergonomic routing layer: a `Router` with method/path matching (`:id` params,
+# `*rest` wildcards) plus the `IntoResponse` trait, so handlers can return
+# `&str` / `String` / `(StatusCode, _)` / `Result<_, _>` directly. Dependency-
+# free and additive — the low-level `Handler` trait is unchanged.
+router = []
 # TOML configuration file loading.
 config = ["dep:serde", "dep:toml"]
 # The `httpsd` command-line binary. Pulls in config + the thread-pool runtime

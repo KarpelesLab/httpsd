@@ -28,6 +28,8 @@
 //!
 //! - `tls` — HTTPS via `purecrypto`'s sans-I/O TLS engine.
 //! - `compress` — gzip/deflate/zlib response compression via `compcol`.
+//! - `router` — a [`Router`] with method/path matching plus the
+//!   [`IntoResponse`] trait (dependency-free).
 //! - `config` — load a [`ServerConfig`] from a TOML file.
 //! - `cli` — build the `httpsd` binary.
 //! - `rt-threadpool` (default), `rt-tokio`, `rt-mio` — runtime drivers.
@@ -57,6 +59,9 @@ pub mod h3;
 #[cfg(feature = "acme")]
 pub mod acme;
 
+#[cfg(feature = "router")]
+pub mod router;
+
 pub mod session;
 
 #[cfg(feature = "config")]
@@ -69,6 +74,9 @@ pub use handler::Handler;
 pub use proto::{Body, Headers, Method, Request, Response, StatusCode, Version};
 pub use session::Session;
 pub use static_files::StaticFiles;
+
+#[cfg(feature = "router")]
+pub use router::{IntoResponse, Router};
 
 #[cfg(feature = "config")]
 pub use config::ServerConfig;

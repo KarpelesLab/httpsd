@@ -66,6 +66,9 @@ jobs:
       - name: HTTP/2 (no HTTP/3)
         run: cargo build --no-default-features --features rt-threadpool,tls,h2
 
+      - name: Router (no TLS, dependency-free)
+        run: cargo build --no-default-features --features rt-threadpool,router
+
       - name: ACME without HTTP/3
         run: cargo build --no-default-features --features cli,tls,acme
 
