@@ -14,6 +14,8 @@ use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{Config, Connection, SigningKey};
 use purecrypto::x509::{AnyPrivateKey, Certificate, DistinguishedName, Time, Validity};
+#[cfg(feature = "acme")]
+use purecrypto::x509::{extension::subject_alt_name, CertSigner, Extension, GeneralName};
 
 use crate::error::{Error, Result};
 
@@ -83,13 +85,21 @@ impl TlsAcceptor {
     }
 
     fn build(chain: Vec<Vec<u8>>, key_pem: String) -> Result<TlsAcceptor> {
-        let key = load_signing_key(&key_pem)?;
         // Offer HTTP/2 ahead of HTTP/1.1 when compiled in; the client picks.
         let alpn = if cfg!(feature = "h2") {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         } else {
             vec![b"http/1.1".to_vec()]
         };
+        TlsAcceptor::build_with_alpn(chain, key_pem, alpn)
+    }
+
+    fn build_with_alpn(
+        chain: Vec<Vec<u8>>,
+        key_pem: String,
+        alpn: Vec<Vec<u8>>,
+    ) -> Result<TlsAcceptor> {
+        let key = load_signing_key(&key_pem)?;
         let config = Config::builder()
             .rng(Arc::new(OsRng))
             .tls_only()
@@ -103,6 +113,39 @@ impl TlsAcceptor {
             #[cfg(feature = "h3")]
             key_pem: Arc::new(key_pem),
         })
+    }
+
+    /// Build the special acceptor for an ACME **TLS-ALPN-01** challenge
+    /// (RFC 8737): a self-signed cert for `host` carrying the critical
+    /// `id-pe-acmeIdentifier` extension with `key_auth_digest`
+    /// (`SHA-256(key authorization)`), and an ALPN of exactly `acme-tls/1`.
+    /// The CA opens an `acme-tls/1` connection and validates this cert; no
+    /// application data flows.
+    #[cfg(feature = "acme")]
+    pub fn acme_challenge(host: &str, key_auth_digest: &[u8; 32]) -> Result<TlsAcceptor> {
+        let mut rng = OsRng;
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name(host);
+        let validity = Validity::new(
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2040, 1, 1, 0, 0, 0),
+        );
+        let san = subject_alt_name(&[GeneralName::Dns(host.to_owned())]);
+        // extnValue is OCTET STRING; its content is itself an OCTET STRING of
+        // the 32-byte digest. `Extension.value` is wrapped in the outer OCTET
+        // STRING at serialization, so it must hold the inner DER `04 20 <32>`.
+        let mut acme_value = vec![0x04, 0x20];
+        acme_value.extend_from_slice(key_auth_digest);
+        let acme_ext = Extension {
+            oid: vec![1, 3, 6, 1, 5, 5, 7, 1, 31], // id-pe-acmeIdentifier
+            critical: true,
+            value: acme_value,
+        };
+        let cert =
+            Certificate::self_signed_with_extensions(&CertSigner::Ecdsa(&key), &name, &validity, 1, &[san, acme_ext])
+                .map_err(tls_err)?;
+        let chain = vec![cert.to_der().to_vec()];
+        TlsAcceptor::build_with_alpn(chain, key.to_sec1_pem(), vec![b"acme-tls/1".to_vec()])
     }
 
     /// Begin a new server-side TLS connection. The handshake is driven by

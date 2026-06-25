@@ -12,4 +12,7 @@
 pub mod client;
 pub mod jose;
 pub mod json;
+pub mod manager;
 pub mod store;
+
+pub use manager::{AcmeConfig, AcmeManager, CertChoice};
