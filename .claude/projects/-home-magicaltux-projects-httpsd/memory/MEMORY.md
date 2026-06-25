@@ -1,1 +1,1 @@
-- [API positioning](api-positioning.md) — lean low-level core; framework ergonomics go behind opt-in features; no `http` crate
+- [API positioning](api-positioning.md) — lean core; ergonomics behind features (dep-free→default, dep-pulling like `http`→opt-in)

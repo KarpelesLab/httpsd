@@ -7,6 +7,7 @@
 //! handler (with optional compression), serializes, and re-encrypts. It
 //! performs no I/O itself.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -27,26 +28,29 @@ enum Transport {
 }
 
 impl Transport {
-    /// Turn received wire bytes into plaintext (decrypting under TLS).
-    fn decrypt(&mut self, wire_in: &[u8]) -> Result<Vec<u8>> {
+    /// Turn received wire bytes into plaintext (decrypting under TLS). On a
+    /// plain connection the bytes are returned borrowed — no copy; the engine
+    /// copies them into its own input buffer.
+    fn decrypt<'a>(&mut self, wire_in: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match self {
-            Transport::Plain => Ok(wire_in.to_vec()),
+            Transport::Plain => Ok(Cow::Borrowed(wire_in)),
             #[cfg(feature = "tls")]
             Transport::Tls(stream) => {
                 stream.feed(wire_in)?;
-                stream.recv_all()
+                Ok(Cow::Owned(stream.recv_all()?))
             }
         }
     }
 
     /// Turn application bytes into wire bytes (encrypting under TLS, and
-    /// flushing any pending handshake records).
-    fn encrypt(&mut self, app: &[u8]) -> Result<Vec<u8>> {
+    /// flushing any pending handshake records). Takes the buffer by value so a
+    /// plain connection can hand it straight back without copying.
+    fn encrypt(&mut self, app: Vec<u8>) -> Result<Vec<u8>> {
         match self {
-            Transport::Plain => Ok(app.to_vec()),
+            Transport::Plain => Ok(app),
             #[cfg(feature = "tls")]
             Transport::Tls(stream) => {
-                stream.send(app)?;
+                stream.send(&app)?;
                 stream.pop_all()
             }
         }
@@ -163,7 +167,7 @@ impl Session {
         if plaintext.is_empty() || self.engine.is_none() {
             return Ok(());
         }
-        self.drive(&plaintext)
+        self.drive(plaintext.as_ref())
     }
 
     #[cfg(feature = "tls")]
@@ -224,7 +228,7 @@ impl Session {
             Some(Engine::H2(conn)) => conn.take_out(),
             None => Vec::new(),
         };
-        self.transport.encrypt(&app)
+        self.transport.encrypt(app)
     }
 
     /// Whether the connection should be closed once pending output is written.

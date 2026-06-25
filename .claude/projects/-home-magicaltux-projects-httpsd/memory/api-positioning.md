@@ -10,13 +10,18 @@ When extending httpsd's public API, framework-style ergonomics (routing,
 so the low-level core stays lean and dependency-free. The core `Handler`
 (`Fn(&Request) -> Response`) + sans-I/O engine must remain unchanged.
 
-The user declined adopting the `http` crate's types — keep httpsd standalone /
-pure-Rust (purecrypto + compcol only).
+The user DID want `http`-crate interop — but as an opt-in feature so it can be
+disabled (don't replace httpsd's own core types; keep the default build
+dependency-free of `http`). Added 2026-06 as the non-default `http` feature
+(`src/interop.rs`): `From`/`TryFrom` between httpsd and `http` types,
+`HttpConvertError`, and `IntoResponse for http::Response` when `router` is on.
+(Earlier I mis-recorded this as "declined" — it was accepted, gated.)
 
 **Why:** httpsd targets the hyper/tiny_http tier (a foundation), but should be
 pleasant for app devs too — without forcing the weight on everyone.
 
-**How to apply:** Add ergonomic layers as default-on, dependency-free features
-(e.g. `router`, added 2026-06; gives `Router` + `IntoResponse`, `Request::param`
-only exists under `cfg(feature="router")`). Gate any new field on core types by
-the feature so feature-off builds have zero footprint.
+**How to apply:** Add ergonomic layers as features. Dependency-free ones can be
+default-on (e.g. `router`, gives `Router` + `IntoResponse`; `Request::param`
+only exists under `cfg(feature="router")`). Ones that pull a dependency stay
+opt-in/non-default (e.g. `http`). Gate any new field on core types by the
+feature so feature-off builds have zero footprint.

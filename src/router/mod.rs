@@ -75,10 +75,11 @@ struct Route {
 }
 
 impl Route {
-    /// Match `path` against this route's pattern, returning the captured
-    /// parameters on success (empty `Vec` when the pattern has none).
-    fn matches(&self, path: &str) -> Option<Vec<(String, String)>> {
-        let path_segs = segments(path);
+    /// Match the (already-split) request path against this route's pattern,
+    /// returning the captured parameters on success (empty `Vec` when the
+    /// pattern has none). The caller splits the path once and reuses it across
+    /// every route, so matching allocates nothing until a capture is found.
+    fn matches(&self, path_segs: &[&str]) -> Option<Vec<(String, String)>> {
         let mut params = Vec::new();
         let mut i = 0;
         for seg in &self.segs {
@@ -189,10 +190,10 @@ impl Router {
     /// Allowed` (with an `Allow` header) when the path matches but the method
     /// does not, and otherwise the fallback or a `404`.
     fn dispatch(&self, req: &Request) -> Response {
-        let path = req.path();
+        let path_segs = segments(req.path());
         let mut allowed: Vec<&str> = Vec::new();
         for route in &self.routes {
-            let Some(params) = route.matches(path) else {
+            let Some(params) = route.matches(&path_segs) else {
                 continue;
             };
             if &route.method != req.method() {
