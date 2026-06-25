@@ -90,6 +90,9 @@ pub struct SessionConfig {
     /// connections (e.g. `"max-age=31536000"`), or `None` to omit it. Never
     /// sent over plain HTTP, where HSTS is meaningless.
     pub hsts: Option<String>,
+    /// `Alt-Svc` header value advertising alternative services such as HTTP/3
+    /// (e.g. `r#"h3=":443"; ma=86400"#`), or `None` to omit it.
+    pub alt_svc: Option<String>,
     /// Response compression options.
     #[cfg(feature = "compress")]
     pub compression: compress::Options,
@@ -103,6 +106,7 @@ impl SessionConfig {
             limits: Limits::default(),
             server_name: Some(concat!("httpsd/", env!("CARGO_PKG_VERSION")).to_owned()),
             hsts: None,
+            alt_svc: None,
             #[cfg(feature = "compress")]
             compression: compress::Options::default(),
         }
@@ -207,7 +211,7 @@ impl Session {
         let resp = cfg.handler.handle(req);
         #[cfg(feature = "compress")]
         let resp = compress::compress_response(req, resp, &cfg.compression);
-        apply_hsts(cfg, resp, secure)
+        apply_edge_headers(cfg, resp, secure)
     }
 
     /// Produce the bytes to write to the socket: TLS handshake records and/or
@@ -238,15 +242,18 @@ impl Session {
     }
 }
 
-/// Add the configured `Strict-Transport-Security` header when the connection is
-/// secure. HSTS sent over plain HTTP is ignored by clients, so we never add it
-/// there. Shared with the HTTP/3 engine (always secure).
-pub(crate) fn apply_hsts(cfg: &SessionConfig, mut resp: Response, secure: bool) -> Response {
+/// Add the configured edge headers: `Strict-Transport-Security` (secure
+/// connections only — clients ignore HSTS over plain HTTP) and `Alt-Svc`
+/// (e.g. advertising HTTP/3). Shared with the HTTP/3 engine (always secure).
+pub(crate) fn apply_edge_headers(cfg: &SessionConfig, mut resp: Response, secure: bool) -> Response {
+    let h = resp.headers_mut();
     if secure
         && let Some(value) = &cfg.hsts
     {
-        resp.headers_mut()
-            .set_if_absent("Strict-Transport-Security", value.clone());
+        h.set_if_absent("Strict-Transport-Security", value.clone());
+    }
+    if let Some(value) = &cfg.alt_svc {
+        h.set_if_absent("Alt-Svc", value.clone());
     }
     resp
 }
@@ -264,19 +271,19 @@ mod tests {
 
     #[test]
     fn hsts_added_only_on_secure() {
-        let secure = apply_hsts(&cfg(), Response::status(StatusCode::OK), true);
+        let secure = apply_edge_headers(&cfg(), Response::status(StatusCode::OK), true);
         assert_eq!(
             secure.headers().get("strict-transport-security"),
             Some("max-age=31536000")
         );
-        let plain = apply_hsts(&cfg(), Response::status(StatusCode::OK), false);
+        let plain = apply_edge_headers(&cfg(), Response::status(StatusCode::OK), false);
         assert!(plain.headers().get("strict-transport-security").is_none());
     }
 
     #[test]
     fn hsts_absent_when_unset() {
         let c = SessionConfig::new(Arc::new(|_: &Request| Response::status(StatusCode::OK)));
-        let r = apply_hsts(&c, Response::status(StatusCode::OK), true);
+        let r = apply_edge_headers(&c, Response::status(StatusCode::OK), true);
         assert!(r.headers().get("strict-transport-security").is_none());
     }
 }

@@ -20,7 +20,7 @@ required-features = ["cli"]
 [features]
 # The default build is a complete, self-contained HTTPS server CLI: a worker
 # thread pool, TLS, HTTP/2, response compression, and TOML config loading.
-default = ["cli", "rt-threadpool", "tls", "compress", "h2"]
+default = ["cli", "rt-threadpool", "tls", "compress", "h2", "h3"]
 
 # TLS / HTTPS support, built on the sans-I/O `purecrypto::tls` engine.
 tls = ["dep:purecrypto"]

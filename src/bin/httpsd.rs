@@ -46,10 +46,11 @@ fn run() -> httpsd::Result<()> {
         }
     };
 
-    // Optionally serve HTTP/3 on UDP alongside the TCP server. It runs on its
-    // own thread; the TCP server (HTTP/1.1 + HTTP/2) stays in the foreground.
+    // Serve HTTP/3 on UDP alongside the TCP server by default whenever we have a
+    // static TLS certificate. It runs on its own thread; the TCP server
+    // (HTTP/1.1 + HTTP/2) stays in the foreground.
     #[cfg(feature = "h3")]
-    if opts.http3 {
+    if opts.http3_enabled() {
         let h3 = opts.build_server()?;
         let addr = opts.listen.clone();
         std::thread::spawn(move || {
@@ -58,10 +59,11 @@ fn run() -> httpsd::Result<()> {
             }
         });
         eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
-    }
-    #[cfg(not(feature = "h3"))]
-    if opts.http3 {
-        eprintln!("httpsd: warning: built without the `h3` feature; --http3 ignored");
+    } else if !opts.no_http3 && opts.acme_accept_tos && !opts.is_tls() {
+        eprintln!(
+            "httpsd: HTTP/3 not started — per-SNI HTTP/3 under ACME awaits QUIC SNI support; \
+             use --tls-cert for HTTP/3"
+        );
     }
 
     let server = opts.build_server()?;
@@ -92,7 +94,7 @@ OPTIONS:
         --tls-key FILE      PEM private key
         --self-signed[=H]   generate a self-signed certificate (default host localhost)
         --workers N         number of worker threads
-        --http3             also serve HTTP/3 over QUIC/UDP (requires TLS)
+        --no-http3          do not serve HTTP/3 (on by default with a TLS cert)
         --http ADDR         also bind a plain-HTTP listener for redirects + ACME HTTP-01
         --allow-http        serve content over HTTP instead of redirecting to HTTPS
         --acme-accept-tos   enable automatic certificates, accepting the CA's terms of service
@@ -117,7 +119,7 @@ struct Options {
     tls_key: Option<String>,
     self_signed: Option<String>,
     workers: Option<usize>,
-    http3: bool,
+    no_http3: bool,
     no_compress: bool,
     allow_http: bool,
     http_listen: Option<String>,
@@ -143,7 +145,7 @@ impl Options {
             tls_key: None,
             self_signed: None,
             workers: None,
-            http3: false,
+            no_http3: false,
             no_compress: false,
             allow_http: false,
             http_listen: None,
@@ -173,7 +175,7 @@ impl Options {
                 "--tls-cert" => opts.tls_cert = Some(take_value(args, &mut i, arg)?),
                 "--tls-key" => opts.tls_key = Some(take_value(args, &mut i, arg)?),
                 "--self-signed" => opts.self_signed = Some("localhost".to_owned()),
-                "--http3" => opts.http3 = true,
+                "--no-http3" => opts.no_http3 = true,
                 "--workers" => {
                     let v = take_value(args, &mut i, arg)?;
                     opts.workers = Some(v.parse().map_err(|_| format!("invalid --workers: {v}"))?);
@@ -250,7 +252,30 @@ impl Options {
             server = server.http_redirect(http.as_str())?;
         }
         server = self.apply_acme(server)?;
+        // Advertise HTTP/3 via Alt-Svc when we'll be serving it.
+        #[cfg(feature = "h3")]
+        if self.http3_enabled() {
+            let port = self.listen_port();
+            server = server.alt_svc(Some(format!("h3=\":{port}\"; ma=86400")));
+        }
         Ok(server)
+    }
+
+    /// Whether HTTP/3 should run: on by default with a static TLS cert, off via
+    /// `--no-http3`. (Per-SNI HTTP/3 under ACME isn't available yet.)
+    #[cfg(feature = "h3")]
+    fn http3_enabled(&self) -> bool {
+        !self.no_http3 && self.is_tls()
+    }
+
+    /// The port from the listen address (defaults to 443 if unparseable).
+    #[cfg(feature = "h3")]
+    fn listen_port(&self) -> u16 {
+        self.listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443)
     }
 
     /// Build the HSTS header value if any `--hsts*` flag was given.

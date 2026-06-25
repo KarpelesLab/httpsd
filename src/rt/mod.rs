@@ -73,6 +73,8 @@ pub struct Server {
     compression: compress::Options,
     /// `Strict-Transport-Security` value sent on secure responses, if any.
     hsts: Option<String>,
+    /// `Alt-Svc` value advertising alternative services (e.g. HTTP/3), if any.
+    alt_svc: Option<String>,
     /// Serve content over plain HTTP instead of redirecting to HTTPS.
     allow_http: bool,
     /// Optional plain-HTTP listener address(es) for redirects + ACME HTTP-01.
@@ -98,6 +100,7 @@ impl Server {
             #[cfg(feature = "compress")]
             compression: compress::Options::default(),
             hsts: None,
+            alt_svc: None,
             allow_http: false,
             http_addrs: Vec::new(),
             #[cfg(feature = "acme")]
@@ -180,6 +183,13 @@ impl Server {
         self
     }
 
+    /// Set the `Alt-Svc` header value (e.g. advertising HTTP/3) sent on
+    /// responses, or `None` to omit it.
+    pub fn alt_svc(mut self, value: Option<String>) -> Server {
+        self.alt_svc = value;
+        self
+    }
+
     /// Build the shared session configuration.
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
@@ -187,6 +197,7 @@ impl Server {
             limits: crate::proto::Limits::default(),
             server_name: self.server_name.clone(),
             hsts: self.hsts.clone(),
+            alt_svc: self.alt_svc.clone(),
             #[cfg(feature = "compress")]
             compression: self.compression,
         }
@@ -265,16 +276,31 @@ impl Server {
     }
 
     /// Run an HTTP/3 server on a QUIC/UDP event loop, listening on the same
-    /// address(es) as the TCP server (but over UDP). Requires TLS to be
-    /// configured (HTTP/3 is always encrypted). Blocks the calling thread.
+    /// address(es) as the TCP server (but over UDP). HTTP/3 is always encrypted.
+    ///
+    /// Uses the static [`tls`](Server::tls) acceptor's certificate. Per-SNI
+    /// certificate selection over QUIC (the HTTP/3 equivalent of the TCP path's
+    /// ClientHello peek) needs the QUIC engine to expose the SNI from the
+    /// encrypted Initial packet before the handshake; until then, on-demand
+    /// ACME certificates aren't available over HTTP/3. Blocks the calling thread.
     #[cfg(feature = "h3")]
     pub fn run_h3(self) -> Result<()> {
-        let acceptor = self
-            .tls
-            .clone()
-            .ok_or_else(|| Error::Config("HTTP/3 requires TLS (set an acceptor via .tls())".into()))?;
+        let acceptor = self.h3_acceptor()?;
         let cfg = self.session_config();
         quic::run(self.addrs.clone(), cfg, acceptor)
+    }
+
+    #[cfg(feature = "h3")]
+    fn h3_acceptor(&self) -> Result<TlsAcceptor> {
+        #[cfg(feature = "tls")]
+        if let Some(acc) = &self.tls {
+            return Ok(acc.clone());
+        }
+        Err(Error::Config(
+            "HTTP/3 needs a static TLS certificate (Server::tls); per-SNI HTTP/3 under ACME \
+             awaits QUIC ClientHello/SNI peek support in purecrypto"
+                .into(),
+        ))
     }
 }
 
