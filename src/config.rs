@@ -84,6 +84,26 @@ impl Default for CompressConfig {
     }
 }
 
+/// Automatic-certificate (ACME) settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeFileConfig {
+    /// Must be `true` to enable automatic issuance (accepts the CA's ToS).
+    #[serde(default)]
+    pub accept_tos: bool,
+    /// Account contact email (optional).
+    pub email: Option<String>,
+    /// ACME directory URL (defaults to Let's Encrypt production).
+    pub directory: Option<String>,
+    /// Use the Let's Encrypt staging environment.
+    #[serde(default)]
+    pub staging: bool,
+    /// Only issue for these host names, if set.
+    pub host_whitelist: Option<Vec<String>>,
+    /// Override the certificate storage directory.
+    pub cert_dir: Option<PathBuf>,
+}
+
 /// The parsed server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +120,13 @@ pub struct ServerConfig {
     pub tls: Option<TlsConfig>,
     /// Compression settings.
     pub compress: Option<CompressConfig>,
+    /// Serve content over plain HTTP instead of redirecting to HTTPS.
+    #[serde(default)]
+    pub allow_http: bool,
+    /// Plain-HTTP listener address(es) for redirects + ACME HTTP-01.
+    http_listen: Option<OneOrMany>,
+    /// Automatic certificate management.
+    pub acme: Option<AcmeFileConfig>,
 }
 
 impl ServerConfig {
@@ -139,9 +166,66 @@ impl ServerConfig {
             server = server.server_name(self.server_name.clone());
         }
 
+        if self.allow_http {
+            server = server.allow_http(true);
+        }
+        if let Some(http) = &self.http_listen {
+            use std::net::ToSocketAddrs;
+            let mut resolved = Vec::new();
+            for a in http.clone().into_vec() {
+                resolved.extend(a.to_socket_addrs()?);
+            }
+            server = server.http_redirect(resolved.as_slice())?;
+        }
+
         server = self.apply_tls(server)?;
         server = self.apply_compress(server);
+        server = self.apply_acme(server)?;
 
+        Ok(server)
+    }
+
+    #[cfg(all(
+        feature = "acme",
+        any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio")
+    ))]
+    fn apply_acme(&self, server: crate::rt::Server) -> Result<crate::rt::Server> {
+        let Some(acme) = &self.acme else {
+            return Ok(server);
+        };
+        let directory = if acme.staging {
+            crate::acme::client::LETSENCRYPT_STAGING.to_owned()
+        } else {
+            acme.directory
+                .clone()
+                .unwrap_or_else(|| crate::acme::client::LETSENCRYPT_PRODUCTION.to_owned())
+        };
+        let whitelist = acme.host_whitelist.as_ref().map(|hosts| {
+            hosts
+                .iter()
+                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+                .collect()
+        });
+        let cfg = crate::acme::AcmeConfig {
+            directory_url: directory,
+            accept_tos: acme.accept_tos,
+            email: acme.email.clone(),
+            host_whitelist: whitelist,
+            cert_dir: acme.cert_dir.clone(),
+        };
+        Ok(server.acme(crate::acme::AcmeManager::new(cfg)?))
+    }
+
+    #[cfg(all(
+        not(feature = "acme"),
+        any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio")
+    ))]
+    fn apply_acme(&self, server: crate::rt::Server) -> Result<crate::rt::Server> {
+        if self.acme.is_some() {
+            return Err(Error::Config(
+                "[acme] configured but the `acme` feature is not enabled".into(),
+            ));
+        }
         Ok(server)
     }
 

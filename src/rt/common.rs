@@ -15,13 +15,29 @@ pub(crate) const READ_BUF: usize = 16 * 1024;
 /// flow through the same read/flush cycle), so the same loop serves HTTP and
 /// HTTPS.
 pub(crate) fn serve_blocking<S: Read + Write>(stream: &mut S, session: &mut Session) -> Result<()> {
+    serve_blocking_prefed(stream, session, &[])
+}
+
+/// Like [`serve_blocking`] but first feeds `initial` bytes already read from the
+/// stream (e.g. the ClientHello consumed while choosing a certificate).
+pub(crate) fn serve_blocking_prefed<S: Read + Write>(
+    stream: &mut S,
+    session: &mut Session,
+    initial: &[u8],
+) -> Result<()> {
     let mut buf = [0u8; READ_BUF];
+    let mut pending = initial;
     loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break; // peer closed
+        if !pending.is_empty() {
+            session.received(pending)?;
+            pending = &[];
+        } else {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break; // peer closed
+            }
+            session.received(&buf[..n])?;
         }
-        session.received(&buf[..n])?;
         let out = session.to_send()?;
         if !out.is_empty() {
             stream.write_all(&out)?;

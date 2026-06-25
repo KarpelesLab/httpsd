@@ -66,8 +66,15 @@ fn run() -> httpsd::Result<()> {
 
     let server = opts.build_server()?;
     let addr = opts.listen.clone();
-    let scheme = if opts.is_tls() { "https" } else { "http" };
+    let scheme = if opts.is_tls() || opts.acme_accept_tos {
+        "https"
+    } else {
+        "http"
+    };
     eprintln!("httpsd: serving on {scheme}://{addr}");
+    if let Some(http) = &opts.http_listen {
+        eprintln!("httpsd: redirecting HTTP→HTTPS on {http}");
+    }
     server.run()
 }
 
@@ -86,6 +93,14 @@ OPTIONS:
         --self-signed[=H]   generate a self-signed certificate (default host localhost)
         --workers N         number of worker threads
         --http3             also serve HTTP/3 over QUIC/UDP (requires TLS)
+        --http ADDR         also bind a plain-HTTP listener for redirects + ACME HTTP-01
+        --allow-http        serve content over HTTP instead of redirecting to HTTPS
+        --acme-accept-tos   enable automatic certificates, accepting the CA's terms of service
+        --acme-email EMAIL  ACME account contact email
+        --acme-directory URL  ACME directory (default Let's Encrypt production)
+        --acme-staging      use the Let's Encrypt staging environment
+        --host-whitelist H1,H2  only issue certificates for these hosts
+        --cert-dir DIR      certificate storage directory
         --no-compress       disable response compression
     -h, --help              print this help
 ";
@@ -100,6 +115,14 @@ struct Options {
     workers: Option<usize>,
     http3: bool,
     no_compress: bool,
+    allow_http: bool,
+    http_listen: Option<String>,
+    acme_accept_tos: bool,
+    acme_email: Option<String>,
+    acme_directory: Option<String>,
+    acme_staging: bool,
+    host_whitelist: Option<Vec<String>>,
+    cert_dir: Option<String>,
 }
 
 impl Options {
@@ -114,6 +137,14 @@ impl Options {
             workers: None,
             http3: false,
             no_compress: false,
+            allow_http: false,
+            http_listen: None,
+            acme_accept_tos: false,
+            acme_email: None,
+            acme_directory: None,
+            acme_staging: false,
+            host_whitelist: None,
+            cert_dir: None,
         };
         let mut saw_dir = false;
         let mut i = 0;
@@ -136,6 +167,18 @@ impl Options {
                     opts.workers = Some(v.parse().map_err(|_| format!("invalid --workers: {v}"))?);
                 }
                 "--no-compress" => opts.no_compress = true,
+                "--allow-http" => opts.allow_http = true,
+                "--http" => opts.http_listen = Some(take_value(args, &mut i, arg)?),
+                "--acme-accept-tos" => opts.acme_accept_tos = true,
+                "--acme-email" => opts.acme_email = Some(take_value(args, &mut i, arg)?),
+                "--acme-directory" => opts.acme_directory = Some(take_value(args, &mut i, arg)?),
+                "--acme-staging" => opts.acme_staging = true,
+                "--cert-dir" => opts.cert_dir = Some(take_value(args, &mut i, arg)?),
+                "--host-whitelist" => {
+                    let v = take_value(args, &mut i, arg)?;
+                    opts.host_whitelist =
+                        Some(v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect());
+                }
                 other if other.starts_with("--self-signed=") => {
                     opts.self_signed = Some(other["--self-signed=".len()..].to_owned());
                 }
@@ -176,6 +219,66 @@ impl Options {
         server = self.apply_tls(server)?;
         if self.no_compress {
             server = self.disable_compress(server);
+        }
+        if self.allow_http {
+            server = server.allow_http(true);
+        }
+        if let Some(http) = &self.http_listen {
+            server = server.http_redirect(http.as_str())?;
+        }
+        server = self.apply_acme(server)?;
+        Ok(server)
+    }
+
+    /// Whether any ACME flag was supplied.
+    fn acme_requested(&self) -> bool {
+        self.acme_accept_tos
+            || self.acme_email.is_some()
+            || self.acme_directory.is_some()
+            || self.acme_staging
+            || self.host_whitelist.is_some()
+            || self.cert_dir.is_some()
+    }
+
+    #[cfg(feature = "acme")]
+    fn apply_acme(&self, server: Server) -> httpsd::Result<Server> {
+        if !self.acme_requested() {
+            return Ok(server);
+        }
+        if !self.acme_accept_tos {
+            return Err(httpsd::Error::Config(
+                "automatic certificates require --acme-accept-tos (you accept the CA terms of service)".into(),
+            ));
+        }
+        let directory = if self.acme_staging {
+            httpsd::acme::client::LETSENCRYPT_STAGING.to_owned()
+        } else {
+            self.acme_directory
+                .clone()
+                .unwrap_or_else(|| httpsd::acme::client::LETSENCRYPT_PRODUCTION.to_owned())
+        };
+        let whitelist = self.host_whitelist.as_ref().map(|hosts| {
+            hosts
+                .iter()
+                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+                .collect()
+        });
+        let cfg = httpsd::acme::AcmeConfig {
+            directory_url: directory,
+            accept_tos: true,
+            email: self.acme_email.clone(),
+            host_whitelist: whitelist,
+            cert_dir: self.cert_dir.clone().map(std::path::PathBuf::from),
+        };
+        Ok(server.acme(httpsd::acme::AcmeManager::new(cfg)?))
+    }
+
+    #[cfg(not(feature = "acme"))]
+    fn apply_acme(&self, server: Server) -> httpsd::Result<Server> {
+        if self.acme_requested() {
+            return Err(httpsd::Error::Config(
+                "automatic certificates requested but the `acme` feature is not enabled".into(),
+            ));
         }
         Ok(server)
     }

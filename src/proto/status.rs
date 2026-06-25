@@ -42,6 +42,8 @@ impl StatusCode {
     pub const PARTIAL_CONTENT: StatusCode = StatusCode::new(206, "Partial Content");
     pub const MOVED_PERMANENTLY: StatusCode = StatusCode::new(301, "Moved Permanently");
     pub const FOUND: StatusCode = StatusCode::new(302, "Found");
+    pub const TEMPORARY_REDIRECT: StatusCode = StatusCode::new(307, "Temporary Redirect");
+    pub const PERMANENT_REDIRECT: StatusCode = StatusCode::new(308, "Permanent Redirect");
     pub const NOT_MODIFIED: StatusCode = StatusCode::new(304, "Not Modified");
     pub const BAD_REQUEST: StatusCode = StatusCode::new(400, "Bad Request");
     pub const FORBIDDEN: StatusCode = StatusCode::new(403, "Forbidden");

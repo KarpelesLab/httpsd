@@ -23,6 +23,9 @@ use crate::compress;
 use crate::tls::TlsAcceptor;
 
 pub(crate) mod common;
+pub(crate) mod redirect;
+#[cfg(feature = "acme")]
+pub(crate) mod route;
 
 #[cfg(feature = "rt-threadpool")]
 mod threadpool;
@@ -32,6 +35,22 @@ mod tokio;
 mod mio;
 #[cfg(feature = "h3")]
 mod quic;
+
+#[cfg(feature = "acme")]
+use crate::acme::AcmeManager;
+
+/// How the main listener terminates TLS.
+#[cfg(feature = "rt-threadpool")]
+pub(crate) enum TlsMode {
+    /// Plain HTTP, no TLS.
+    Plain,
+    /// A single static certificate.
+    #[cfg(feature = "tls")]
+    Static(TlsAcceptor),
+    /// Per-connection certificates via ACME (SNI-routed).
+    #[cfg(feature = "acme")]
+    Acme(AcmeManager),
+}
 
 /// A default handler used when none is configured: replies `404` to everything.
 fn not_found(_req: &Request) -> Response {
@@ -52,6 +71,12 @@ pub struct Server {
     tls: Option<TlsAcceptor>,
     #[cfg(feature = "compress")]
     compression: compress::Options,
+    /// Serve content over plain HTTP instead of redirecting to HTTPS.
+    allow_http: bool,
+    /// Optional plain-HTTP listener address(es) for redirects + ACME HTTP-01.
+    http_addrs: Vec<std::net::SocketAddr>,
+    #[cfg(feature = "acme")]
+    acme: Option<AcmeManager>,
 }
 
 impl Server {
@@ -70,6 +95,10 @@ impl Server {
             tls: None,
             #[cfg(feature = "compress")]
             compression: compress::Options::default(),
+            allow_http: false,
+            http_addrs: Vec::new(),
+            #[cfg(feature = "acme")]
+            acme: None,
         })
     }
 
@@ -116,6 +145,30 @@ impl Server {
         self
     }
 
+    /// Serve content over plain HTTP instead of redirecting to HTTPS. Off by
+    /// default — this server upgrades HTTP requests to HTTPS.
+    pub fn allow_http(mut self, allow: bool) -> Server {
+        self.allow_http = allow;
+        self
+    }
+
+    /// Also bind a plain-HTTP listener (e.g. port 80) that redirects to HTTPS
+    /// and serves ACME HTTP-01 challenges. Runs on its own thread under
+    /// [`run`](Server::run).
+    pub fn http_redirect(mut self, addr: impl ToSocketAddrs) -> Result<Server> {
+        self.http_addrs = addr.to_socket_addrs()?.collect();
+        Ok(self)
+    }
+
+    /// Enable automatic certificates via ACME, routed per-connection by SNI.
+    /// Takes precedence over a static [`tls`](Server::tls) acceptor. Currently
+    /// served by the thread-pool runtime ([`run`](Server::run)).
+    #[cfg(feature = "acme")]
+    pub fn acme(mut self, manager: AcmeManager) -> Server {
+        self.acme = Some(manager);
+        self
+    }
+
     /// Build the shared session configuration.
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
@@ -127,18 +180,49 @@ impl Server {
         }
     }
 
+    /// Build the context for the plain-HTTP listener.
+    fn http_ctx(&self) -> redirect::HttpCtx {
+        redirect::HttpCtx {
+            allow_http: self.allow_http,
+            server_name: self.server_name.clone(),
+            limits: crate::proto::Limits::default(),
+            content: self.allow_http.then(|| Arc::clone(&self.handler)),
+            #[cfg(feature = "acme")]
+            acme: self.acme.clone(),
+            #[cfg(feature = "compress")]
+            compression: self.compression,
+        }
+    }
+
+    /// Pick how the main listener terminates TLS.
+    #[cfg(feature = "rt-threadpool")]
+    fn tls_mode(&self) -> TlsMode {
+        #[cfg(feature = "acme")]
+        if let Some(mgr) = &self.acme {
+            return TlsMode::Acme(mgr.clone());
+        }
+        #[cfg(feature = "tls")]
+        if let Some(acc) = &self.tls {
+            return TlsMode::Static(acc.clone());
+        }
+        TlsMode::Plain
+    }
+
     /// Run on the blocking thread-pool runtime. Blocks the calling thread.
+    /// If an HTTP redirect listener is configured, it runs on its own thread.
     #[cfg(feature = "rt-threadpool")]
     pub fn run(self) -> Result<()> {
         let listener = std::net::TcpListener::bind(self.addrs.as_slice())?;
         let cfg = self.session_config();
-        threadpool::run(
-            listener,
-            cfg,
-            #[cfg(feature = "tls")]
-            self.tls,
-            self.workers,
-        )
+        let tls_mode = self.tls_mode();
+
+        if !self.http_addrs.is_empty() {
+            let http = std::net::TcpListener::bind(self.http_addrs.as_slice())?;
+            let ctx = self.http_ctx();
+            std::thread::spawn(move || threadpool::run_http_redirect(http, ctx));
+        }
+
+        threadpool::run(listener, cfg, tls_mode, self.workers)
     }
 
     /// Run on a tokio runtime. Requires being called from within a tokio
