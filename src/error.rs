@@ -21,6 +21,8 @@ pub enum Error {
     Compress(String),
     /// A configuration error (invalid TOML, missing file, bad value, …).
     Config(String),
+    /// An ACME certificate-management error (protocol, network, or CA error).
+    Acme(String),
 }
 
 impl fmt::Display for Error {
@@ -32,6 +34,7 @@ impl fmt::Display for Error {
             Error::Tls(e) => write!(f, "tls error: {e}"),
             Error::Compress(e) => write!(f, "compression error: {e}"),
             Error::Config(e) => write!(f, "config error: {e}"),
+            Error::Acme(e) => write!(f, "acme error: {e}"),
         }
     }
 }

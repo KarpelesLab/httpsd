@@ -9,5 +9,7 @@
 // in following commits; allow until the module is fully wired.
 #![allow(dead_code)]
 
+pub mod client;
 pub mod jose;
 pub mod json;
+pub mod store;
