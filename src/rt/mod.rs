@@ -278,28 +278,30 @@ impl Server {
     /// Run an HTTP/3 server on a QUIC/UDP event loop, listening on the same
     /// address(es) as the TCP server (but over UDP). HTTP/3 is always encrypted.
     ///
-    /// Uses the static [`tls`](Server::tls) acceptor's certificate. Per-SNI
-    /// certificate selection over QUIC (the HTTP/3 equivalent of the TCP path's
-    /// ClientHello peek) needs the QUIC engine to expose the SNI from the
-    /// encrypted Initial packet before the handshake; until then, on-demand
-    /// ACME certificates aren't available over HTTP/3. Blocks the calling thread.
+    /// Under ACME, certificates are selected per-connection by peeking the SNI
+    /// from the QUIC Initial (`purecrypto::quic::peek_initial_sni`); the QUIC
+    /// loop serves already-issued certs (the TCP path does the issuing). With a
+    /// static [`tls`](Server::tls) acceptor, that one certificate is used.
+    /// Blocks the calling thread.
     #[cfg(feature = "h3")]
     pub fn run_h3(self) -> Result<()> {
-        let acceptor = self.h3_acceptor()?;
+        let certs = self.h3_cert_source()?;
         let cfg = self.session_config();
-        quic::run(self.addrs.clone(), cfg, acceptor)
+        quic::run(self.addrs.clone(), cfg, certs)
     }
 
     #[cfg(feature = "h3")]
-    fn h3_acceptor(&self) -> Result<TlsAcceptor> {
+    fn h3_cert_source(&self) -> Result<quic::CertSource> {
+        #[cfg(feature = "acme")]
+        if let Some(mgr) = &self.acme {
+            return Ok(quic::CertSource::Acme(mgr.clone()));
+        }
         #[cfg(feature = "tls")]
         if let Some(acc) = &self.tls {
-            return Ok(acc.clone());
+            return Ok(quic::CertSource::Static(acc.clone()));
         }
         Err(Error::Config(
-            "HTTP/3 needs a static TLS certificate (Server::tls); per-SNI HTTP/3 under ACME \
-             awaits QUIC ClientHello/SNI peek support in purecrypto"
-                .into(),
+            "HTTP/3 requires TLS: a static cert via .tls(), or ACME via .acme()".into(),
         ))
     }
 }

@@ -20,6 +20,44 @@ use crate::h3::H3Conn;
 use crate::session::SessionConfig;
 use crate::tls::TlsAcceptor;
 
+#[cfg(feature = "acme")]
+use crate::acme::{AcmeManager, CertChoice};
+
+/// Where the QUIC listener gets a certificate for each new connection.
+pub(crate) enum CertSource {
+    /// One static certificate for every connection.
+    Static(TlsAcceptor),
+    /// Per-SNI certificates from ACME, selected by peeking the QUIC Initial.
+    #[cfg(feature = "acme")]
+    Acme(AcmeManager),
+}
+
+impl CertSource {
+    /// Choose the acceptor for a new connection given its first datagram.
+    /// Returns `None` to drop the datagram (SNI not yet available, host not
+    /// permitted, or no cert issued yet — the client retries / falls back).
+    #[cfg_attr(not(feature = "acme"), allow(unused_variables))]
+    fn acceptor_for(&self, peer: SocketAddr, first_datagram: &[u8]) -> Option<TlsAcceptor> {
+        match self {
+            CertSource::Static(acceptor) => Some(acceptor.clone()),
+            #[cfg(feature = "acme")]
+            CertSource::Acme(mgr) => {
+                // The QUIC ClientHello rides in the encrypted Initial; peek its
+                // SNI without committing to a connection.
+                let info = match purecrypto::quic::peek_initial_sni(first_datagram) {
+                    Ok(Some(info)) => info,
+                    // Need the full Initial, or not a ClientHello — wait for retry.
+                    Ok(None) | Err(_) => return None,
+                };
+                match mgr.choose_cached(info.server_name.as_deref(), peer.ip().is_loopback()) {
+                    CertChoice::Serve(acceptor) => Some(acceptor),
+                    CertChoice::Reject => None,
+                }
+            }
+        }
+    }
+}
+
 /// QUIC datagrams must fit a conservative MTU; 1350 is the usual safe ceiling,
 /// we read into a slightly larger buffer.
 const RECV_BUF: usize = 2048;
@@ -34,7 +72,7 @@ struct Conn {
 }
 
 /// Bind a UDP socket and serve HTTP/3 until a fatal socket error.
-pub(crate) fn run(addrs: Vec<SocketAddr>, cfg: SessionConfig, acceptor: TlsAcceptor) -> Result<()> {
+pub(crate) fn run(addrs: Vec<SocketAddr>, cfg: SessionConfig, certs: CertSource) -> Result<()> {
     let socket = bind_first(&addrs)?;
     let start = Instant::now();
     let mut conns: HashMap<SocketAddr, Conn> = HashMap::new();
@@ -55,7 +93,7 @@ pub(crate) fn run(addrs: Vec<SocketAddr>, cfg: SessionConfig, acceptor: TlsAccep
         match socket.recv_from(&mut buf) {
             Ok((n, peer)) => {
                 let data = buf[..n].to_vec();
-                if let Err(e) = on_datagram(&socket, &mut conns, peer, &data, &cfg, &acceptor) {
+                if let Err(e) = on_datagram(&socket, &mut conns, peer, &data, &cfg, &certs) {
                     if cfg!(debug_assertions) {
                         eprintln!("httpsd: h3 connection error from {peer}: {e}");
                     }
@@ -90,9 +128,13 @@ fn on_datagram(
     peer: SocketAddr,
     data: &[u8],
     cfg: &SessionConfig,
-    acceptor: &TlsAcceptor,
+    certs: &CertSource,
 ) -> Result<()> {
     if let std::collections::hash_map::Entry::Vacant(slot) = conns.entry(peer) {
+        // New connection: pick the certificate from the Initial's SNI.
+        let Some(acceptor) = certs.acceptor_for(peer, data) else {
+            return Ok(()); // SNI unavailable / host not served — drop, client retries
+        };
         let qcfg = acceptor.quic_config()?;
         let quic = QuicConnection::server(qcfg).map_err(qerr)?;
         slot.insert(Conn {

@@ -59,11 +59,6 @@ fn run() -> httpsd::Result<()> {
             }
         });
         eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
-    } else if !opts.no_http3 && opts.acme_accept_tos && !opts.is_tls() {
-        eprintln!(
-            "httpsd: HTTP/3 not started — per-SNI HTTP/3 under ACME awaits QUIC SNI support; \
-             use --tls-cert for HTTP/3"
-        );
     }
 
     let server = opts.build_server()?;
@@ -261,11 +256,11 @@ impl Options {
         Ok(server)
     }
 
-    /// Whether HTTP/3 should run: on by default with a static TLS cert, off via
-    /// `--no-http3`. (Per-SNI HTTP/3 under ACME isn't available yet.)
+    /// Whether HTTP/3 should run: on by default whenever HTTPS is served (a
+    /// static cert or ACME), off via `--no-http3`.
     #[cfg(feature = "h3")]
     fn http3_enabled(&self) -> bool {
-        !self.no_http3 && self.is_tls()
+        !self.no_http3 && (self.is_tls() || self.acme_accept_tos)
     }
 
     /// The port from the listen address (defaults to 443 if unparseable).

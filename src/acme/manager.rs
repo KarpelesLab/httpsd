@@ -147,6 +147,40 @@ impl AcmeManager {
         }
     }
 
+    /// Like [`choose`](Self::choose) but **never blocks on ACME issuance** —
+    /// it serves only a cert already cached or on disk. Used by the QUIC/HTTP-3
+    /// runtime, whose single event loop must not stall on a multi-second
+    /// issuance; the TCP path issues, and HTTP/3 picks the cert up once it
+    /// exists (browsers reach TCP first and upgrade via `Alt-Svc`).
+    pub fn choose_cached(&self, sni: Option<&str>, peer_is_loopback: bool) -> CertChoice {
+        if peer_is_loopback {
+            return CertChoice::Serve(self.self_signed());
+        }
+        let Some(host) = sni.map(normalize).filter(|h| !h.is_empty()) else {
+            return CertChoice::Serve(self.self_signed());
+        };
+        if let Some(wl) = &self.inner.cfg.host_whitelist
+            && !wl.contains(&host)
+        {
+            return CertChoice::Reject;
+        }
+        if let Some(c) = self.inner.cache.lock().unwrap().get(&host).cloned() {
+            return CertChoice::Serve(c.acceptor.clone());
+        }
+        match self.inner.store.load_cert(&host) {
+            Ok(Some(stored)) => match TlsAcceptor::from_pem(&stored.chain_pem, &stored.key_pem) {
+                Ok(acceptor) => {
+                    let not_after = cert_not_after(&stored.chain_pem);
+                    self.cache_put(&host, acceptor.clone(), not_after);
+                    CertChoice::Serve(acceptor)
+                }
+                Err(_) => CertChoice::Reject,
+            },
+            // Not issued yet: don't block the QUIC loop — let the TCP path issue.
+            _ => CertChoice::Reject,
+        }
+    }
+
     /// Return a ready acceptor for `host`, issuing or renewing as needed.
     fn get_or_issue(&self, host: &str) -> Result<TlsAcceptor> {
         let now = now_secs();
