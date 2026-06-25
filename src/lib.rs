@@ -54,6 +54,9 @@ pub mod h2;
 #[cfg(feature = "h3")]
 pub mod h3;
 
+#[cfg(feature = "acme")]
+pub mod acme;
+
 pub mod session;
 
 #[cfg(feature = "config")]
