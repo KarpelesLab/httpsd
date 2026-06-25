@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "bitflags"
+version = "2.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+
+[[package]]
 name = "bytes"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13,6 +19,18 @@ name = "cacrt"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "883da6debf9bb96b0d591bb1589ad98b7428bd142f8acf4a014a8034fcab743d"
+
+[[package]]
+name = "cfg-if"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "compcol"
@@ -42,7 +60,8 @@ version = "0.1.0"
 dependencies = [
  "compcol 0.6.5",
  "mio",
- "purecrypto",
+ "purecrypto 0.6.22",
+ "rsurl",
  "serde",
  "tokio",
  "toml",
@@ -57,6 +76,12 @@ dependencies = [
  "equivalent",
  "hashbrown",
 ]
+
+[[package]]
+name = "intl"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5bfae726bb3f672d4f4b1f29cee6c74898a35230a4c794d8292c21129107f21"
 
 [[package]]
 name = "libc"
@@ -89,6 +114,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,11 +141,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl2"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0578cbc65e74c8217c48298c9e80468b4750426a5e651d55df14675de45f7729"
+
+[[package]]
 name = "purecrypto"
 version = "0.6.22"
 dependencies = [
  "cacrt",
  "compcol 0.4.7",
+]
+
+[[package]]
+name = "purecrypto"
+version = "0.6.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b985cabdcffe67c8372a07de7dcebd737be5a51a7422caec470a53a95407cf5e"
+dependencies = [
+ "cacrt",
+ "compcol 0.4.7",
+]
+
+[[package]]
+name = "puressh"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72da1a53865f9f7058158317730f769e48d8195594f4c94d89c2487a9b805d06"
+dependencies = [
+ "compcol 0.4.7",
+ "libc",
+ "nix",
+ "purecrypto 0.6.22 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zeroize",
 ]
 
 [[package]]
@@ -118,6 +184,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rsurl"
+version = "0.1.2"
+dependencies = [
+ "compcol 0.4.7",
+ "intl",
+ "psl2",
+ "purecrypto 0.6.22 (registry+https://github.com/rust-lang/crates.io-index)",
+ "puressh",
+ "zeroize",
 ]
 
 [[package]]
@@ -281,4 +359,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]

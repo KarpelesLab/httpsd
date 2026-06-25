@@ -38,6 +38,7 @@
 pub mod error;
 pub mod handler;
 pub mod mime;
+pub mod net;
 pub mod proto;
 pub mod static_files;
 

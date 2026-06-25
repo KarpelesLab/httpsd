@@ -31,6 +31,10 @@ h2 = ["tls", "dep:compcol", "compcol/hpack"]
 # HTTP/3 (RFC 9114) over QUIC/UDP. QUIC comes from `purecrypto`, QPACK from
 # `compcol`. Brings its own UDP server loop (see `Server::run_h3`).
 h3 = ["tls", "dep:compcol", "compcol/qpack", "compcol/hpack"]
+# Automatic TLS certificates via ACME (Let's Encrypt et al.): on-demand
+# issuance keyed on SNI, TLS-ALPN-01 + HTTP-01 challenges, on-disk persistence.
+# Uses `rsurl` as the ACME HTTP client.
+acme = ["tls", "dep:rsurl"]
 # TOML configuration file loading.
 config = ["dep:serde", "dep:toml"]
 # The `httpsd` command-line binary. Pulls in config + the thread-pool runtime
@@ -54,6 +58,7 @@ serde = { version = "1", optional = true, features = ["derive"] }
 toml = { version = "0.8", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 mio = { version = "1", optional = true, features = ["os-poll", "net"] }
+rsurl = { path = "../rsurl", optional = true }
 
 [dev-dependencies]
 purecrypto = { path = "../purecrypto" }
