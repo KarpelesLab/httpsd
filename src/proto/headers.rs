@@ -80,9 +80,7 @@ impl Headers {
     /// elements, compared case-insensitively. Handy for `Connection`,
     /// `Accept-Encoding`, `Transfer-Encoding`, etc.
     pub fn contains_token(&self, name: &str, token: &str) -> bool {
-        self.get_all(name).any(|v| {
-            v.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case(token))
-        })
+        self.get_all(name)
+            .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
     }
 }

@@ -17,7 +17,8 @@ fn free_addr() -> std::net::SocketAddr {
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("httpsd-test-{}-{}-{}", std::process::id(), tag, n));
+    let dir =
+        std::env::temp_dir().join(format!("httpsd-test-{}-{}-{}", std::process::id(), tag, n));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -36,7 +37,9 @@ fn connect(addr: std::net::SocketAddr) -> TcpStream {
 
 fn request(addr: std::net::SocketAddr, raw: &[u8]) -> Vec<u8> {
     let mut stream = connect(addr);
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     stream.write_all(raw).unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).unwrap();
@@ -115,7 +118,9 @@ fn keep_alive_two_requests_one_connection() {
     });
 
     let mut stream = connect(addr);
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     // First request keeps the connection alive.
     stream
         .write_all(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -177,7 +182,9 @@ fn tls_handshake_and_request_in_process() {
 
     // Server side: a self-signed identity + an HTTP handler, wrapped in a TLS session.
     let acceptor = TlsAcceptor::self_signed(&["localhost"]).unwrap();
-    let cfg = SessionConfig::new(Arc::new(|_: &httpsd::Request| Response::text("secure hello")));
+    let cfg = SessionConfig::new(Arc::new(|_: &httpsd::Request| {
+        Response::text("secure hello")
+    }));
     let mut server = Session::tls(cfg, acceptor.accept().unwrap());
 
     // Client side: a purecrypto TLS client that trusts anything (test only).
@@ -203,10 +210,15 @@ fn tls_handshake_and_request_in_process() {
             break;
         }
     }
-    assert!(client.is_handshake_complete(), "client handshake incomplete");
+    assert!(
+        client.is_handshake_complete(),
+        "client handshake incomplete"
+    );
 
     // Application data: send an HTTP request through the tunnel.
-    client.send(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    client
+        .send(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
     let req_wire = client.pop().unwrap();
     server.received(&req_wire).unwrap();
     let resp_wire = server.to_send().unwrap();

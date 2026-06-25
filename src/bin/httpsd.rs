@@ -188,13 +188,19 @@ impl Options {
                 "--hsts-preload" => opts.hsts_preload = true,
                 "--hsts-max-age" => {
                     let v = take_value(args, &mut i, arg)?;
-                    opts.hsts_max_age =
-                        Some(v.parse().map_err(|_| format!("invalid --hsts-max-age: {v}"))?);
+                    opts.hsts_max_age = Some(
+                        v.parse()
+                            .map_err(|_| format!("invalid --hsts-max-age: {v}"))?,
+                    );
                 }
                 "--host-whitelist" => {
                     let v = take_value(args, &mut i, arg)?;
-                    opts.host_whitelist =
-                        Some(v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect());
+                    opts.host_whitelist = Some(
+                        v.split(',')
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
                 }
                 other if other.starts_with("--self-signed=") => {
                     opts.self_signed = Some(other["--self-signed=".len()..].to_owned());
@@ -351,9 +357,9 @@ impl Options {
             (Some(cert), Some(key), _) => {
                 Ok(server.tls(httpsd::tls::TlsAcceptor::from_pem_files(cert, key)?))
             }
-            (Some(_), None, _) | (None, Some(_), _) => {
-                Err(httpsd::Error::Config("--tls-cert requires --tls-key".into()))
-            }
+            (Some(_), None, _) | (None, Some(_), _) => Err(httpsd::Error::Config(
+                "--tls-cert requires --tls-key".into(),
+            )),
             (None, None, Some(host)) => {
                 Ok(server.tls(httpsd::tls::TlsAcceptor::self_signed(&[host.as_str()])?))
             }

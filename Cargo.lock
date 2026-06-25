@@ -41,6 +41,8 @@ checksum = "e65b9ac28430d193e8cc280c5a814c5c9a5b820c57ad8611f348d46e2550554f"
 [[package]]
 name = "compcol"
 version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f7c23cbb4d3ef654210053e2f9d1c335e0e83e23d2044764df7f02b219a10cf"
 
 [[package]]
 name = "equivalent"
@@ -60,7 +62,7 @@ version = "0.1.0"
 dependencies = [
  "compcol 0.6.5",
  "mio",
- "purecrypto 0.6.25",
+ "purecrypto",
  "rsurl",
  "serde",
  "tokio",
@@ -148,17 +150,9 @@ checksum = "0578cbc65e74c8217c48298c9e80468b4750426a5e651d55df14675de45f7729"
 
 [[package]]
 name = "purecrypto"
-version = "0.6.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b985cabdcffe67c8372a07de7dcebd737be5a51a7422caec470a53a95407cf5e"
-dependencies = [
- "cacrt",
- "compcol 0.4.7",
-]
-
-[[package]]
-name = "purecrypto"
 version = "0.6.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d29b8f98b5af94fdf6f06453e45eed452f7034ebd054699b4e9b33a1c30d9fa8"
 dependencies = [
  "cacrt",
  "compcol 0.4.7",
@@ -173,7 +167,7 @@ dependencies = [
  "compcol 0.4.7",
  "libc",
  "nix",
- "purecrypto 0.6.22",
+ "purecrypto",
  "zeroize",
 ]
 
@@ -189,11 +183,13 @@ dependencies = [
 [[package]]
 name = "rsurl"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "177b43806a8f1e29cd40cd22bf18f483bcdd4838dd607811c87ba0f7b14825fa"
 dependencies = [
  "compcol 0.4.7",
  "intl",
  "psl2",
- "purecrypto 0.6.22",
+ "purecrypto",
  "puressh",
  "zeroize",
 ]

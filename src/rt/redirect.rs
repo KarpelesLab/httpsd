@@ -65,23 +65,25 @@ fn respond(req: &Request, local_ip: std::net::IpAddr, ctx: &HttpCtx) -> Response
     // ACME HTTP-01: serve the key authorization for a known token.
     #[cfg(feature = "acme")]
     if let Some(mgr) = &ctx.acme
-        && let Some(token) = req.path().strip_prefix("/.well-known/acme-challenge/") {
-            return match mgr.http_challenge(token) {
-                Some(key_auth) => Response::new(StatusCode::OK)
-                    .header("Content-Type", "application/octet-stream")
-                    .body(key_auth),
-                None => Response::status(StatusCode::NOT_FOUND),
-            };
-        }
+        && let Some(token) = req.path().strip_prefix("/.well-known/acme-challenge/")
+    {
+        return match mgr.http_challenge(token) {
+            Some(key_auth) => Response::new(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
+                .body(key_auth),
+            None => Response::status(StatusCode::NOT_FOUND),
+        };
+    }
 
     // Serve content over HTTP only when explicitly allowed.
     if ctx.allow_http
-        && let Some(handler) = &ctx.content {
-            let resp = handler.handle(req);
-            #[cfg(feature = "compress")]
-            let resp = compress::compress_response(req, resp, &ctx.compression);
-            return resp;
-        }
+        && let Some(handler) = &ctx.content
+    {
+        let resp = handler.handle(req);
+        #[cfg(feature = "compress")]
+        let resp = compress::compress_response(req, resp, &ctx.compression);
+        return resp;
+    }
 
     // Otherwise upgrade to HTTPS (308 keeps the method/body).
     let location = gdns::redirect_location(req.host(), local_ip, req.target());

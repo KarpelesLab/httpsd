@@ -15,7 +15,7 @@ use compcol::qpack::{QpackDecoder, QpackEncoder};
 use purecrypto::quic::{QuicConnection, StreamId};
 
 use crate::error::Result;
-use crate::proto::{request_head, response_fields, Limits, Request, Response, Version};
+use crate::proto::{Limits, Request, Response, Version, request_head, response_fields};
 use crate::session::SessionConfig;
 
 #[cfg(feature = "compress")]
@@ -89,8 +89,8 @@ impl H3Conn {
         let ids: Vec<u64> = quic.readable_streams().map(|s| s.value()).collect();
         for id in ids {
             match id & 0x3 {
-                0x0 => self.read_request(quic, id),       // client-initiated bidi
-                0x2 => drain_stream(quic, id),            // client-initiated uni (control/qpack)
+                0x0 => self.read_request(quic, id), // client-initiated bidi
+                0x2 => drain_stream(quic, id),      // client-initiated uni (control/qpack)
                 _ => {}
             }
         }
@@ -214,8 +214,15 @@ impl H3Conn {
         }
 
         let block = header_block.ok_or(())?;
-        let fields = self.qpack_dec.decode_field_section(&block).map_err(|_| ())?;
-        let head = request_head(fields.iter().map(|f| (f.name.as_slice(), f.value.as_slice())))?;
+        let fields = self
+            .qpack_dec
+            .decode_field_section(&block)
+            .map_err(|_| ())?;
+        let head = request_head(
+            fields
+                .iter()
+                .map(|f| (f.name.as_slice(), f.value.as_slice())),
+        )?;
         Ok(Request::new(
             head.method,
             head.target,
@@ -228,10 +235,11 @@ impl H3Conn {
     /// Encode a response as a HEADERS frame followed by a DATA frame.
     fn encode_response(&mut self, resp: Response) -> Vec<u8> {
         let (status, headers, body) = resp.into_parts();
-        let fields: Vec<HeaderField> = response_fields(status, &headers, self.server_name.as_deref())
-            .iter()
-            .map(|(n, v)| HeaderField::new(n, v))
-            .collect();
+        let fields: Vec<HeaderField> =
+            response_fields(status, &headers, self.server_name.as_deref())
+                .iter()
+                .map(|(n, v)| HeaderField::new(n, v))
+                .collect();
         let section = self.qpack_enc.encode_field_section(&fields);
 
         let mut out = Vec::new();
@@ -359,7 +367,17 @@ mod tests {
     #[test]
     fn varint_round_trip() {
         // QUIC varints encode values in [0, 2^62 - 1].
-        for v in [0u64, 1, 63, 64, 16383, 16384, 1 << 29, 1 << 30, (1 << 62) - 1] {
+        for v in [
+            0u64,
+            1,
+            63,
+            64,
+            16383,
+            16384,
+            1 << 29,
+            1 << 30,
+            (1 << 62) - 1,
+        ] {
             let mut out = Vec::new();
             write_varint(&mut out, v);
             let (got, n) = read_varint(&out, 0).unwrap();

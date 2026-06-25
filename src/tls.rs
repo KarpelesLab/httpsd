@@ -15,7 +15,7 @@ use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{Config, Connection, SigningKey};
 use purecrypto::x509::{AnyPrivateKey, Certificate, DistinguishedName, Time, Validity};
 #[cfg(feature = "acme")]
-use purecrypto::x509::{extension::subject_alt_name, CertSigner, Extension, GeneralName};
+use purecrypto::x509::{CertSigner, Extension, GeneralName, extension::subject_alt_name};
 
 use crate::error::{Error, Result};
 
@@ -141,9 +141,14 @@ impl TlsAcceptor {
             critical: true,
             value: acme_value,
         };
-        let cert =
-            Certificate::self_signed_with_extensions(&CertSigner::Ecdsa(&key), &name, &validity, 1, &[san, acme_ext])
-                .map_err(tls_err)?;
+        let cert = Certificate::self_signed_with_extensions(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            &[san, acme_ext],
+        )
+        .map_err(tls_err)?;
         let chain = vec![cert.to_der().to_vec()];
         TlsAcceptor::build_with_alpn(chain, key.to_sec1_pem(), vec![b"acme-tls/1".to_vec()])
     }
@@ -377,9 +382,7 @@ fn signing_key_from_pkcs8(text: &str) -> Result<SigningKey> {
     if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(text) {
         return Ok(SigningKey::Ed25519(k));
     }
-    Err(Error::Tls(
-        "PKCS#8 key is not RSA, EC, or Ed25519".into(),
-    ))
+    Err(Error::Tls("PKCS#8 key is not RSA, EC, or Ed25519".into()))
 }
 
 #[cfg(test)]

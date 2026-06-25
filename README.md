@@ -1,5 +1,10 @@
 # httpsd
 
+[![CI](https://github.com/KarpelesLab/httpsd/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/httpsd/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/httpsd.svg)](https://crates.io/crates/httpsd)
+[![docs.rs](https://img.shields.io/docsrs/httpsd)](https://docs.rs/httpsd)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust HTTP server (HTTP/1.1, HTTP/2, and HTTP/3) with a **sans-I/O core**
 and **pluggable runtimes**.
 

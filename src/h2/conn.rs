@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 
 use compcol::hpack::{HeaderField, HpackDecoder, HpackEncoder};
 
-use super::frame::{self, errcode, flag, ftype, settings, FrameHeader, CLIENT_PREFACE};
+use super::frame::{self, CLIENT_PREFACE, FrameHeader, errcode, flag, ftype, settings};
 use crate::proto::{
-    request_head, Headers, Limits, Request, RequestHead, Response, StatusCode, Version,
+    Headers, Limits, Request, RequestHead, Response, StatusCode, Version, request_head,
 };
 
 const DEFAULT_WINDOW: i64 = 65_535;
@@ -194,10 +194,11 @@ impl H2Conn {
 
             // A CONTINUATION must immediately follow its HEADERS on the same stream.
             if let Some(cs) = self.continuation_stream
-                && (header.ftype != ftype::CONTINUATION || header.stream_id != cs) {
-                    self.conn_error(errcode::PROTOCOL_ERROR);
-                    return;
-                }
+                && (header.ftype != ftype::CONTINUATION || header.stream_id != cs)
+            {
+                self.conn_error(errcode::PROTOCOL_ERROR);
+                return;
+            }
 
             match header.ftype {
                 ftype::SETTINGS => self.on_settings(&header, &payload),
@@ -359,8 +360,16 @@ impl H2Conn {
             }
         };
 
-        let end_stream = self.streams.get(&sid).map(|s| s.end_stream_recv).unwrap_or(false);
-        let head = request_head(fields.iter().map(|f| (f.name.as_slice(), f.value.as_slice())));
+        let end_stream = self
+            .streams
+            .get(&sid)
+            .map(|s| s.end_stream_recv)
+            .unwrap_or(false);
+        let head = request_head(
+            fields
+                .iter()
+                .map(|f| (f.name.as_slice(), f.value.as_slice())),
+        );
         match head {
             Ok(parts) => {
                 if end_stream {
@@ -412,10 +421,11 @@ impl H2Conn {
         }
 
         if header.has(flag::END_STREAM)
-            && let Some(parts) = self.pending_heads.remove(&sid) {
-                let body = std::mem::take(&mut self.streams.get_mut(&sid).unwrap().body);
-                self.deliver(sid, parts, body);
-            }
+            && let Some(parts) = self.pending_heads.remove(&sid)
+        {
+            let body = std::mem::take(&mut self.streams.get_mut(&sid).unwrap().body);
+            self.deliver(sid, parts, body);
+        }
     }
 
     fn deliver(&mut self, sid: u32, head: RequestHead, body: Vec<u8>) {
@@ -454,7 +464,10 @@ impl H2Conn {
                 return;
             }
             s.out_headers_sent = true;
-            (std::mem::take(&mut s.out_headers), s.out_body_remaining() > 0)
+            (
+                std::mem::take(&mut s.out_headers),
+                s.out_body_remaining() > 0,
+            )
         };
 
         let max = self.peer_max_frame.max(1);
@@ -580,7 +593,12 @@ mod tests {
         (headers, data)
     }
 
-    fn client_request(enc: &mut HpackEncoder, sid: u32, fields: &[HeaderField], body: Option<&[u8]>) -> Vec<u8> {
+    fn client_request(
+        enc: &mut HpackEncoder,
+        sid: u32,
+        fields: &[HeaderField],
+        body: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
         let block = enc.encode(fields);
         let end_stream = body.is_none();
@@ -624,8 +642,13 @@ mod tests {
         c.respond(1, Response::text("hello h2"));
         let out = c.take_out();
         let (hblock, data) = collect(&out, 1);
-        let fields = HpackDecoder::new().decode(&hblock).expect("decode resp headers");
-        let status = fields.iter().find(|f| f.name == b":status").expect("status");
+        let fields = HpackDecoder::new()
+            .decode(&hblock)
+            .expect("decode resp headers");
+        let status = fields
+            .iter()
+            .find(|f| f.name == b":status")
+            .expect("status");
         assert_eq!(status.value, b"200");
         assert_eq!(data, b"hello h2");
     }
@@ -664,7 +687,11 @@ mod tests {
 
 /// Build the HPACK field list for a response from the shared response-header
 /// rules (`:status` first, hop-by-hop dropped, `server` defaulted).
-fn response_fields(status: StatusCode, headers: &Headers, server: Option<&str>) -> Vec<HeaderField> {
+fn response_fields(
+    status: StatusCode,
+    headers: &Headers,
+    server: Option<&str>,
+) -> Vec<HeaderField> {
     crate::proto::response_fields(status, headers, server)
         .iter()
         .map(|(n, v)| HeaderField::new(n, v))

@@ -195,7 +195,8 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("httpsd-store-{}-{}-{}", std::process::id(), tag, n));
+        let d =
+            std::env::temp_dir().join(format!("httpsd-store-{}-{}-{}", std::process::id(), tag, n));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -226,7 +227,11 @@ mod tests {
         assert!(s.host_dir("").is_err());
         assert!(s.host_dir("ok.example.com").is_ok());
         // wildcard maps to underscore
-        assert!(s.host_dir("*.example.com").unwrap().ends_with("_.example.com"));
+        assert!(
+            s.host_dir("*.example.com")
+                .unwrap()
+                .ends_with("_.example.com")
+        );
     }
 
     #[cfg(unix)]
@@ -235,7 +240,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let s = Store::open(Some(tmpdir("perm"))).unwrap();
         s.save_account_key("K").unwrap();
-        let mode = std::fs::metadata(s.account_path()).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(s.account_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 }

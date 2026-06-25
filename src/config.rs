@@ -330,8 +330,8 @@ mod tests {
 
     #[test]
     fn parses_minimal() {
-        let cfg = ServerConfig::from_toml_str("listen = \"127.0.0.1:8080\"\nroot = \"/srv\"\n")
-            .unwrap();
+        let cfg =
+            ServerConfig::from_toml_str("listen = \"127.0.0.1:8080\"\nroot = \"/srv\"\n").unwrap();
         assert_eq!(cfg.listen_addrs(), vec!["127.0.0.1:8080"]);
         assert_eq!(cfg.root, Some(PathBuf::from("/srv")));
     }

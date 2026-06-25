@@ -244,7 +244,8 @@ impl H1Conn {
 
     fn maybe_send_continue(&mut self, headers: &Headers) {
         if !self.interim_sent && headers.contains_token("expect", "100-continue") {
-            self.outbuf.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+            self.outbuf
+                .extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
             self.interim_sent = true;
         }
     }
@@ -263,7 +264,10 @@ impl H1Conn {
         }
 
         let keep_alive = meta.keep_alive && !self.closed;
-        headers.set("Connection", if keep_alive { "keep-alive" } else { "close" });
+        headers.set(
+            "Connection",
+            if keep_alive { "keep-alive" } else { "close" },
+        );
 
         if let Some(server) = &self.server_name {
             headers.set_if_absent("Server", server.clone());
@@ -349,9 +353,7 @@ fn negotiate_keep_alive(version: Version, headers: &Headers) -> bool {
 
 /// Parse the request line and header fields from the header block (the bytes
 /// before the terminating CRLFCRLF).
-fn parse_head(
-    head: &[u8],
-) -> Result<(Method, String, Option<Version>, Headers)> {
+fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)> {
     let text = std::str::from_utf8(head).map_err(|_| Error::BadRequest("non-UTF-8 header"))?;
     let mut lines = text.split("\r\n");
 
@@ -414,8 +416,7 @@ fn decode_chunked(
             None => size_line,
         };
         let hex = std::str::from_utf8(hex).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let size = usize::from_str_radix(hex.trim(), 16)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let size = usize::from_str_radix(hex.trim(), 16).map_err(|_| StatusCode::BAD_REQUEST)?;
         let after_size = pos + eol + 2;
 
         if size == 0 {
@@ -447,9 +448,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Current Unix time in whole seconds (0 if the clock is before the epoch).

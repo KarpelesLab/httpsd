@@ -259,7 +259,10 @@ mod tests {
         let v = parse(r#"{"a":1,"b":[true,null,"x"],"c":{"d":"e"}}"#).unwrap();
         assert_eq!(v.get("c").unwrap().str_at("d"), Some("e"));
         assert_eq!(v.get("b").unwrap().as_array().unwrap().len(), 3);
-        assert_eq!(v.get("b").unwrap().as_array().unwrap()[2].as_str(), Some("x"));
+        assert_eq!(
+            v.get("b").unwrap().as_array().unwrap()[2].as_str(),
+            Some("x")
+        );
         assert_eq!(v.get("a"), Some(&Value::Num(1.0)));
     }
 

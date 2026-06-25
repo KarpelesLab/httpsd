@@ -2,7 +2,7 @@
 //! ES256 (ECDSA P-256 / SHA-256) JWS signing (RFC 7515/7518/7638, RFC 8555 §6.2).
 
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
-use purecrypto::hash::{sha256, Sha256};
+use purecrypto::hash::{Sha256, sha256};
 
 use super::json;
 use crate::error::{Error, Result};
@@ -175,7 +175,9 @@ mod tests {
         assert_eq!(ph.get("jwk").unwrap().str_at("crv"), Some("P-256"));
 
         // POST-as-GET uses an empty payload.
-        let g = k.sign("https://acme.test/y", "n2", &KeyId::Kid("acc".into()), "").unwrap();
+        let g = k
+            .sign("https://acme.test/y", "n2", &KeyId::Kid("acc".into()), "")
+            .unwrap();
         assert_eq!(json::parse(&g).unwrap().str_at("payload"), Some(""));
     }
 

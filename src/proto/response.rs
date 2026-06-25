@@ -159,6 +159,8 @@ impl Response {
         (self.status, self.headers, self.body.into_bytes())
     }
 
+    // Used by the compression layer to rebuild a response after re-encoding.
+    #[cfg_attr(not(feature = "compress"), allow(dead_code))]
     pub(crate) fn from_parts(status: StatusCode, headers: Headers, body: Vec<u8>) -> Response {
         Response {
             status,

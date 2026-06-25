@@ -40,7 +40,11 @@ pub(crate) fn choose(mgr: &AcmeManager, info: &ClientHelloInfo, loopback: bool) 
     // A TLS-ALPN-01 validation connection must get the challenge cert (and only
     // when one is actually pending for that host).
     if info.wants_acme_tls() {
-        return match info.server_name.as_deref().and_then(|h| mgr.challenge_acceptor(h)) {
+        return match info
+            .server_name
+            .as_deref()
+            .and_then(|h| mgr.challenge_acceptor(h))
+        {
             Some(acceptor) => CertChoice::Serve(acceptor),
             None => CertChoice::Reject,
         };

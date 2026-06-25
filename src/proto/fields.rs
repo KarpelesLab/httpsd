@@ -94,16 +94,15 @@ pub(crate) fn response_fields(
     for (name, value) in headers.iter() {
         let lower = name.to_ascii_lowercase();
         match lower.as_str() {
-            "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding"
-            | "upgrade" => continue,
+            "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" => {
+                continue;
+            }
             "server" => has_server = true,
             _ => {}
         }
         fields.push((lower.into_bytes(), value.as_bytes().to_vec()));
     }
-    if !has_server
-        && let Some(s) = server
-    {
+    if !has_server && let Some(s) = server {
         fields.push((b"server".to_vec(), s.as_bytes().to_vec()));
     }
     fields

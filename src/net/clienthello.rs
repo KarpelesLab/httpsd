@@ -101,7 +101,10 @@ mod tests {
         let rec = client_hello(Some("example.test"), &[b"h2", b"http/1.1"]);
         let info = peek(&rec).unwrap().unwrap();
         assert_eq!(info.server_name.as_deref(), Some("example.test"));
-        assert_eq!(info.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(
+            info.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
         assert!(!info.wants_acme_tls());
     }
 

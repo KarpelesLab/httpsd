@@ -27,14 +27,14 @@ pub(crate) mod redirect;
 #[cfg(feature = "acme")]
 pub(crate) mod route;
 
-#[cfg(feature = "rt-threadpool")]
-mod threadpool;
-#[cfg(feature = "rt-tokio")]
-mod tokio;
 #[cfg(feature = "rt-mio")]
 mod mio;
 #[cfg(feature = "h3")]
 mod quic;
+#[cfg(feature = "rt-threadpool")]
+mod threadpool;
+#[cfg(feature = "rt-tokio")]
+mod tokio;
 
 #[cfg(feature = "acme")]
 use crate::acme::AcmeManager;

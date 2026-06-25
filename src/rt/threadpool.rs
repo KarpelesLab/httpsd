@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::Result;
+use crate::rt::TlsMode;
 use crate::rt::common::serve_blocking;
 use crate::rt::redirect::{self, HttpCtx};
-use crate::rt::TlsMode;
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "acme")]
@@ -69,9 +69,10 @@ fn worker_loop(rx: Arc<Mutex<Receiver<TcpStream>>>, shared: Arc<Shared>) {
             return;
         };
         if let Err(e) = handle(stream, &shared)
-            && cfg!(debug_assertions) {
-                eprintln!("httpsd: connection ended: {e}");
-            }
+            && cfg!(debug_assertions)
+        {
+            eprintln!("httpsd: connection ended: {e}");
+        }
     }
 }
 
@@ -95,7 +96,11 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> Result<()> {
 }
 
 #[cfg(feature = "acme")]
-fn handle_acme(mut stream: TcpStream, shared: &Shared, mgr: &crate::acme::AcmeManager) -> Result<()> {
+fn handle_acme(
+    mut stream: TcpStream,
+    shared: &Shared,
+    mgr: &crate::acme::AcmeManager,
+) -> Result<()> {
     // Peek the ClientHello, then choose a certificate by SNI/ALPN.
     let Some((initial, info)) = route::read_client_hello(&mut stream)? else {
         return Ok(()); // not TLS / closed early
@@ -125,9 +130,10 @@ pub(crate) fn run_http_redirect(listener: TcpListener, ctx: HttpCtx) {
                 thread::spawn(move || {
                     stream.set_nodelay(true).ok();
                     if let Err(e) = redirect::serve(&mut stream, &ctx)
-                        && cfg!(debug_assertions) {
-                            eprintln!("httpsd: http connection ended: {e}");
-                        }
+                        && cfg!(debug_assertions)
+                    {
+                        eprintln!("httpsd: http connection ended: {e}");
+                    }
                 });
             }
             Err(e) => eprintln!("httpsd: http accept error: {e}"),

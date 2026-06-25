@@ -52,17 +52,17 @@ rt-mio = ["dep:mio"]
 [dependencies]
 # purecrypto's `tls` module pulls in DTLS/QUIC paths that are wired to the
 # default feature set, so we use its defaults rather than cherry-picking.
-purecrypto = { path = "../purecrypto", optional = true }
-compcol = { path = "../compcol", optional = true, default-features = false, features = ["std", "gzip", "deflate", "zlib"] }
+purecrypto = { version = "0.6.25", optional = true }
+compcol = { version = "0.6.5", optional = true, default-features = false, features = ["std", "gzip", "deflate", "zlib"] }
 serde = { version = "1", optional = true, features = ["derive"] }
 toml = { version = "0.8", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 mio = { version = "1", optional = true, features = ["os-poll", "net"] }
-rsurl = { path = "../rsurl", optional = true }
+rsurl = { version = "0.1.2", optional = true }
 
 [dev-dependencies]
-purecrypto = { path = "../purecrypto" }
-compcol = { path = "../compcol", default-features = false, features = ["std", "gzip"] }
+purecrypto = "0.6.25"
+compcol = { version = "0.6.5", default-features = false, features = ["std", "gzip"] }
 
 [package.metadata.docs.rs]
 all-features = true

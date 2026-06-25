@@ -12,7 +12,7 @@ use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
 use purecrypto::x509::{CertSigner, CertificationRequest, DistinguishedName};
 use rsurl::Request;
 
-use super::jose::{b64url, AccountKey, KeyId};
+use super::jose::{AccountKey, KeyId, b64url};
 use super::json::{self, Value};
 use crate::error::{Error, Result};
 
@@ -62,7 +62,11 @@ impl AcmeClient {
     /// `email` for the `contact` field (optional). The caller is responsible for
     /// having obtained ToS agreement from the operator before calling
     /// [`ensure_account`](Self::ensure_account).
-    pub fn new(directory_url: &str, account: AccountKey, email: Option<String>) -> Result<AcmeClient> {
+    pub fn new(
+        directory_url: &str,
+        account: AccountKey,
+        email: Option<String>,
+    ) -> Result<AcmeClient> {
         let resp = http_get(directory_url)?;
         let doc = parse_json(&resp.body)?;
         let dir = Directory {
@@ -387,7 +391,9 @@ mod tests {
     fn bad_nonce_detection() {
         let body = br#"{"type":"urn:ietf:params:acme:error:badNonce","detail":"bad"}"#;
         assert!(is_bad_nonce(body));
-        assert!(!is_bad_nonce(br#"{"type":"urn:ietf:params:acme:error:malformed"}"#));
+        assert!(!is_bad_nonce(
+            br#"{"type":"urn:ietf:params:acme:error:malformed"}"#
+        ));
     }
 
     #[test]

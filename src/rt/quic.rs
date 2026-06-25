@@ -171,7 +171,12 @@ fn fire_timers(
 }
 
 /// Run the HTTP/3 engine, flush outbound datagrams, and refresh the timer.
-fn service(socket: &UdpSocket, peer: SocketAddr, conn: &mut Conn, cfg: &SessionConfig) -> Result<()> {
+fn service(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    conn: &mut Conn,
+    cfg: &SessionConfig,
+) -> Result<()> {
     conn.h3.drive(&mut conn.quic, cfg)?;
     loop {
         let dg = conn.quic.pop_datagram();

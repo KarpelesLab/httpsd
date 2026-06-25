@@ -119,7 +119,12 @@ impl AcmeManager {
     /// The HTTP-01 key authorization for `token`, if any (served by the HTTP
     /// listener at `/.well-known/acme-challenge/<token>`).
     pub fn http_challenge(&self, token: &str) -> Option<String> {
-        self.inner.http_challenges.lock().unwrap().get(token).cloned()
+        self.inner
+            .http_challenges
+            .lock()
+            .unwrap()
+            .get(token)
+            .cloned()
     }
 
     /// Decide which certificate to present for a connection.
@@ -133,9 +138,10 @@ impl AcmeManager {
             return CertChoice::Serve(self.self_signed());
         };
         if let Some(wl) = &self.inner.cfg.host_whitelist
-            && !wl.contains(&host) {
-                return CertChoice::Reject;
-            }
+            && !wl.contains(&host)
+        {
+            return CertChoice::Reject;
+        }
         match self.get_or_issue(&host) {
             Ok(acceptor) => CertChoice::Serve(acceptor),
             Err(e) => {
@@ -187,9 +193,10 @@ impl AcmeManager {
 
         // Fast path: a fresh cached cert.
         if let Some(c) = self.inner.cache.lock().unwrap().get(host).cloned()
-            && !near_expiry(c.not_after, now) {
-                return Ok(c.acceptor.clone());
-            }
+            && !near_expiry(c.not_after, now)
+        {
+            return Ok(c.acceptor.clone());
+        }
 
         // Serialize issuance per host.
         let lock = self.host_lock(host);
@@ -197,9 +204,10 @@ impl AcmeManager {
 
         // Re-check the cache now that we hold the lock.
         if let Some(c) = self.inner.cache.lock().unwrap().get(host).cloned()
-            && !near_expiry(c.not_after, now) {
-                return Ok(c.acceptor.clone());
-            }
+            && !near_expiry(c.not_after, now)
+        {
+            return Ok(c.acceptor.clone());
+        }
 
         // Try disk before talking to the CA.
         if let Some(stored) = self.inner.store.load_cert(host)? {
@@ -233,7 +241,8 @@ impl AcmeManager {
     fn issue(&self, host: &str) -> Result<TlsAcceptor> {
         if !self.inner.cfg.accept_tos {
             return Err(Error::Acme(
-                "automatic issuance disabled: the CA terms of service have not been accepted".into(),
+                "automatic issuance disabled: the CA terms of service have not been accepted"
+                    .into(),
             ));
         }
         let mut client = self.make_client()?;
@@ -286,7 +295,10 @@ impl AcmeManager {
     fn cache_put(&self, host: &str, acceptor: TlsAcceptor, not_after: Option<u64>) {
         self.inner.cache.lock().unwrap().insert(
             host.to_owned(),
-            Arc::new(Cached { acceptor, not_after }),
+            Arc::new(Cached {
+                acceptor,
+                not_after,
+            }),
         );
     }
 }

@@ -125,7 +125,13 @@ pub fn write_window_update(out: &mut Vec<u8>, stream_id: u32, increment: u32) {
 
 /// Append an RST_STREAM frame.
 pub fn write_rst_stream(out: &mut Vec<u8>, stream_id: u32, error_code: u32) {
-    write_frame(out, ftype::RST_STREAM, 0, stream_id, &error_code.to_be_bytes());
+    write_frame(
+        out,
+        ftype::RST_STREAM,
+        0,
+        stream_id,
+        &error_code.to_be_bytes(),
+    );
 }
 
 /// Append a GOAWAY frame.

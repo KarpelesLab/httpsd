@@ -245,11 +245,13 @@ impl Session {
 /// Add the configured edge headers: `Strict-Transport-Security` (secure
 /// connections only — clients ignore HSTS over plain HTTP) and `Alt-Svc`
 /// (e.g. advertising HTTP/3). Shared with the HTTP/3 engine (always secure).
-pub(crate) fn apply_edge_headers(cfg: &SessionConfig, mut resp: Response, secure: bool) -> Response {
+pub(crate) fn apply_edge_headers(
+    cfg: &SessionConfig,
+    mut resp: Response,
+    secure: bool,
+) -> Response {
     let h = resp.headers_mut();
-    if secure
-        && let Some(value) = &cfg.hsts
-    {
+    if secure && let Some(value) = &cfg.hsts {
         h.set_if_absent("Strict-Transport-Security", value.clone());
     }
     if let Some(value) = &cfg.alt_svc {

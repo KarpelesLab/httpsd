@@ -44,10 +44,11 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
         // feed may have produced a TLS alert (e.g. a refused renegotiation), and
         // the peer should receive it rather than a bare connection reset.
         if let Ok(out) = session.to_send()
-            && !out.is_empty() {
-                stream.write_all(&out)?;
-                stream.flush()?;
-            }
+            && !out.is_empty()
+        {
+            stream.write_all(&out)?;
+            stream.flush()?;
+        }
 
         received?;
         if session.wants_close() {

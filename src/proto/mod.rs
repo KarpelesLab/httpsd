@@ -25,4 +25,4 @@ pub use version::Version;
 
 pub(crate) use conn::http_date;
 #[cfg(any(feature = "h2", feature = "h3"))]
-pub(crate) use fields::{request_head, response_fields, RequestHead};
+pub(crate) use fields::{RequestHead, request_head, response_fields};
