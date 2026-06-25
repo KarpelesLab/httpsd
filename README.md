@@ -18,6 +18,10 @@ or as a command-line server that serves a directory or a TOML config file.
   stack — no OpenSSL, no C.
 - **Compression via [compcol](https://crates.io/crates/compcol).** gzip/deflate
   response compression, plus HPACK (HTTP/2) and QPACK (HTTP/3) header coding.
+- **Automatic certificates (ACME).** On-demand issuance keyed on SNI
+  (Let's Encrypt or any ACME CA), TLS-ALPN-01 + HTTP-01 challenges, on-disk
+  persistence and renewal. HTTP is redirected to HTTPS by default; bare-IP
+  requests are redirected to a resolvable `g-dns.net` host.
 - **No mandatory async runtime.** The default build is a blocking thread pool;
   tokio and mio are opt-in.
 
@@ -38,6 +42,10 @@ httpsd ./public -l 127.0.0.1:8443 --self-signed
 
 # Also serve HTTP/3 over QUIC/UDP on the same port (requires TLS)
 httpsd ./public -l 127.0.0.1:8443 --self-signed --http3
+
+# Automatic HTTPS with Let's Encrypt (issues certs on demand, per SNI)
+httpsd /srv/www -l 0.0.0.0:443 --http 0.0.0.0:80 \
+    --acme-accept-tos --acme-email you@example.com
 
 # Run from a config file (see samples/config.toml)
 httpsd -c config.toml
@@ -102,6 +110,35 @@ A custom handler is just `Fn(&Request) -> Response` (or anything implementing
 [`Handler`](src/handler.rs)). Because the core is sans-I/O, one synchronous
 handler works identically under all three runtimes.
 
+## Automatic certificates (ACME)
+
+With `--acme-accept-tos` (you accept the CA's terms of service) the server
+obtains certificates on demand: when a TLS ClientHello arrives for a host it has
+no certificate for, it issues one from the ACME CA and persists it, then serves
+it. Defaults chosen for safety:
+
+- **Challenges:** TLS-ALPN-01 (all on 443) is tried first; HTTP-01 is a fallback
+  when the `--http` listener is running.
+- **Storage:** `/var/lib/httpsd` (FHS persistent state) → falls back to
+  `$XDG_DATA_HOME/httpsd` when not root. Account key `0600`, dirs `0700`,
+  atomic writes. (Never `/run` — tmpfs would cause re-issuance storms.)
+- **Loopback** peers never trigger issuance — they get a self-signed cert.
+- **Scope:** `--host-whitelist a.com,b.com` restricts which hosts may be issued;
+  otherwise any SNI host is attempted. First issuance blocks the handshake
+  (single-flight per host); renewal happens within 30 days of expiry.
+- **HTTPS-first:** plain-HTTP requests are `308`-redirected to HTTPS unless
+  `--allow-http`. A request to a bare IP (or with no `Host`) is redirected to
+  `https://<base32(ip)>.g-dns.net/…`, which resolves back to that IP so the
+  follow-up request carries a real SNI host.
+
+```sh
+httpsd /srv/www -l 0.0.0.0:443 --http 0.0.0.0:80 \
+    --acme-accept-tos --acme-email you@example.com --acme-staging
+```
+
+Drop `--acme-staging` for production Let's Encrypt; `--acme-directory URL` points
+at any other ACME CA. ACME currently runs under the thread-pool runtime.
+
 ## Configuration file
 
 ```toml
@@ -132,6 +169,7 @@ See [`samples/config.toml`](samples/config.toml).
 | `compress`      |   ✓     | gzip/deflate response compression via `compcol`.         |
 | `h2`            |   ✓     | HTTP/2 over TLS (ALPN); HPACK via `compcol`.             |
 | `h3`            |         | HTTP/3 over QUIC/UDP; QPACK via `compcol`, QUIC via `purecrypto`. |
+| `acme`          |         | Automatic certificates (ACME); ACME HTTP client via `rsurl`. |
 | `config`        |         | TOML configuration loading (pulled in by `cli`).         |
 | `rt-tokio`      |         | Asynchronous tokio runtime.                              |
 | `rt-mio`        |         | Single-thread mio event-loop runtime.                    |
@@ -157,6 +195,9 @@ httpsd = { version = "0.1", default-features = false, features = ["rt-tokio", "t
 - Path-traversal protection (rejects `..`, canonicalizes against the root).
 - Response compression negotiated from `Accept-Encoding`, skipping
   already-compressed media types and tiny bodies.
+- Automatic ACME certificates (RFC 8555) with TLS-ALPN-01 (RFC 8737) and
+  HTTP-01 challenges, on-disk persistence, and renewal; HTTP→HTTPS and
+  bare-IP→`g-dns.net` redirects.
 
 Verified against `curl` for HTTP/1.1, `--http2`, and `--http3-only`.
 

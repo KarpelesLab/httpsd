@@ -24,3 +24,17 @@ server_name = "httpsd"
 [compress]
 enabled = true
 min_size = 256
+
+# Plain-HTTP listener: redirects to HTTPS and serves ACME HTTP-01 challenges.
+# http_listen = "0.0.0.0:80"
+# Serve content over HTTP instead of redirecting (off by default):
+# allow_http = false
+
+# Automatic certificates via ACME (e.g. Let's Encrypt). Requires accept_tos.
+# [acme]
+# accept_tos = true
+# email = "you@example.com"
+# staging = true                     # use Let's Encrypt staging while testing
+# directory = "https://acme-v02.api.letsencrypt.org/directory"  # any ACME CA
+# host_whitelist = ["example.com", "www.example.com"]
+# cert_dir = "/var/lib/httpsd"
