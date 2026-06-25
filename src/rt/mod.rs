@@ -266,9 +266,14 @@ impl Server {
     }
 }
 
-/// Pick a sensible default worker count from the available parallelism.
+/// Pick a sensible default worker count. Workers spend most of their time
+/// blocked on socket I/O — and, with on-demand ACME, a worker can block on a
+/// full certificate issuance whose challenge validation needs *another* worker
+/// to answer concurrently. So we don't size the pool to CPU count (a 1-core box
+/// would deadlock that case); we apply a floor.
 fn default_workers() -> usize {
-    std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
+        .unwrap_or(1);
+    cores.max(8)
 }
