@@ -101,6 +101,10 @@ OPTIONS:
         --acme-staging      use the Let's Encrypt staging environment
         --host-whitelist H1,H2  only issue certificates for these hosts
         --cert-dir DIR      certificate storage directory
+        --hsts              send Strict-Transport-Security (max-age 1 year) on HTTPS
+        --hsts-max-age N    HSTS max-age in seconds (implies --hsts)
+        --hsts-include-subdomains  add includeSubDomains (implies --hsts)
+        --hsts-preload      add preload (implies --hsts)
         --no-compress       disable response compression
     -h, --help              print this help
 ";
@@ -123,6 +127,10 @@ struct Options {
     acme_staging: bool,
     host_whitelist: Option<Vec<String>>,
     cert_dir: Option<String>,
+    hsts: bool,
+    hsts_max_age: Option<u64>,
+    hsts_include_subdomains: bool,
+    hsts_preload: bool,
 }
 
 impl Options {
@@ -145,6 +153,10 @@ impl Options {
             acme_staging: false,
             host_whitelist: None,
             cert_dir: None,
+            hsts: false,
+            hsts_max_age: None,
+            hsts_include_subdomains: false,
+            hsts_preload: false,
         };
         let mut saw_dir = false;
         let mut i = 0;
@@ -174,6 +186,14 @@ impl Options {
                 "--acme-directory" => opts.acme_directory = Some(take_value(args, &mut i, arg)?),
                 "--acme-staging" => opts.acme_staging = true,
                 "--cert-dir" => opts.cert_dir = Some(take_value(args, &mut i, arg)?),
+                "--hsts" => opts.hsts = true,
+                "--hsts-include-subdomains" => opts.hsts_include_subdomains = true,
+                "--hsts-preload" => opts.hsts_preload = true,
+                "--hsts-max-age" => {
+                    let v = take_value(args, &mut i, arg)?;
+                    opts.hsts_max_age =
+                        Some(v.parse().map_err(|_| format!("invalid --hsts-max-age: {v}"))?);
+                }
                 "--host-whitelist" => {
                     let v = take_value(args, &mut i, arg)?;
                     opts.host_whitelist =
@@ -220,6 +240,9 @@ impl Options {
         if self.no_compress {
             server = self.disable_compress(server);
         }
+        if let Some(value) = self.hsts_value() {
+            server = server.hsts(Some(value));
+        }
         if self.allow_http {
             server = server.allow_http(true);
         }
@@ -228,6 +251,25 @@ impl Options {
         }
         server = self.apply_acme(server)?;
         Ok(server)
+    }
+
+    /// Build the HSTS header value if any `--hsts*` flag was given.
+    fn hsts_value(&self) -> Option<String> {
+        let on = self.hsts
+            || self.hsts_max_age.is_some()
+            || self.hsts_include_subdomains
+            || self.hsts_preload;
+        if !on {
+            return None;
+        }
+        let mut v = format!("max-age={}", self.hsts_max_age.unwrap_or(31_536_000));
+        if self.hsts_include_subdomains {
+            v.push_str("; includeSubDomains");
+        }
+        if self.hsts_preload {
+            v.push_str("; preload");
+        }
+        Some(v)
     }
 
     /// Whether any ACME flag was supplied.

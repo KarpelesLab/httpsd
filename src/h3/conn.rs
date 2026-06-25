@@ -178,6 +178,8 @@ impl H3Conn {
         let resp = cfg.handler.handle(&req);
         #[cfg(feature = "compress")]
         let resp = compress::compress_response(&req, resp, &cfg.compression);
+        // HTTP/3 is always over QUIC's TLS 1.3 — secure by definition.
+        let resp = crate::session::apply_hsts(cfg, resp, true);
 
         let bytes = self.encode_response(resp);
         let r = self.reqs.get_mut(&id).unwrap();

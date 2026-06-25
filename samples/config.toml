@@ -25,6 +25,12 @@ server_name = "httpsd"
 enabled = true
 min_size = 256
 
+# Strict-Transport-Security, sent only on HTTPS responses.
+# [hsts]
+# max_age = 31536000
+# include_subdomains = false
+# preload = false
+
 # Plain-HTTP listener: redirects to HTTPS and serves ACME HTTP-01 challenges.
 # http_listen = "0.0.0.0:80"
 # Serve content over HTTP instead of redirecting (off by default):

@@ -86,6 +86,10 @@ pub struct SessionConfig {
     pub limits: Limits,
     /// `Server` header value (or `None` to omit).
     pub server_name: Option<String>,
+    /// `Strict-Transport-Security` header value to send on **secure**
+    /// connections (e.g. `"max-age=31536000"`), or `None` to omit it. Never
+    /// sent over plain HTTP, where HSTS is meaningless.
+    pub hsts: Option<String>,
     /// Response compression options.
     #[cfg(feature = "compress")]
     pub compression: compress::Options,
@@ -98,6 +102,7 @@ impl SessionConfig {
             handler,
             limits: Limits::default(),
             server_name: Some(concat!("httpsd/", env!("CARGO_PKG_VERSION")).to_owned()),
+            hsts: None,
             #[cfg(feature = "compress")]
             compression: compress::Options::default(),
         }
@@ -175,11 +180,12 @@ impl Session {
     }
 
     fn drive(&mut self, plaintext: &[u8]) -> Result<()> {
+        let secure = !matches!(self.transport, Transport::Plain);
         match self.engine.as_mut().unwrap() {
             Engine::H1(conn) => {
                 conn.feed(plaintext);
                 while let Ok(Some(req)) = conn.poll_request() {
-                    let resp = Self::run_handler(&self.cfg, &req);
+                    let resp = Self::run_handler(&self.cfg, &req, secure);
                     conn.respond(resp);
                 }
             }
@@ -187,7 +193,7 @@ impl Session {
             Engine::H2(conn) => {
                 conn.received(plaintext);
                 while let Some((sid, req)) = conn.poll_request() {
-                    let resp = Self::run_handler(&self.cfg, &req);
+                    let resp = Self::run_handler(&self.cfg, &req, secure);
                     conn.respond(sid, resp);
                 }
             }
@@ -195,12 +201,13 @@ impl Session {
         Ok(())
     }
 
-    /// Run the handler and apply response compression.
-    fn run_handler(cfg: &SessionConfig, req: &Request) -> Response {
+    /// Run the handler, apply response compression, and (on secure transports)
+    /// the HSTS header.
+    fn run_handler(cfg: &SessionConfig, req: &Request, secure: bool) -> Response {
         let resp = cfg.handler.handle(req);
         #[cfg(feature = "compress")]
         let resp = compress::compress_response(req, resp, &cfg.compression);
-        resp
+        apply_hsts(cfg, resp, secure)
     }
 
     /// Produce the bytes to write to the socket: TLS handshake records and/or
@@ -228,5 +235,48 @@ impl Session {
     /// Whether the session is still completing the TLS handshake.
     pub fn handshaking(&self) -> bool {
         self.transport.handshaking()
+    }
+}
+
+/// Add the configured `Strict-Transport-Security` header when the connection is
+/// secure. HSTS sent over plain HTTP is ignored by clients, so we never add it
+/// there. Shared with the HTTP/3 engine (always secure).
+pub(crate) fn apply_hsts(cfg: &SessionConfig, mut resp: Response, secure: bool) -> Response {
+    if secure
+        && let Some(value) = &cfg.hsts
+    {
+        resp.headers_mut()
+            .set_if_absent("Strict-Transport-Security", value.clone());
+    }
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::StatusCode;
+
+    fn cfg() -> SessionConfig {
+        let mut c = SessionConfig::new(Arc::new(|_: &Request| Response::status(StatusCode::OK)));
+        c.hsts = Some("max-age=31536000".into());
+        c
+    }
+
+    #[test]
+    fn hsts_added_only_on_secure() {
+        let secure = apply_hsts(&cfg(), Response::status(StatusCode::OK), true);
+        assert_eq!(
+            secure.headers().get("strict-transport-security"),
+            Some("max-age=31536000")
+        );
+        let plain = apply_hsts(&cfg(), Response::status(StatusCode::OK), false);
+        assert!(plain.headers().get("strict-transport-security").is_none());
+    }
+
+    #[test]
+    fn hsts_absent_when_unset() {
+        let c = SessionConfig::new(Arc::new(|_: &Request| Response::status(StatusCode::OK)));
+        let r = apply_hsts(&c, Response::status(StatusCode::OK), true);
+        assert!(r.headers().get("strict-transport-security").is_none());
     }
 }

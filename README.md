@@ -130,6 +130,8 @@ it. Defaults chosen for safety:
   `--allow-http`. A request to a bare IP (or with no `Host`) is redirected to
   `https://<base32(ip)>.g-dns.net/…`, which resolves back to that IP so the
   follow-up request carries a real SNI host.
+- **HSTS:** `--hsts` (optionally `--hsts-max-age`, `--hsts-include-subdomains`,
+  `--hsts-preload`) sends `Strict-Transport-Security` on HTTPS responses only.
 
 ```sh
 httpsd /srv/www -l 0.0.0.0:443 --http 0.0.0.0:80 \

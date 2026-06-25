@@ -104,6 +104,39 @@ pub struct AcmeFileConfig {
     pub cert_dir: Option<PathBuf>,
 }
 
+/// `Strict-Transport-Security` settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HstsConfig {
+    /// `max-age` in seconds (default one year).
+    #[serde(default = "default_hsts_max_age")]
+    pub max_age: u64,
+    /// Append `; includeSubDomains`.
+    #[serde(default)]
+    pub include_subdomains: bool,
+    /// Append `; preload`.
+    #[serde(default)]
+    pub preload: bool,
+}
+
+fn default_hsts_max_age() -> u64 {
+    31_536_000
+}
+
+impl HstsConfig {
+    /// Render the header value, e.g. `max-age=31536000; includeSubDomains`.
+    pub fn header_value(&self) -> String {
+        let mut v = format!("max-age={}", self.max_age);
+        if self.include_subdomains {
+            v.push_str("; includeSubDomains");
+        }
+        if self.preload {
+            v.push_str("; preload");
+        }
+        v
+    }
+}
+
 /// The parsed server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +160,8 @@ pub struct ServerConfig {
     http_listen: Option<OneOrMany>,
     /// Automatic certificate management.
     pub acme: Option<AcmeFileConfig>,
+    /// `Strict-Transport-Security` settings (sent on secure responses).
+    pub hsts: Option<HstsConfig>,
 }
 
 impl ServerConfig {
@@ -166,6 +201,9 @@ impl ServerConfig {
             server = server.server_name(self.server_name.clone());
         }
 
+        if let Some(hsts) = &self.hsts {
+            server = server.hsts(Some(hsts.header_value()));
+        }
         if self.allow_http {
             server = server.allow_http(true);
         }

@@ -71,6 +71,8 @@ pub struct Server {
     tls: Option<TlsAcceptor>,
     #[cfg(feature = "compress")]
     compression: compress::Options,
+    /// `Strict-Transport-Security` value sent on secure responses, if any.
+    hsts: Option<String>,
     /// Serve content over plain HTTP instead of redirecting to HTTPS.
     allow_http: bool,
     /// Optional plain-HTTP listener address(es) for redirects + ACME HTTP-01.
@@ -95,6 +97,7 @@ impl Server {
             tls: None,
             #[cfg(feature = "compress")]
             compression: compress::Options::default(),
+            hsts: None,
             allow_http: false,
             http_addrs: Vec::new(),
             #[cfg(feature = "acme")]
@@ -145,6 +148,14 @@ impl Server {
         self
     }
 
+    /// Set the `Strict-Transport-Security` header value sent on secure
+    /// responses (e.g. `"max-age=31536000"`), or `None` to omit it. Never sent
+    /// over plain HTTP.
+    pub fn hsts(mut self, value: Option<String>) -> Server {
+        self.hsts = value;
+        self
+    }
+
     /// Serve content over plain HTTP instead of redirecting to HTTPS. Off by
     /// default — this server upgrades HTTP requests to HTTPS.
     pub fn allow_http(mut self, allow: bool) -> Server {
@@ -175,6 +186,7 @@ impl Server {
             handler: Arc::clone(&self.handler),
             limits: crate::proto::Limits::default(),
             server_name: self.server_name.clone(),
+            hsts: self.hsts.clone(),
             #[cfg(feature = "compress")]
             compression: self.compression,
         }
