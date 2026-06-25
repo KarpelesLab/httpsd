@@ -52,7 +52,15 @@ httpsd -c config.toml
 ```
 
 HTTP/2 is negotiated automatically over HTTPS (ALPN `h2`); clients that don't
-support it fall back to HTTP/1.1. HTTP/3 is served on UDP when `--http3` is given.
+support it fall back to HTTP/1.1. **HTTP/3 is served on UDP by default** whenever
+a TLS certificate is configured (use `--no-http3` to disable), and advertised via
+`Alt-Svc` so browsers upgrade after the first request.
+
+> HTTP/3 currently requires a static certificate (`--tls-cert`/`--self-signed`).
+> On-demand ACME certificates over HTTP/3 await a QUIC ClientHello/SNI peek in
+> `purecrypto` (QUIC carries the same TLS SNI, but inside the encrypted Initial
+> packet, so per-connection selection needs the engine to expose it
+> pre-handshake — the h3 analog of the TCP path's `peek_client_hello`).
 
 Run `httpsd --help` for all options.
 
@@ -170,7 +178,7 @@ See [`samples/config.toml`](samples/config.toml).
 | `tls`           |   ✓     | HTTPS via `purecrypto`.                                  |
 | `compress`      |   ✓     | gzip/deflate response compression via `compcol`.         |
 | `h2`            |   ✓     | HTTP/2 over TLS (ALPN); HPACK via `compcol`.             |
-| `h3`            |         | HTTP/3 over QUIC/UDP; QPACK via `compcol`, QUIC via `purecrypto`. |
+| `h3`            |   ✓     | HTTP/3 over QUIC/UDP; QPACK via `compcol`, QUIC via `purecrypto`. |
 | `acme`          |         | Automatic certificates (ACME); ACME HTTP client via `rsurl`. |
 | `config`        |         | TOML configuration loading (pulled in by `cli`).         |
 | `rt-tokio`      |         | Asynchronous tokio runtime.                              |
