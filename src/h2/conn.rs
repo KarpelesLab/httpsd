@@ -568,6 +568,15 @@ impl H2Conn {
     }
 }
 
+/// Build the HPACK field list for a response from the shared response-header
+/// rules (`:status` first, hop-by-hop dropped, `server` defaulted).
+fn response_fields(status: StatusCode, headers: &Headers, server: Option<&str>) -> Vec<HeaderField> {
+    crate::proto::response_fields(status, headers, server)
+        .iter()
+        .map(|(n, v)| HeaderField::new(n, v))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,17 +692,4 @@ mod tests {
         c.received(b"NOT-A-PREFACE-AT-ALL-XXXX");
         assert!(c.wants_close());
     }
-}
-
-/// Build the HPACK field list for a response from the shared response-header
-/// rules (`:status` first, hop-by-hop dropped, `server` defaulted).
-fn response_fields(
-    status: StatusCode,
-    headers: &Headers,
-    server: Option<&str>,
-) -> Vec<HeaderField> {
-    crate::proto::response_fields(status, headers, server)
-        .iter()
-        .map(|(n, v)| HeaderField::new(n, v))
-        .collect()
 }

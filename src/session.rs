@@ -132,8 +132,9 @@ impl Session {
         }
     }
 
-    /// Create a TLS (HTTPS) session wrapping an accepted [`TlsStream`]. The
-    /// protocol (HTTP/1.1 or HTTP/2) is chosen once ALPN is known.
+    /// Create a TLS (HTTPS) session wrapping an accepted
+    /// [`TlsStream`](crate::tls::TlsStream). The protocol (HTTP/1.1 or HTTP/2)
+    /// is chosen once ALPN is known.
     #[cfg(feature = "tls")]
     pub fn tls(cfg: SessionConfig, stream: crate::tls::TlsStream) -> Session {
         Session {
