@@ -8,13 +8,12 @@
 
 use std::sync::Arc;
 
-use purecrypto::bignum::Uint;
-use purecrypto::ec::BoxedEcdsaPrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
 use purecrypto::rng::OsRng;
-use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{Config, Connection, SigningKey};
-use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
+use purecrypto::x509::{AnyPrivateKey, Certificate, DistinguishedName, Time, Validity};
 
 use crate::error::{Error, Result};
 
@@ -61,22 +60,26 @@ impl TlsAcceptor {
         TlsAcceptor::from_pem(&cert, &key)
     }
 
-    /// Generate an ephemeral self-signed RSA certificate covering the given
-    /// host names. Handy for local development; clients must opt out of
-    /// verification or trust the generated certificate.
+    /// Generate an ephemeral self-signed certificate covering the given host
+    /// names. Uses an ECDSA P-256 key, which generates near-instantly (unlike
+    /// RSA). Handy for local development; clients must opt out of verification
+    /// or trust the generated certificate.
     pub fn self_signed(hostnames: &[&str]) -> Result<TlsAcceptor> {
         let primary = hostnames.first().copied().unwrap_or("localhost");
         let mut rng = OsRng;
-        let key = RsaPrivateKey::<32>::generate(Uint::from_u64(65537), &mut rng, 20);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
         let name = DistinguishedName::common_name(primary);
         let validity = Validity::new(
             Time::utc(2020, 1, 1, 0, 0, 0),
             Time::utc(2040, 1, 1, 0, 0, 0),
         );
-        let cert = Certificate::self_signed_with_sans(&key, &name, &validity, 1, false, hostnames)
+        // Keep the SEC1 PEM so `build`/`quic_config` can re-parse the identity.
+        let key_pem = key.to_sec1_pem();
+        let any = AnyPrivateKey::Ecdsa(key);
+        let cert = Certificate::self_signed_with_sans(&any, &name, &validity, 1, false, hostnames)
             .map_err(tls_err)?;
         let chain = vec![cert.to_der().to_vec()];
-        TlsAcceptor::build(chain, key.to_pkcs1_pem())
+        TlsAcceptor::build(chain, key_pem)
     }
 
     fn build(chain: Vec<Vec<u8>>, key_pem: String) -> Result<TlsAcceptor> {
