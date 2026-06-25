@@ -28,21 +28,28 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
     let mut buf = [0u8; READ_BUF];
     let mut pending = initial;
     loop {
-        if !pending.is_empty() {
-            session.received(pending)?;
+        let received = if !pending.is_empty() {
+            let r = session.received(pending);
             pending = &[];
+            r
         } else {
             let n = stream.read(&mut buf)?;
             if n == 0 {
                 break; // peer closed
             }
-            session.received(&buf[..n])?;
-        }
-        let out = session.to_send()?;
-        if !out.is_empty() {
-            stream.write_all(&out)?;
-            stream.flush()?;
-        }
+            session.received(&buf[..n])
+        };
+
+        // Always flush queued output before acting on a parse error: a failed
+        // feed may have produced a TLS alert (e.g. a refused renegotiation), and
+        // the peer should receive it rather than a bare connection reset.
+        if let Ok(out) = session.to_send()
+            && !out.is_empty() {
+                stream.write_all(&out)?;
+                stream.flush()?;
+            }
+
+        received?;
         if session.wants_close() {
             break;
         }
