@@ -50,7 +50,11 @@ pub(crate) fn run(
                     break;
                 }
             }
-            Err(e) => eprintln!("httpsd: accept error: {e}"),
+            Err(e) => {
+                if crate::rt::common::note_accept_error("accept error", &e) {
+                    thread::sleep(crate::rt::common::ACCEPT_BACKOFF);
+                }
+            }
         }
     }
     Ok(())
@@ -136,7 +140,11 @@ pub(crate) fn run_http_redirect(listener: TcpListener, ctx: HttpCtx) {
                     }
                 });
             }
-            Err(e) => eprintln!("httpsd: http accept error: {e}"),
+            Err(e) => {
+                if crate::rt::common::note_accept_error("http accept error", &e) {
+                    thread::sleep(crate::rt::common::ACCEPT_BACKOFF);
+                }
+            }
         }
     }
 }

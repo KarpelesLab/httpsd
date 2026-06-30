@@ -50,7 +50,11 @@ pub(crate) async fn run(
                     }
                 });
             }
-            Err(e) => eprintln!("httpsd: accept error: {e}"),
+            Err(e) => {
+                if crate::rt::common::note_accept_error("accept error", &e) {
+                    tokio::time::sleep(crate::rt::common::ACCEPT_BACKOFF).await;
+                }
+            }
         }
     }
 }

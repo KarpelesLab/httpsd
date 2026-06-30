@@ -175,7 +175,9 @@ fn accept_ready(
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
-                eprintln!("httpsd: accept error: {e}");
+                if crate::rt::common::note_accept_error("accept error", &e) {
+                    std::thread::sleep(crate::rt::common::ACCEPT_BACKOFF);
+                }
                 break;
             }
         }

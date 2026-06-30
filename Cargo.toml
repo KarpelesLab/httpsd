@@ -67,7 +67,7 @@ compcol = { version = "0.6.5", optional = true, default-features = false, featur
 http = { version = "1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 toml = { version = "0.8", optional = true }
-tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
 mio = { version = "1", optional = true, features = ["os-poll", "net"] }
 rsurl = { version = "0.1.2", optional = true }
 
