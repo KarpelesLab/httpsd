@@ -70,12 +70,26 @@ fn host_only(authority: &str) -> &str {
 ///   `http://203.0.113.7/x` → `https://<base32(203.0.113.7)>.g-dns.net/x`.
 ///
 /// `target` is the request target (path plus optional query), used verbatim.
+///
+/// Defense in depth against response-header (`Location`) injection: although the
+/// HTTP/1 parser is the primary guard, both `authority` and `target` originate
+/// in the request, so any control byte (`< 0x20`, or `0x7f` DEL) found here is
+/// treated as hostile — the authority falls back to the g-dns host and the
+/// target to `/`, rather than splicing CR/LF (or other controls) into the
+/// emitted `Location` header.
 pub fn redirect_location(host_header: Option<&str>, local_ip: IpAddr, target: &str) -> String {
     let authority = match host_header.map(host_only) {
-        Some(h) if !h.is_empty() && h.parse::<IpAddr>().is_err() => h.to_owned(),
+        Some(h) if !h.is_empty() && h.parse::<IpAddr>().is_err() && is_clean(h) => h.to_owned(),
         _ => gdns_host(local_ip),
     };
+    let target = if is_clean(target) { target } else { "/" };
     format!("https://{authority}{target}")
+}
+
+/// Whether `s` is free of control characters (bytes `< 0x20` or the `0x7f` DEL),
+/// which must never appear in a `Location` header value.
+fn is_clean(s: &str) -> bool {
+    !s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 #[cfg(test)]
@@ -118,6 +132,27 @@ mod tests {
         );
         assert_eq!(
             redirect_location(Some("example.com:8080"), ip, "/"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn redirect_strips_control_chars() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        // A CR/LF (or other control) in the host falls back to the g-dns host.
+        let host_fallback = format!("https://{}/p", gdns_host(ip));
+        assert_eq!(
+            redirect_location(Some("evil.com\r\nX-Injected: 1"), ip, "/p"),
+            host_fallback
+        );
+        // A control char in the target falls back to "/".
+        assert_eq!(
+            redirect_location(Some("example.com"), ip, "/a\r\nSet-Cookie: x"),
+            "https://example.com/"
+        );
+        // A bare DEL byte is rejected too.
+        assert_eq!(
+            redirect_location(Some("example.com"), ip, "/a\x7fb"),
             "https://example.com/"
         );
     }
