@@ -63,6 +63,11 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
     if resp.headers().contains("content-encoding") {
         return resp;
     }
+    // Never compress partial-content responses: re-encoding a byte range would
+    // corrupt the `Content-Range` semantics (and can poison shared caches).
+    if resp.status_code().code() == 206 || resp.headers().contains("content-range") {
+        return resp;
+    }
     if resp.body_ref().len() < opts.min_size {
         return resp;
     }
@@ -177,5 +182,55 @@ mod tests {
         assert_eq!(choose_coding("deflate, gzip"), Some(Coding::Gzip));
         assert_eq!(choose_coding("deflate"), Some(Coding::Deflate));
         assert_eq!(choose_coding("br"), None);
+    }
+
+    fn gzip_request() -> Request {
+        let mut headers = crate::proto::Headers::new();
+        headers.set("Accept-Encoding", "gzip");
+        Request::new(
+            crate::proto::Method::Get,
+            "/x".to_owned(),
+            crate::proto::Version::Http11,
+            headers,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn partial_content_is_not_compressed() {
+        let req = gzip_request();
+        // A highly compressible body well over `min_size`.
+        let body = vec![b'a'; 4096];
+        let resp = Response::new(crate::proto::StatusCode::PARTIAL_CONTENT)
+            .header("Content-Type", "text/plain")
+            .header("Content-Range", "bytes 0-4095/8192")
+            .body(body.clone());
+        let out = compress_response(&req, resp, &Options::default());
+        assert!(!out.headers().contains("content-encoding"));
+        assert_eq!(out.body_ref().len(), body.len());
+    }
+
+    #[test]
+    fn content_range_is_not_compressed() {
+        let req = gzip_request();
+        let body = vec![b'a'; 4096];
+        // Even a 200 carrying a Content-Range must be left alone.
+        let resp = Response::new(crate::proto::StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .header("Content-Range", "bytes 0-4095/8192")
+            .body(body.clone());
+        let out = compress_response(&req, resp, &Options::default());
+        assert!(!out.headers().contains("content-encoding"));
+    }
+
+    #[test]
+    fn ordinary_body_is_compressed() {
+        let req = gzip_request();
+        let body = vec![b'a'; 4096];
+        let resp = Response::new(crate::proto::StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .body(body);
+        let out = compress_response(&req, resp, &Options::default());
+        assert!(out.headers().contains("content-encoding"));
     }
 }

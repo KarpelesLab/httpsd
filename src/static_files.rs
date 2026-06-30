@@ -1,6 +1,7 @@
 //! A [`Handler`] that serves files from a directory on disk.
 
 use std::fs;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -55,6 +56,12 @@ impl StaticFiles {
             if seg == ".." {
                 return None; // never allow upward traversal
             }
+            // Reject dotfiles/dotdirs (`.git`, `.env`, …) to avoid leaking
+            // sensitive files. The handler turns `None` into a `404` so we do
+            // not confirm their existence.
+            if seg.starts_with('.') {
+                return None;
+            }
             // Reject embedded NULs and path separators that survived decoding.
             if seg.contains('\0') || seg.contains('/') || seg.contains('\\') {
                 return None;
@@ -79,7 +86,9 @@ impl StaticFiles {
         }
 
         let Some(mut path) = self.resolve(req.path()) else {
-            return Response::status(StatusCode::FORBIDDEN);
+            // Unsafe paths (traversal, dotfiles, …) are reported as `404` so we
+            // never confirm whether a rejected target exists.
+            return Response::status(StatusCode::NOT_FOUND);
         };
 
         // Directory → index file.
@@ -128,22 +137,19 @@ impl StaticFiles {
             return resp;
         }
 
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => return Response::status(StatusCode::INTERNAL_SERVER_ERROR),
-        };
-
-        // Range handling (single range only).
+        // Range handling (single range only). For a satisfiable range we read
+        // only the requested span off disk instead of buffering the whole file.
         if let Some(range) = req.headers().get("range") {
-            if let Some((start, end)) = parse_single_range(range, bytes.len() as u64) {
-                let slice = bytes[start as usize..=end as usize].to_vec();
+            if let Some((start, end)) = parse_single_range(range, len) {
+                let slice = match read_span(&path, start, end - start + 1) {
+                    Ok(b) => b,
+                    Err(_) => return Response::status(StatusCode::INTERNAL_SERVER_ERROR),
+                };
                 let mut resp = Response::new(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", content_type)
                     .header("Accept-Ranges", "bytes")
-                    .header(
-                        "Content-Range",
-                        format!("bytes {start}-{end}/{}", bytes.len()),
-                    )
+                    .header("X-Content-Type-Options", "nosniff")
+                    .header("Content-Range", format!("bytes {start}-{end}/{len}"))
                     .header("ETag", etag);
                 if let Some(lm) = last_modified {
                     resp = resp.header("Last-Modified", lm);
@@ -152,13 +158,22 @@ impl StaticFiles {
             } else if range.trim_start().starts_with("bytes=") {
                 // A syntactically present but unsatisfiable range.
                 return Response::new(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header("Content-Range", format!("bytes */{}", bytes.len()));
+                    .header("Content-Range", format!("bytes */{len}"));
             }
         }
+
+        // NOTE (deferred): full-file responses still buffer the entire file in
+        // memory via `fs::read`. Converting this to a streaming body is a larger
+        // follow-up; only the Range path is optimized here.
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return Response::status(StatusCode::INTERNAL_SERVER_ERROR),
+        };
 
         let mut resp = Response::new(StatusCode::OK)
             .header("Content-Type", content_type)
             .header("Accept-Ranges", "bytes")
+            .header("X-Content-Type-Options", "nosniff")
             .header("ETag", etag);
         if let Some(lm) = last_modified {
             resp = resp.header("Last-Modified", lm);
@@ -182,6 +197,16 @@ fn conditional_hit(req: &Request, etag: &str, last_modified: Option<&str>) -> bo
         return ims == lm;
     }
     false
+}
+
+/// Read exactly `count` bytes starting at byte offset `start` from `path`,
+/// without buffering the rest of the file.
+fn read_span(path: &Path, start: u64, count: u64) -> io::Result<Vec<u8>> {
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; count as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 /// Parse a single `Range: bytes=...` value into an inclusive `(start, end)`,
@@ -275,5 +300,34 @@ mod tests {
             sf.resolve("/sub/file.txt"),
             Some(PathBuf::from("/srv/www/sub/file.txt"))
         );
+    }
+
+    #[test]
+    fn dotfiles_rejected() {
+        let sf = StaticFiles::new("/srv/www");
+        // Top-level and nested dotfiles/dotdirs are refused.
+        assert!(sf.resolve("/.env").is_none());
+        assert!(sf.resolve("/.git/config").is_none());
+        assert!(sf.resolve("/sub/.htpasswd").is_none());
+        assert!(sf.resolve("/%2egit/config").is_none());
+        // Ordinary files with dots elsewhere are still fine.
+        assert_eq!(
+            sf.resolve("/a.b.txt"),
+            Some(PathBuf::from("/srv/www/a.b.txt"))
+        );
+    }
+
+    #[test]
+    fn dotfile_request_is_404() {
+        let sf = StaticFiles::new("/srv/www");
+        let req = Request::new(
+            Method::Get,
+            "/.git/config".to_owned(),
+            crate::proto::Version::Http11,
+            crate::proto::Headers::new(),
+            Vec::new(),
+        );
+        // Rejected paths report 404 (not 403) so existence is not confirmed.
+        assert_eq!(sf.serve(&req).status_code().code(), 404);
     }
 }
