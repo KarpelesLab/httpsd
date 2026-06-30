@@ -557,8 +557,23 @@ fn near_expiry(not_after: Option<u64>, now: u64) -> bool {
 
 /// Parse the leaf certificate's `notAfter` (Unix seconds) from a chain PEM.
 fn cert_not_after(chain_pem: &str) -> Option<u64> {
-    let cert = Certificate::from_pem(chain_pem).ok()?;
+    // A fullchain PEM holds several certificates (leaf + intermediates), and
+    // `Certificate::from_pem` rejects the trailing blocks (`Der(Pem)`). Parse
+    // only the leaf — the first block — which is the cert whose expiry we renew
+    // against. Without this the expiry is unknown, and `near_expiry(None)` is
+    // `true`, so the server re-issues on every check until it is rate-limited.
+    let leaf = first_pem_cert(chain_pem)?;
+    let cert = Certificate::from_pem(&leaf).ok()?;
     Some(cert.validity().ok()?.not_after.to_unix())
+}
+
+/// Extract the first PEM `CERTIFICATE` block (the leaf) from a chain.
+fn first_pem_cert(pem: &str) -> Option<String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let start = pem.find(BEGIN)?;
+    let end = pem[start..].find(END)? + start + END.len();
+    Some(pem[start..end].to_string())
 }
 
 #[cfg(test)]
@@ -571,6 +586,22 @@ mod tests {
         assert!(near_expiry(Some(now + 10 * 86_400), now)); // 10 days left → renew
         assert!(!near_expiry(Some(now + 60 * 86_400), now)); // 60 days left → keep
         assert!(near_expiry(None, now)); // unknown expiry → renew, don't serve forever
+    }
+
+    #[test]
+    fn first_pem_cert_takes_the_leaf_from_a_chain() {
+        // A fullchain has several blocks; the leaf is the first. (Real cert
+        // parsing is covered indirectly — the bug was that the multi-block chain
+        // failed to parse at all, so `cert_not_after` saw the whole string.)
+        let chain = "junk before\n\
+            -----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----\n\
+            -----BEGIN CERTIFICATE-----\nINTERMEDIATE\n-----END CERTIFICATE-----\n";
+        let leaf = first_pem_cert(chain).expect("a leaf block");
+        assert!(leaf.contains("LEAF"));
+        assert!(!leaf.contains("INTERMEDIATE"));
+        assert!(leaf.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(leaf.trim_end().ends_with("-----END CERTIFICATE-----"));
+        assert!(first_pem_cert("no pem here").is_none());
     }
 
     #[test]
