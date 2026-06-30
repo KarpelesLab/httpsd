@@ -11,8 +11,9 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::response::BodyKind;
 use super::response::STREAM_CHUNK;
-use super::{Body, Headers, Method, Request, Response, StatusCode, Version};
+use super::{Headers, Method, Request, Response, StatusCode, Version};
 use crate::error::{Error, Result};
 use crate::proto::read_at_exact;
 
@@ -400,19 +401,19 @@ impl H1Conn {
         self.outbuf.extend_from_slice(b"\r\n");
 
         if !omit_body {
-            match body {
-                Body::Bytes(bytes) => self.outbuf.extend_from_slice(&bytes),
+            match body.into_kind() {
+                BodyKind::Bytes(bytes) => self.outbuf.extend_from_slice(&bytes),
                 // Stream a file body across subsequent `take_out` calls rather
                 // than buffering it. HEAD/bodyless responses fall in the
                 // `omit_body` arm above, so no read happens for them.
-                Body::File { file, offset, len } if len > 0 => {
+                BodyKind::File { file, offset, len } if len > 0 => {
                     self.body_stream = Some(FileBody {
                         file,
                         offset,
                         remaining: len,
                     });
                 }
-                Body::File { .. } => {}
+                BodyKind::File { .. } => {}
             }
         }
 
@@ -843,6 +844,7 @@ pub(crate) fn http_date(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::Body;
 
     /// Write `data` to a fresh temp file and return it opened read-only.
     fn temp_file(data: &[u8]) -> Arc<File> {

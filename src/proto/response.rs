@@ -11,22 +11,38 @@ pub(crate) const STREAM_CHUNK: usize = 64 * 1024;
 
 /// The body of a response.
 ///
-/// A body is either a buffered byte vector ([`Body::Bytes`]) or a region of an
-/// open file ([`Body::File`]) that the engines stream in bounded chunks instead
-/// of reading into memory. Cloning a `File` body shares the underlying file
-/// descriptor (via `Arc`), so [`Response`] stays cheap to clone.
+/// Construct one from bytes or a string via the `From` impls. Internally a body
+/// is either buffered bytes or a region of an open file that the engines stream
+/// in bounded chunks rather than reading into memory — but that is an
+/// implementation detail, so `Body` is an opaque struct. Cloning a file body
+/// shares the underlying descriptor (via `Arc`), so [`Response`] stays cheap to
+/// clone.
 #[derive(Debug, Clone)]
-pub enum Body {
+pub struct Body {
+    inner: BodyInner,
+}
+
+#[derive(Debug, Clone)]
+enum BodyInner {
     /// A fully-buffered byte body.
     Bytes(Vec<u8>),
     /// A `len`-byte region of `file` starting at `offset`, streamed on demand
     /// using positioned reads (so `offset` is honored without a shared cursor).
     File {
-        /// The open file, shared so cloning the body shares the descriptor.
         file: Arc<File>,
-        /// Absolute byte offset of the region's start within the file.
         offset: u64,
-        /// Number of bytes to serve from `offset`.
+        len: u64,
+    },
+}
+
+/// Owned, destructured view of a [`Body`] for the engines, which must decide
+/// whether to buffer or stream. Kept `pub(crate)` so the public `Body` API is
+/// unaffected by the streaming machinery.
+pub(crate) enum BodyKind {
+    Bytes(Vec<u8>),
+    File {
+        file: Arc<File>,
+        offset: u64,
         len: u64,
     },
 }
@@ -40,46 +56,69 @@ impl Default for Body {
 impl Body {
     /// An empty body.
     pub fn empty() -> Body {
-        Body::Bytes(Vec::new())
+        Body {
+            inner: BodyInner::Bytes(Vec::new()),
+        }
     }
 
-    /// A body streamed from `len` bytes of `file` starting at `offset`.
-    pub fn file(file: Arc<File>, offset: u64, len: u64) -> Body {
-        Body::File { file, offset, len }
-    }
-
-    /// The body bytes, for a buffered body. A [`Body::File`] yields an empty
-    /// slice (its bytes live on disk; use the streaming engines to send them).
+    /// The body bytes, for a buffered body. A file-backed body yields an empty
+    /// slice (its bytes live on disk; the engines stream them).
     pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            Body::Bytes(b) => b,
-            Body::File { .. } => &[],
+        match &self.inner {
+            BodyInner::Bytes(b) => b,
+            BodyInner::File { .. } => &[],
         }
     }
 
     /// The body length in bytes.
-    pub fn len(&self) -> u64 {
-        match self {
-            Body::Bytes(b) => b.len() as u64,
-            Body::File { len, .. } => *len,
-        }
+    pub fn len(&self) -> usize {
+        self.len_u64() as usize
     }
 
     /// Whether the body is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len_u64() == 0
+    }
+
+    /// A body streamed from `len` bytes of `file` starting at `offset`.
+    pub(crate) fn file(file: Arc<File>, offset: u64, len: u64) -> Body {
+        Body {
+            inner: BodyInner::File { file, offset, len },
+        }
+    }
+
+    /// The body length as a `u64` (a file body can exceed `usize` on 32-bit).
+    pub(crate) fn len_u64(&self) -> u64 {
+        match &self.inner {
+            BodyInner::Bytes(b) => b.len() as u64,
+            BodyInner::File { len, .. } => *len,
+        }
+    }
+
+    /// Whether this is a file-backed (streamed) body.
+    #[cfg(feature = "compress")]
+    pub(crate) fn is_file(&self) -> bool {
+        matches!(self.inner, BodyInner::File { .. })
+    }
+
+    /// Destructure into the engine-facing view.
+    pub(crate) fn into_kind(self) -> BodyKind {
+        match self.inner {
+            BodyInner::Bytes(b) => BodyKind::Bytes(b),
+            BodyInner::File { file, offset, len } => BodyKind::File { file, offset, len },
+        }
     }
 
     /// Materialize the body into a byte vector.
     ///
-    /// For a [`Body::Bytes`] this just hands back the buffer. For a
-    /// [`Body::File`] it reads the region into memory (so this must NOT be called
-    /// on the streaming/compression hot path — see [`crate::compress`]); a read
-    /// error yields an empty vector rather than panicking.
+    /// For a buffered body this hands back the buffer. For a file body it reads
+    /// the region into memory (so this must NOT be called on the
+    /// streaming/compression hot path — see [`crate::compress`]); a read error
+    /// yields an empty vector rather than panicking.
     pub(crate) fn into_bytes(self) -> Vec<u8> {
-        match self {
-            Body::Bytes(b) => b,
-            Body::File { file, offset, len } => {
+        match self.inner {
+            BodyInner::Bytes(b) => b,
+            BodyInner::File { file, offset, len } => {
                 let mut buf = vec![0u8; len as usize];
                 match read_at_exact(&file, offset, &mut buf) {
                     Ok(n) => {
@@ -95,25 +134,33 @@ impl Body {
 
 impl From<Vec<u8>> for Body {
     fn from(bytes: Vec<u8>) -> Body {
-        Body::Bytes(bytes)
+        Body {
+            inner: BodyInner::Bytes(bytes),
+        }
     }
 }
 
 impl From<&[u8]> for Body {
     fn from(bytes: &[u8]) -> Body {
-        Body::Bytes(bytes.to_vec())
+        Body {
+            inner: BodyInner::Bytes(bytes.to_vec()),
+        }
     }
 }
 
 impl From<String> for Body {
     fn from(s: String) -> Body {
-        Body::Bytes(s.into_bytes())
+        Body {
+            inner: BodyInner::Bytes(s.into_bytes()),
+        }
     }
 }
 
 impl From<&str> for Body {
     fn from(s: &str) -> Body {
-        Body::Bytes(s.as_bytes().to_vec())
+        Body {
+            inner: BodyInner::Bytes(s.as_bytes().to_vec()),
+        }
     }
 }
 
@@ -170,9 +217,9 @@ pub(crate) enum OutBody {
 impl OutBody {
     /// Build a send-side body from a response [`Body`].
     pub(crate) fn from_body(body: Body) -> OutBody {
-        match body {
-            Body::Bytes(data) => OutBody::Bytes { data, pos: 0 },
-            Body::File { file, offset, len } => OutBody::File {
+        match body.into_kind() {
+            BodyKind::Bytes(data) => OutBody::Bytes { data, pos: 0 },
+            BodyKind::File { file, offset, len } => OutBody::File {
                 file,
                 offset,
                 remaining: len,

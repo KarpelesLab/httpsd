@@ -8,7 +8,7 @@ use compcol::deflate::Deflate;
 use compcol::gzip::Gzip;
 use compcol::zlib::Zlib;
 
-use crate::proto::{Body, Request, Response};
+use crate::proto::{Request, Response};
 
 /// Knobs controlling response compression.
 #[derive(Debug, Clone, Copy)]
@@ -70,10 +70,10 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
     }
     // Only buffered byte bodies are compressed; a streamed file body passes
     // through untouched (streaming + compression together is out of scope).
-    if !matches!(resp.body_ref(), Body::Bytes(_)) {
+    if resp.body_ref().is_file() {
         return resp;
     }
-    if resp.body_ref().len() < opts.min_size as u64 {
+    if resp.body_ref().len() < opts.min_size {
         return resp;
     }
     // Skip already-compressed media types.
@@ -89,8 +89,8 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
     };
 
     let (status, mut headers, body) = resp.into_parts();
-    // Safe: the `Body::Bytes` guard above means this is the buffered bytes, not
-    // a file read.
+    // Safe: the non-file guard above means this is the buffered bytes, not a
+    // file read.
     let body = body.into_bytes();
     let compressed = match coding {
         Coding::Gzip => compcol::vec::compress_to_vec::<Gzip>(&body),
@@ -103,11 +103,11 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
         Ok(out) if out.len() < body.len() => {
             headers.set("Content-Encoding", coding.token());
             append_vary(&mut headers, "Accept-Encoding");
-            Response::from_parts(status, headers, Body::Bytes(out))
+            Response::from_parts(status, headers, out.into())
         }
         _ => {
             append_vary(&mut headers, "Accept-Encoding");
-            Response::from_parts(status, headers, Body::Bytes(body))
+            Response::from_parts(status, headers, body.into())
         }
     }
 }
@@ -215,7 +215,7 @@ mod tests {
             .body(body.clone());
         let out = compress_response(&req, resp, &Options::default());
         assert!(!out.headers().contains("content-encoding"));
-        assert_eq!(out.body_ref().len(), body.len() as u64);
+        assert_eq!(out.body_ref().len(), body.len());
     }
 
     #[test]
