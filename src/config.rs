@@ -104,6 +104,20 @@ pub struct AcmeFileConfig {
     pub cert_dir: Option<PathBuf>,
 }
 
+/// Privilege-dropping settings (drop root after binding; Unix only).
+#[cfg(feature = "privdrop")]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivDropConfig {
+    /// User to switch to: `NAME` or `UID` (a group may be appended as
+    /// `NAME:GROUP`, or supplied separately via `group`).
+    pub user: Option<String>,
+    /// Group to switch to: `NAME` or `GID`. Overrides the user's primary group.
+    pub group: Option<String>,
+    /// Directory to `chroot` into before dropping.
+    pub chroot: Option<PathBuf>,
+}
+
 /// `Strict-Transport-Security` settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +161,9 @@ pub struct ServerConfig {
     pub root: Option<PathBuf>,
     /// `Server` header value.
     pub server_name: Option<String>,
+    /// Omit the `Server` response header entirely. Wins over `server_name`.
+    #[serde(default)]
+    pub no_server_header: bool,
     /// Worker thread count (thread-pool runtime).
     pub workers: Option<usize>,
     /// TLS settings.
@@ -162,6 +179,9 @@ pub struct ServerConfig {
     pub acme: Option<AcmeFileConfig>,
     /// `Strict-Transport-Security` settings (sent on secure responses).
     pub hsts: Option<HstsConfig>,
+    /// Privilege-dropping settings (drop root after binding; Unix only).
+    #[cfg(feature = "privdrop")]
+    pub privdrop: Option<PrivDropConfig>,
 }
 
 impl ServerConfig {
@@ -182,6 +202,43 @@ impl ServerConfig {
         self.listen.clone().into_vec()
     }
 
+    /// Resolve the `[privdrop]` table into a runnable
+    /// [`PrivDrop`](crate::privdrop::PrivDrop), if configured.
+    ///
+    /// Because dropping privileges is process-wide and must happen only after
+    /// every listener (TCP, HTTP redirect, and HTTP/3 UDP) is bound, the actual
+    /// drop is performed by the caller (the CLI) — not by
+    /// [`into_server`](ServerConfig::into_server). This exposes the parsed
+    /// actions so the binary can apply them once, under the bind-readiness
+    /// handshake.
+    #[cfg(feature = "privdrop")]
+    pub fn priv_drop(&self) -> Result<Option<crate::privdrop::PrivDrop>> {
+        let Some(pd) = &self.privdrop else {
+            return Ok(None);
+        };
+        if pd.user.is_none() && pd.group.is_none() && pd.chroot.is_none() {
+            return Ok(None);
+        }
+        let user_spec = match (&pd.user, &pd.group) {
+            (Some(u), Some(g)) => Some(format!("{u}:{g}")),
+            (Some(u), None) => Some(u.clone()),
+            (None, Some(_)) => {
+                return Err(Error::Config("[privdrop] `group` requires `user`".into()));
+            }
+            (None, None) => None,
+        };
+        let chroot = match &pd.chroot {
+            Some(p) => Some(p.to_str().ok_or_else(|| {
+                Error::Config("[privdrop] chroot path is not valid UTF-8".into())
+            })?),
+            None => None,
+        };
+        Ok(Some(crate::privdrop::PrivDrop::parse(
+            user_spec.as_deref(),
+            chroot,
+        )?))
+    }
+
     /// Build a runnable [`Server`](crate::rt::Server) from this configuration.
     #[cfg(any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio"))]
     pub fn into_server(self) -> Result<crate::rt::Server> {
@@ -197,7 +254,9 @@ impl ServerConfig {
         if let Some(workers) = self.workers {
             server = server.workers(workers);
         }
-        if self.server_name.is_some() {
+        if self.no_server_header {
+            server = server.server_name(None);
+        } else if self.server_name.is_some() {
             server = server.server_name(self.server_name.clone());
         }
 

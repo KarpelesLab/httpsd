@@ -46,6 +46,22 @@ fn run() -> httpsd::Result<()> {
         }
     };
 
+    // Privilege dropping changes the orchestration: every privileged bind (the
+    // main TCP listener, any HTTP redirect listener, and the HTTP/3 UDP socket)
+    // must complete before the process-wide `setuid` runs. When requested we hand
+    // off to a coordinator that binds on threads, waits for all of them, drops,
+    // then blocks on the serving threads.
+    #[cfg(feature = "privdrop")]
+    if let Some(priv_drop) = opts.resolve_privdrop()? {
+        return run_with_privdrop(&opts, priv_drop);
+    }
+    #[cfg(not(feature = "privdrop"))]
+    if opts.user.is_some() || opts.chroot.is_some() {
+        return Err(httpsd::Error::Config(
+            "--user/--chroot require the `privdrop` feature (not enabled in this build)".into(),
+        ));
+    }
+
     // Serve HTTP/3 on UDP alongside the TCP server by default whenever we have a
     // static TLS certificate. It runs on its own thread; the TCP server
     // (HTTP/1.1 + HTTP/2) stays in the foreground.
@@ -103,6 +119,10 @@ OPTIONS:
         --hsts-include-subdomains  add includeSubDomains (implies --hsts)
         --hsts-preload      add preload (implies --hsts)
         --no-compress       disable response compression
+        --server-name NAME  set a custom Server: response header
+        --no-server-header  omit the Server: response header (wins over --server-name)
+        --user NAME[:GROUP] drop to this user (and group) after binding; NAME/GROUP may be numeric
+        --chroot DIR        chroot into DIR after binding, before dropping privileges
     -h, --help              print this help
 ";
 
@@ -128,6 +148,10 @@ struct Options {
     hsts_max_age: Option<u64>,
     hsts_include_subdomains: bool,
     hsts_preload: bool,
+    server_name: Option<String>,
+    no_server_header: bool,
+    user: Option<String>,
+    chroot: Option<String>,
 }
 
 impl Options {
@@ -154,6 +178,10 @@ impl Options {
             hsts_max_age: None,
             hsts_include_subdomains: false,
             hsts_preload: false,
+            server_name: None,
+            no_server_header: false,
+            user: None,
+            chroot: None,
         };
         let mut saw_dir = false;
         let mut i = 0;
@@ -193,6 +221,10 @@ impl Options {
                             .map_err(|_| format!("invalid --hsts-max-age: {v}"))?,
                     );
                 }
+                "--server-name" => opts.server_name = Some(take_value(args, &mut i, arg)?),
+                "--no-server-header" => opts.no_server_header = true,
+                "--user" => opts.user = Some(take_value(args, &mut i, arg)?),
+                "--chroot" => opts.chroot = Some(take_value(args, &mut i, arg)?),
                 "--host-whitelist" => {
                     let v = take_value(args, &mut i, arg)?;
                     opts.host_whitelist = Some(
@@ -237,6 +269,11 @@ impl Options {
         let mut server = Server::bind(self.listen.as_str())?.serve_dir(self.dir.clone());
         if let Some(workers) = self.workers {
             server = server.workers(workers);
+        }
+        if self.no_server_header {
+            server = server.server_name(None);
+        } else if let Some(name) = &self.server_name {
+            server = server.server_name(Some(name.clone()));
         }
 
         server = self.apply_tls(server)?;
@@ -296,6 +333,26 @@ impl Options {
             v.push_str("; preload");
         }
         Some(v)
+    }
+
+    /// Resolve the requested privilege drop, if any. A config file's
+    /// `[privdrop]` table takes precedence; otherwise the `--user`/`--chroot`
+    /// flags are used. Returns `None` when no drop was requested.
+    #[cfg(feature = "privdrop")]
+    fn resolve_privdrop(&self) -> httpsd::Result<Option<httpsd::privdrop::PrivDrop>> {
+        if let Some(path) = &self.config {
+            let cfg = httpsd::ServerConfig::from_file(path)?;
+            if let Some(pd) = cfg.priv_drop()? {
+                return Ok(Some(pd));
+            }
+        }
+        if self.user.is_some() || self.chroot.is_some() {
+            return Ok(Some(httpsd::privdrop::PrivDrop::parse(
+                self.user.as_deref(),
+                self.chroot.as_deref(),
+            )?));
+        }
+        Ok(None)
     }
 
     /// Whether any ACME flag was supplied.
@@ -388,6 +445,120 @@ impl Options {
     #[cfg(not(feature = "compress"))]
     fn disable_compress(&self, server: Server) -> Server {
         server
+    }
+}
+
+/// Orchestrate startup with privilege dropping: bind every listener on its own
+/// thread, wait for all of them, then drop privileges once (process-wide) and
+/// serve. Dropping must happen only after every privileged bind completes,
+/// because `setuid` affects the whole process — including the separate HTTP/3
+/// server thread.
+#[cfg(feature = "privdrop")]
+fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> httpsd::Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    if priv_drop.chroot.is_some() && opts.acme_accept_tos {
+        eprintln!(
+            "httpsd: warning: --chroot with ACME is unlikely to work (ACME needs DNS, a CA trust store, and a writable cert dir, which a bare chroot lacks)"
+        );
+    }
+
+    let (tx, rx) = mpsc::channel::<()>();
+
+    #[cfg(feature = "h3")]
+    let h3_on = opts.http3_enabled();
+    #[cfg(not(feature = "h3"))]
+    let h3_on = false;
+    let expected = 1 + usize::from(h3_on);
+
+    let mut handles: Vec<std::thread::JoinHandle<httpsd::Result<()>>> = Vec::new();
+
+    #[cfg(feature = "h3")]
+    if h3_on {
+        let h3 = opts.build_server()?.notify_bound(tx.clone());
+        let addr = opts.listen.clone();
+        eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
+        handles.push(std::thread::spawn(move || h3.run_h3()));
+    }
+
+    let server = opts.build_server()?.notify_bound(tx.clone());
+    let addr = opts.listen.clone();
+    let scheme = if opts.is_tls() || opts.acme_accept_tos {
+        "https"
+    } else {
+        "http"
+    };
+    eprintln!("httpsd: serving on {scheme}://{addr}");
+    if let Some(http) = &opts.http_listen {
+        eprintln!("httpsd: redirecting HTTP→HTTPS on {http}");
+    }
+    handles.push(std::thread::spawn(move || server.run()));
+
+    // Drop our own sender so the channel disconnects once the serving threads
+    // (the only remaining senders) are gone.
+    drop(tx);
+
+    // Wait until every listener has signalled that it is bound. A healthy server
+    // thread blocks forever once bound, so a thread that *finishes* early must
+    // have failed before binding — surface that instead of waiting forever.
+    let mut bound = 0usize;
+    while bound < expected {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => bound += 1,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if bound < expected && handles.iter().any(|h| h.is_finished()) {
+            break;
+        }
+    }
+
+    if bound < expected {
+        // A listener failed to bind. Pull the error from whichever thread has
+        // already exited (joining only finished handles can't block); the still
+        // serving threads, if any, are torn down when the process exits with a
+        // failure code, having never dropped privileges.
+        let mut err = httpsd::Error::Config(
+            "a listener exited before binding; refusing to drop privileges".into(),
+        );
+        for h in handles {
+            if h.is_finished()
+                && let Ok(Err(e)) = h.join()
+            {
+                err = e;
+            }
+        }
+        return Err(err);
+    }
+
+    // Every listener is bound: drop privileges once, for the whole process.
+    priv_drop.apply()?;
+    eprintln!("httpsd: dropped privileges");
+
+    // Serve. join blocks on the (forever-running) serving threads; an error is
+    // surfaced if one ever returns.
+    join_all(handles)
+}
+
+/// Join every server thread, returning the first error encountered.
+#[cfg(feature = "privdrop")]
+fn join_all(handles: Vec<std::thread::JoinHandle<httpsd::Result<()>>>) -> httpsd::Result<()> {
+    let mut first_err = None;
+    for h in handles {
+        let result = match h.join() {
+            Ok(r) => r,
+            Err(_) => Err(httpsd::Error::Config("a server thread panicked".into())),
+        };
+        if let Err(e) = result
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
