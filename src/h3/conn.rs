@@ -15,7 +15,9 @@ use compcol::qpack::{QpackDecoder, QpackEncoder};
 use purecrypto::quic::{QuicConnection, StreamId};
 
 use crate::error::Result;
-use crate::proto::{Limits, OutBody, Request, Response, Version, request_head, response_fields};
+use crate::proto::{
+    Body, Limits, Method, OutBody, Request, Response, Version, request_head, response_fields,
+};
 use crate::session::SessionConfig;
 
 #[cfg(feature = "compress")]
@@ -213,7 +215,8 @@ impl H3Conn {
         // HTTP/3 is always over QUIC's TLS 1.3 — secure by definition.
         let resp = crate::session::apply_edge_headers(cfg, resp, true);
 
-        let (bytes, body) = self.encode_response(resp);
+        let is_head = req.method() == &Method::Head;
+        let (bytes, body) = self.encode_response(resp, is_head);
         let r = self.reqs.get_mut(&id).unwrap();
         r.delivered = true;
         r.out = bytes;
@@ -267,8 +270,18 @@ impl H3Conn {
 
     /// Encode a response into its HEADERS frame plus the send-side body to frame
     /// as DATA incrementally (so a file body is never read whole here).
-    fn encode_response(&mut self, resp: Response) -> (Vec<u8>, OutBody) {
-        let (status, headers, body) = resp.into_parts();
+    fn encode_response(&mut self, resp: Response, is_head: bool) -> (Vec<u8>, OutBody) {
+        let (status, mut headers, body) = resp.into_parts();
+        // HEAD: report the entity Content-Length but frame no DATA, so a file is
+        // never streamed in answer to a HEAD request.
+        let body = if is_head {
+            if !status.is_bodyless() {
+                headers.set_if_absent("content-length", body.len().to_string());
+            }
+            Body::empty()
+        } else {
+            body
+        };
         let fields: Vec<HeaderField> =
             response_fields(status, &headers, self.server_name.as_deref())
                 .iter()

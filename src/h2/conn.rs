@@ -12,7 +12,8 @@ use compcol::hpack::{DEFAULT_TABLE_SIZE, HeaderField, HpackDecoder, HpackEncoder
 
 use super::frame::{self, CLIENT_PREFACE, FrameHeader, errcode, flag, ftype, settings};
 use crate::proto::{
-    Headers, Limits, OutBody, Request, RequestHead, Response, StatusCode, Version, request_head,
+    Body, Headers, Limits, Method, OutBody, Request, RequestHead, Response, StatusCode, Version,
+    request_head,
 };
 
 const DEFAULT_WINDOW: i64 = 65_535;
@@ -48,6 +49,9 @@ struct Stream {
     body: Vec<u8>,
     end_stream_recv: bool,
     delivered: bool,
+    /// Whether the delivered request used the HEAD method (response must carry
+    /// the headers it would for GET, including Content-Length, but no body).
+    is_head: bool,
     // --- send / response framing ---
     send_window: i64,
     out_headers: Vec<u8>,
@@ -69,6 +73,7 @@ impl Stream {
             body: Vec::new(),
             end_stream_recv: false,
             delivered: false,
+            is_head: false,
             send_window,
             out_headers: Vec::new(),
             out_headers_sent: false,
@@ -549,8 +554,10 @@ impl H2Conn {
     }
 
     fn deliver(&mut self, sid: u32, head: RequestHead, body: Vec<u8>) {
+        let is_head = head.method == Method::Head;
         if let Some(s) = self.streams.get_mut(&sid) {
             s.delivered = true;
+            s.is_head = is_head;
         }
         self.completed += 1;
         let req = Request::new(head.method, head.target, Version::Http2, head.headers, body);
@@ -565,10 +572,22 @@ impl H2Conn {
     /// Serialize a response for `sid`: a HEADERS frame followed by flow-control
     /// limited DATA frames.
     pub fn respond(&mut self, sid: u32, resp: Response) {
-        let Some(_) = self.streams.get(&sid) else {
+        let Some(s0) = self.streams.get(&sid) else {
             return; // stream was reset/closed
         };
-        let (status, headers, body) = resp.into_parts();
+        let is_head = s0.is_head;
+        let (status, mut headers, body) = resp.into_parts();
+        // A HEAD response carries the same headers a GET would — including the
+        // entity Content-Length — but no body. Report the length, then drop it
+        // so the file is never streamed in answer to a HEAD.
+        let body = if is_head {
+            if !status.is_bodyless() {
+                headers.set_if_absent("content-length", body.len().to_string());
+            }
+            Body::empty()
+        } else {
+            body
+        };
         let fields = response_fields(status, &headers, self.server_name.as_deref());
         let encoded = self.hpack_enc.encode(&fields);
 
@@ -806,6 +825,43 @@ mod tests {
             .expect("status");
         assert_eq!(status.value, b"200");
         assert_eq!(data, b"hello h2");
+    }
+
+    #[test]
+    fn head_response_has_length_but_no_body() {
+        let mut c = H2Conn::new(Limits::default(), Some("httpsd".into()));
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        wire.extend_from_slice(&client_request(
+            &mut enc,
+            1,
+            &[
+                HeaderField::new(b":method", b"HEAD"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"a"),
+                HeaderField::new(b":path", b"/file"),
+            ],
+            None,
+        ));
+        c.received(&wire);
+        let (sid, req) = c.poll_request().expect("request");
+        assert_eq!(req.method(), &Method::Head);
+
+        // Respond as a handler would for the matching GET: a non-empty body.
+        c.respond(sid, Response::text("the full body bytes"));
+        let out = c.take_out();
+        let (hblock, data) = collect(&out, 1);
+        // No DATA frames at all for a HEAD response...
+        assert!(data.is_empty(), "HEAD must not send a body");
+        // ...but the entity Content-Length is still advertised.
+        let fields = HpackDecoder::new().decode(&hblock).expect("decode");
+        let clen = fields
+            .iter()
+            .find(|f| f.name == b"content-length")
+            .expect("content-length present on HEAD");
+        assert_eq!(clen.value, b"19"); // len("the full body bytes")
     }
 
     #[test]
