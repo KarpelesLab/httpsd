@@ -58,6 +58,7 @@ impl TlsAcceptor {
         key_path: impl AsRef<std::path::Path>,
     ) -> Result<TlsAcceptor> {
         let cert = std::fs::read_to_string(cert_path)?;
+        warn_if_key_world_readable(key_path.as_ref());
         let key = std::fs::read_to_string(key_path)?;
         TlsAcceptor::from_pem(&cert, &key)
     }
@@ -311,8 +312,12 @@ fn pem_blocks(pem: &str) -> Vec<PemBlock> {
     out
 }
 
-/// Decode standard-alphabet base64 (ignoring whitespace), tolerating optional
-/// `=` padding. Returns `None` on invalid input.
+/// Decode standard-alphabet base64. Whitespace (including newlines) is ignored
+/// so wrapped PEM bodies decode, and standard trailing `=` padding is accepted.
+/// Stricter than a permissive decoder: interior `=` (padding followed by more
+/// data), a lone trailing symbol, or non-zero dangling bits are all rejected so
+/// corrupted or truncated PEM fails loudly rather than loading silently.
+/// Returns `None` on invalid input.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         match c {
@@ -327,9 +332,19 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut acc: u32 = 0;
     let mut bits = 0u32;
+    let mut padding_seen = false;
     for &c in s.as_bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
+        if c.is_ascii_whitespace() {
             continue;
+        }
+        if c == b'=' {
+            // Only trailing padding is valid; remember we've seen it.
+            padding_seen = true;
+            continue;
+        }
+        // A data symbol after padding means an interior `=` — reject.
+        if padding_seen {
+            return None;
         }
         let v = val(c)? as u32;
         acc = (acc << 6) | v;
@@ -339,8 +354,41 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
             out.push((acc >> bits) as u8);
         }
     }
+    // A leftover of 6 bits means a lone trailing symbol (invalid length); 2 or 4
+    // leftover bits are normal for padded input but must be zero (no dangling
+    // data bits beyond the last whole byte).
+    if bits == 6 {
+        return None;
+    }
+    if bits != 0 && acc & ((1 << bits) - 1) != 0 {
+        return None;
+    }
     Some(out)
 }
+
+/// Warn loudly if the private-key file is group- or world-readable. A leaked
+/// key is far more damaging than a leaked certificate, so over-permissive key
+/// files deserve a visible operator warning. Non-fatal so existing deployments
+/// keep working. No-op on non-Unix platforms (permission bits differ).
+#[cfg(unix)]
+fn warn_if_key_world_readable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        // 0o077 = any group/other permission bit.
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "httpsd: WARNING: private key file {} is group/other-accessible \
+                 (mode {:#o}); restrict it to owner-only (chmod 600)",
+                path.display(),
+                mode & 0o777,
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_key_world_readable(_path: &std::path::Path) {}
 
 /// Collect every `CERTIFICATE` block's DER, in order.
 fn cert_chain_der(pem: &str) -> Result<Vec<Vec<u8>>> {
@@ -357,11 +405,17 @@ fn load_signing_key(pem: &str) -> Result<SigningKey> {
     for block in pem_blocks(pem) {
         match block.label.as_str() {
             "RSA PRIVATE KEY" => {
-                let k = BoxedRsaPrivateKey::from_pkcs1_pem(&block.text).map_err(tls_err)?;
+                // Map parse failures to a fixed, material-free message: the
+                // inner error's Debug output may echo (partial) key bytes,
+                // which must never reach logs.
+                let k = BoxedRsaPrivateKey::from_pkcs1_pem(&block.text)
+                    .map_err(|_| Error::Tls("invalid RSA private key".into()))?;
                 return Ok(SigningKey::Rsa(k));
             }
             "EC PRIVATE KEY" => {
-                let k = BoxedEcdsaPrivateKey::from_sec1_pem(&block.text).map_err(tls_err)?;
+                // Likewise, do not Debug-format the parse error for EC keys.
+                let k = BoxedEcdsaPrivateKey::from_sec1_pem(&block.text)
+                    .map_err(|_| Error::Tls("invalid EC private key".into()))?;
                 return Ok(SigningKey::Ecdsa(k));
             }
             "PRIVATE KEY" => return signing_key_from_pkcs8(&block.text),
@@ -393,6 +447,29 @@ mod tests {
     fn self_signed_round_trips() {
         let acceptor = TlsAcceptor::self_signed(&["localhost"]).expect("self-signed");
         let _stream = acceptor.accept().expect("accept");
+    }
+
+    #[test]
+    fn base64_accepts_valid_padding_and_whitespace() {
+        // "Man" -> "TWFu" (no padding)
+        assert_eq!(base64_decode("TWFu"), Some(b"Man".to_vec()));
+        // "Ma" -> "TWE=" (one pad), "M" -> "TQ==" (two pads)
+        assert_eq!(base64_decode("TWE="), Some(b"Ma".to_vec()));
+        assert_eq!(base64_decode("TQ=="), Some(b"M".to_vec()));
+        // Wrapped with newlines/whitespace still decodes.
+        assert_eq!(base64_decode("TW\n Fu\r\n"), Some(b"Man".to_vec()));
+    }
+
+    #[test]
+    fn base64_rejects_malformed() {
+        // Interior padding.
+        assert_eq!(base64_decode("TW=Fu"), None);
+        // Lone trailing symbol (invalid length).
+        assert_eq!(base64_decode("TWFuQ"), None);
+        // Non-zero dangling bits: "TX==" has a set low bit beyond the byte.
+        assert_eq!(base64_decode("TX=="), None);
+        // Out-of-alphabet character.
+        assert_eq!(base64_decode("TW*u"), None);
     }
 
     #[test]
