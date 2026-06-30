@@ -6,13 +6,14 @@
 //! served concurrently. There is no async runtime involved.
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::Result;
 use crate::rt::TlsMode;
-use crate::rt::common::serve_blocking;
+use crate::rt::common::{self, serve_blocking};
 use crate::rt::redirect::{self, HttpCtx};
 use crate::session::{Session, SessionConfig};
 
@@ -34,7 +35,17 @@ pub(crate) fn run(
 ) -> Result<()> {
     let shared = Arc::new(Shared { cfg, tls });
     let workers = workers.max(1);
-    let (tx, rx): (Sender<TcpStream>, Receiver<TcpStream>) = std::sync::mpsc::channel();
+    // Bound the queue of accepted-but-unserved connections. Each queued stream
+    // holds an open descriptor, so an unbounded queue lets a connection burst
+    // exhaust the fd limit (which is exactly what melted the server once). The
+    // cap is generous — a safety ceiling, not tight backpressure — so it stays
+    // well clear of normal concurrency, including the ACME path where one worker
+    // blocks on issuance while another answers the validation connection. When
+    // the queue is full `send` blocks the accept loop; further connections wait
+    // in the kernel backlog and are shed there if it too fills.
+    let backlog = workers.saturating_mul(64).clamp(256, 4096);
+    let (tx, rx): (SyncSender<TcpStream>, Receiver<TcpStream>) =
+        std::sync::mpsc::sync_channel(backlog);
     let rx = Arc::new(Mutex::new(rx));
 
     for _ in 0..workers {
@@ -51,8 +62,8 @@ pub(crate) fn run(
                 }
             }
             Err(e) => {
-                if crate::rt::common::note_accept_error("accept error", &e) {
-                    thread::sleep(crate::rt::common::ACCEPT_BACKOFF);
+                if common::note_accept_error("accept error", &e) {
+                    thread::sleep(common::ACCEPT_BACKOFF);
                 }
             }
         }
@@ -72,16 +83,25 @@ fn worker_loop(rx: Arc<Mutex<Receiver<TcpStream>>>, shared: Arc<Shared>) {
         let Ok(stream) = stream else {
             return;
         };
-        if let Err(e) = handle(stream, &shared)
-            && cfg!(debug_assertions)
-        {
-            eprintln!("httpsd: connection ended: {e}");
+        // Isolate each connection: a panic while serving one client must not
+        // kill the worker thread, which would permanently shrink the pool and,
+        // once every worker died, wedge the whole server.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(stream, &shared)));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if cfg!(debug_assertions) => {
+                eprintln!("httpsd: connection ended: {e}");
+            }
+            Ok(Err(_)) => {}
+            Err(_) => eprintln!("httpsd: worker recovered from a panic while serving a connection"),
         }
     }
 }
 
 fn handle(mut stream: TcpStream, shared: &Shared) -> Result<()> {
     stream.set_nodelay(true).ok();
+    common::apply_timeouts(&stream);
 
     match &shared.tls {
         TlsMode::Plain => {
@@ -123,26 +143,39 @@ fn handle_acme(
     crate::rt::common::serve_blocking_prefed(&mut stream, &mut session, &initial)
 }
 
-/// Accept loop for the plain-HTTP listener (redirects + ACME HTTP-01). One
-/// thread per connection — this listener carries little traffic.
+/// Accept loop for the plain-HTTP listener (redirects + ACME HTTP-01). It spawns
+/// a thread per connection — these are short-lived (read a request, reply, close)
+/// — but caps how many run at once so a flood can't spawn unbounded threads.
 pub(crate) fn run_http_redirect(listener: TcpListener, ctx: HttpCtx) {
+    /// Maximum redirect connections served concurrently; excess is shed.
+    const MAX_INFLIGHT: usize = 256;
+
     let ctx = Arc::new(ctx);
+    let inflight = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         match incoming {
             Ok(mut stream) => {
+                common::apply_timeouts(&stream);
+                stream.set_nodelay(true).ok();
+                // Shed load past the cap by closing the connection (drop).
+                if inflight.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT {
+                    inflight.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
                 let ctx = Arc::clone(&ctx);
+                let inflight = Arc::clone(&inflight);
                 thread::spawn(move || {
-                    stream.set_nodelay(true).ok();
                     if let Err(e) = redirect::serve(&mut stream, &ctx)
                         && cfg!(debug_assertions)
                     {
                         eprintln!("httpsd: http connection ended: {e}");
                     }
+                    inflight.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => {
-                if crate::rt::common::note_accept_error("http accept error", &e) {
-                    thread::sleep(crate::rt::common::ACCEPT_BACKOFF);
+                if common::note_accept_error("http accept error", &e) {
+                    thread::sleep(common::ACCEPT_BACKOFF);
                 }
             }
         }

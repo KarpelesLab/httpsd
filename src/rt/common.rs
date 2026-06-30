@@ -1,6 +1,7 @@
 //! Pieces shared across the blocking runtimes.
 
 use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,20 @@ use crate::session::Session;
 
 /// Read buffer size used by the blocking drive loop.
 pub(crate) const READ_BUF: usize = 16 * 1024;
+
+/// Per-operation inactivity timeout for blocking connections. A read or write
+/// that makes no progress within this window fails, so a peer that connects and
+/// then stalls (slowloris, dead keep-alive, a client that stops reading our
+/// response) releases its worker thread instead of pinning it forever.
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Apply [`IO_TIMEOUT`] to a freshly accepted stream. Errors are ignored: a
+/// socket that won't take a timeout will still be bounded by the read/write
+/// loop, and failing the connection here would be worse than serving it.
+pub(crate) fn apply_timeouts(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+}
 
 /// Backoff applied after a descriptor-exhaustion `accept()` error.
 pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
