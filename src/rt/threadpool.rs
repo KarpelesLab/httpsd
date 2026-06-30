@@ -33,8 +33,16 @@ pub(crate) fn run(
     tls: TlsMode,
     workers: usize,
 ) -> Result<()> {
+    // On-demand ACME (TLS-ALPN-01) can self-deadlock with a single worker: the
+    // worker that blocks issuing a certificate needs *another* worker to answer
+    // the CA's validation connection to the same server. Force at least two
+    // effective workers whenever ACME is active, regardless of user input.
+    let mut workers = workers.max(1);
+    #[cfg(feature = "acme")]
+    if matches!(tls, TlsMode::Acme(_)) {
+        workers = workers.max(2);
+    }
     let shared = Arc::new(Shared { cfg, tls });
-    let workers = workers.max(1);
     // Bound the queue of accepted-but-unserved connections. Each queued stream
     // holds an open descriptor, so an unbounded queue lets a connection burst
     // exhaust the fd limit (which is exactly what melted the server once). The
@@ -127,8 +135,11 @@ fn handle_acme(
 ) -> Result<()> {
     // Peek the ClientHello, then choose a certificate by SNI/ALPN.
     let Some((initial, info)) = route::read_client_hello(&mut stream)? else {
-        return Ok(()); // not TLS / closed early
+        return Ok(()); // not TLS / closed early / handshake-phase deadline
     };
+    // `read_client_hello` clamped the read timeout to its own deadline; restore
+    // the normal inactivity timeout for the rest of the connection.
+    common::apply_timeouts(&stream);
     let loopback = stream
         .peer_addr()
         .map(|a| a.ip().is_loopback())

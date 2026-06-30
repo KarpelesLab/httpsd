@@ -17,6 +17,22 @@ pub(crate) const READ_BUF: usize = 16 * 1024;
 /// response) releases its worker thread instead of pinning it forever.
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum number of bytes a peer must deliver within each [`IO_TIMEOUT`]
+/// window for the connection to be considered as making real progress.
+///
+/// The per-read inactivity timeout ([`IO_TIMEOUT`]) only fires on a *fully idle*
+/// read: a slow-trickle slowloris that dribbles a single byte every ~25s resets
+/// that timer on every read and so pins a worker forever. To defeat that we also
+/// require a minimum *throughput*: across any [`IO_TIMEOUT`] window the peer must
+/// send at least this many bytes, otherwise the connection is dropped. The floor
+/// is tiny — a TLS handshake, an HTTP request head, or any steady upload clears
+/// it trivially in a single read — so legitimate slow-but-steady transfers keep
+/// working while a byte-at-a-time trickle is shed (within at most ~2× the
+/// window). The window resets every time the floor is met, so the rule applies
+/// uniformly to the handshake, the request head, request bodies, and subsequent
+/// keep-alive requests without ever penalizing bulk transfer.
+pub(crate) const MIN_PROGRESS: usize = 256;
+
 /// Apply [`IO_TIMEOUT`] to a freshly accepted stream. Errors are ignored: a
 /// socket that won't take a timeout will still be bounded by the read/write
 /// loop, and failing the connection here would be worse than serving it.
@@ -90,9 +106,19 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
 ) -> Result<()> {
     let mut buf = [0u8; READ_BUF];
     let mut pending = initial;
+    // Minimum-throughput deadline that defeats slow-trickle slowloris (which the
+    // per-read inactivity timeout alone cannot catch — see [`MIN_PROGRESS`]). The
+    // peer must deliver at least `MIN_PROGRESS` bytes within each [`IO_TIMEOUT`]
+    // window; the window resets whenever that floor is met. The generic stream
+    // here has no timeout-setting API, so the wake-up cadence is provided by the
+    // socket's own read timeout ([`apply_timeouts`]); the deadline is enforced in
+    // software when a read returns, bounding a trickle to at most ~2× the window.
+    let mut window_deadline = Instant::now() + IO_TIMEOUT;
+    let mut window_bytes: usize = 0;
     loop {
         let received = if !pending.is_empty() {
             let r = session.received(pending);
+            window_bytes = window_bytes.saturating_add(pending.len());
             pending = &[];
             r
         } else {
@@ -100,8 +126,19 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
             if n == 0 {
                 break; // peer closed
             }
+            window_bytes = window_bytes.saturating_add(n);
             session.received(&buf[..n])
         };
+
+        // Enforce the minimum-throughput deadline. A peer that has not delivered
+        // `MIN_PROGRESS` bytes by the end of a window is a slow-trickle attacker;
+        // drop it. Meeting the floor opens a fresh window.
+        if window_bytes >= MIN_PROGRESS {
+            window_deadline = Instant::now() + IO_TIMEOUT;
+            window_bytes = 0;
+        } else if Instant::now() >= window_deadline {
+            break; // trickle: closed without making real progress
+        }
 
         // Always flush queued output before acting on a parse error: a failed
         // feed may have produced a TLS alert (e.g. a refused renegotiation), and
