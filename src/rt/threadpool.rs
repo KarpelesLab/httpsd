@@ -7,7 +7,7 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -32,6 +32,7 @@ pub(crate) fn run(
     cfg: SessionConfig,
     tls: TlsMode,
     workers: usize,
+    ready: Option<Sender<()>>,
 ) -> Result<()> {
     // On-demand ACME (TLS-ALPN-01) can self-deadlock with a single worker: the
     // worker that blocks issuing a certificate needs *another* worker to answer
@@ -62,6 +63,13 @@ pub(crate) fn run(
         let rx = Arc::clone(&rx);
         let shared = Arc::clone(&shared);
         thread::spawn(move || worker_loop(rx, shared));
+    }
+
+    // The listener (and any redirect listener bound by the caller) is up and the
+    // workers are spawned: signal readiness before blocking on accept, so an
+    // external coordinator may now drop privileges.
+    if let Some(ready) = ready {
+        let _ = ready.send(());
     }
 
     for incoming in listener.incoming() {

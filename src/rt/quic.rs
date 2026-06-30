@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use purecrypto::quic::QuicConnection;
@@ -89,8 +90,18 @@ struct Conn {
 }
 
 /// Bind a UDP socket and serve HTTP/3 until a fatal socket error.
-pub(crate) fn run(addrs: Vec<SocketAddr>, cfg: SessionConfig, certs: CertSource) -> Result<()> {
+pub(crate) fn run(
+    addrs: Vec<SocketAddr>,
+    cfg: SessionConfig,
+    certs: CertSource,
+    ready: Option<Sender<()>>,
+) -> Result<()> {
     let socket = bind_first(&addrs)?;
+    // The UDP socket is bound; signal readiness before entering the event loop so
+    // an external coordinator may drop privileges.
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
     let start = Instant::now();
     let mut conns: HashMap<SocketAddr, Conn> = HashMap::new();
     let mut buf = [0u8; RECV_BUF];

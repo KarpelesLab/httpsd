@@ -81,6 +81,12 @@ pub struct Server {
     http_addrs: Vec<std::net::SocketAddr>,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
+    /// Optional one-shot notifier fired once all of this server's listeners are
+    /// bound, before it begins serving. Used to coordinate privilege dropping
+    /// across the (separate) TCP and HTTP/3 servers — see
+    /// [`notify_bound`](Server::notify_bound).
+    #[cfg(any(feature = "rt-threadpool", feature = "h3"))]
+    ready_tx: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl Server {
@@ -105,6 +111,8 @@ impl Server {
             http_addrs: Vec::new(),
             #[cfg(feature = "acme")]
             acme: None,
+            #[cfg(any(feature = "rt-threadpool", feature = "h3"))]
+            ready_tx: None,
         })
     }
 
@@ -190,6 +198,18 @@ impl Server {
         self
     }
 
+    /// Register a notifier fired exactly once, after every listener this server
+    /// owns has been bound, just before it starts serving. This lets an external
+    /// coordinator wait until all privileged binds are done before dropping
+    /// privileges. The TCP runtime ([`run`](Server::run)) signals once both the
+    /// main listener and any HTTP redirect listener are bound; the HTTP/3
+    /// runtime ([`run_h3`](Server::run_h3)) signals once its UDP socket is bound.
+    #[cfg(any(feature = "rt-threadpool", feature = "h3"))]
+    pub fn notify_bound(mut self, tx: std::sync::mpsc::Sender<()>) -> Server {
+        self.ready_tx = Some(tx);
+        self
+    }
+
     /// Build the shared session configuration.
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
@@ -245,7 +265,10 @@ impl Server {
             std::thread::spawn(move || threadpool::run_http_redirect(http, ctx));
         }
 
-        threadpool::run(listener, cfg, tls_mode, self.workers)
+        // Both the main listener and (if any) the redirect listener are now
+        // bound; the readiness signal is emitted inside `threadpool::run` right
+        // before the accept loop.
+        threadpool::run(listener, cfg, tls_mode, self.workers, self.ready_tx)
     }
 
     /// Run on a tokio runtime. Requires being called from within a tokio
@@ -287,7 +310,7 @@ impl Server {
     pub fn run_h3(self) -> Result<()> {
         let certs = self.h3_cert_source()?;
         let cfg = self.session_config();
-        quic::run(self.addrs.clone(), cfg, certs)
+        quic::run(self.addrs.clone(), cfg, certs, self.ready_tx)
     }
 
     #[cfg(feature = "h3")]

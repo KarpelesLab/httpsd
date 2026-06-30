@@ -36,7 +36,12 @@
 //! - `cli` — build the `httpsd` binary.
 //! - `rt-threadpool` (default), `rt-tokio`, `rt-mio` — runtime drivers.
 
-#![forbid(unsafe_code)]
+// The crate is unsafe-free except for the optional `privdrop` module, whose
+// privilege-dropping syscalls (setuid/setgid/chroot via libc) require `unsafe`.
+// When that feature is off we keep the hard `forbid`; when it is on we downgrade
+// to `deny` so the single module can opt back in with a scoped `allow`.
+#![cfg_attr(not(feature = "privdrop"), forbid(unsafe_code))]
+#![cfg_attr(feature = "privdrop", deny(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod error;
@@ -73,6 +78,9 @@ pub mod session;
 pub mod config;
 
 pub mod rt;
+
+#[cfg(feature = "privdrop")]
+pub mod privdrop;
 
 pub use error::{Error, Result};
 pub use handler::Handler;

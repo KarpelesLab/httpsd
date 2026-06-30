@@ -40,6 +40,10 @@ acme = ["tls", "dep:rsurl"]
 # `&str` / `String` / `(StatusCode, _)` / `Result<_, _>` directly. Dependency-
 # free and additive — the low-level `Handler` trait is unchanged.
 router = []
+# Drop process privileges (setuid/setgid) after binding, plus optional chroot.
+# Unix only; needs `libc` for the syscalls. Pulled into `cli` so the default
+# binary can `--user`/`--chroot`.
+privdrop = ["dep:libc"]
 # Interop with the `http` crate: `From`/`TryFrom` conversions between httpsd's
 # `Method`/`StatusCode`/`Version`/`Headers`/`Request`/`Response` and the
 # ecosystem-standard `http` types (and `IntoResponse for http::Response` when
@@ -52,7 +56,7 @@ config = ["dep:serde", "dep:toml"]
 # yields a server that can actually obtain certificates — the binary accepts
 # `--acme-accept-tos` and would otherwise fail at startup. Library-only users
 # who set `default-features = false` stay lean and opt into `acme` explicitly.
-cli = ["config", "rt-threadpool", "acme"]
+cli = ["config", "rt-threadpool", "acme", "privdrop"]
 
 # --- runtime drivers (pick one or more; all drive the same sans-I/O core) ---
 # Blocking std::net listener backed by a fixed worker thread pool.
@@ -73,6 +77,8 @@ toml = { version = "0.8", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
 mio = { version = "1", optional = true, features = ["os-poll", "net"] }
 rsurl = { version = "0.1.2", optional = true }
+# Privilege-dropping syscalls (setuid/setgid/chroot, getpwnam_r/getgrnam_r).
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 purecrypto = "0.6.25"
