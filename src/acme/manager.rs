@@ -55,6 +55,11 @@ pub struct AcmeConfig {
     pub email: Option<String>,
     /// If set, only these host names may be issued for; others are rejected.
     pub host_whitelist: Option<HashSet<String>>,
+    /// Host to route by when a connection sends no SNI (e.g. a bare-IP TLS
+    /// client, or a tool that omits SNI). When set, such connections are served
+    /// this host's certificate instead of the self-signed fallback. It is still
+    /// subject to `host_whitelist`, so include it there if a whitelist is set.
+    pub default_host: Option<String>,
     /// Override the on-disk storage directory.
     pub cert_dir: Option<PathBuf>,
 }
@@ -66,6 +71,7 @@ impl Default for AcmeConfig {
             accept_tos: false,
             email: None,
             host_whitelist: None,
+            default_host: None,
             cert_dir: None,
         }
     }
@@ -195,14 +201,29 @@ impl AcmeManager {
             .cloned()
     }
 
+    /// The host to route a connection by: its SNI when present, otherwise the
+    /// configured [`default_host`](AcmeConfig::default_host). `None` means there
+    /// is no usable host, so the caller should serve the self-signed fallback.
+    fn effective_host(&self, sni: Option<&str>) -> Option<String> {
+        if let Some(h) = sni.map(normalize).filter(|h| !h.is_empty()) {
+            return Some(h);
+        }
+        self.inner
+            .cfg
+            .default_host
+            .as_deref()
+            .map(normalize)
+            .filter(|h| !h.is_empty())
+    }
+
     /// Decide which certificate to present for a connection.
     pub fn choose(&self, sni: Option<&str>, peer_is_loopback: bool) -> CertChoice {
         // Loopback never gets a public cert — there's nothing a CA could verify.
         if peer_is_loopback {
             return CertChoice::Serve(self.self_signed());
         }
-        let Some(host) = sni.map(normalize).filter(|h| !h.is_empty()) else {
-            // No SNI (bare IP over TLS): present the self-signed default.
+        let Some(host) = self.effective_host(sni) else {
+            // No SNI and no default host configured: self-signed fallback.
             return CertChoice::Serve(self.self_signed());
         };
         if let Some(wl) = &self.inner.cfg.host_whitelist
@@ -230,7 +251,7 @@ impl AcmeManager {
         if peer_is_loopback {
             return CertChoice::Serve(self.self_signed());
         }
-        let Some(host) = sni.map(normalize).filter(|h| !h.is_empty()) else {
+        let Some(host) = self.effective_host(sni) else {
             return CertChoice::Serve(self.self_signed());
         };
         if let Some(wl) = &self.inner.cfg.host_whitelist
@@ -586,6 +607,36 @@ mod tests {
         assert!(near_expiry(Some(now + 10 * 86_400), now)); // 10 days left → renew
         assert!(!near_expiry(Some(now + 60 * 86_400), now)); // 60 days left → keep
         assert!(near_expiry(None, now)); // unknown expiry → renew, don't serve forever
+    }
+
+    #[test]
+    fn effective_host_falls_back_to_default_host() {
+        let dir = std::env::temp_dir().join(format!("httpsd-acme-{}", std::process::id()));
+        let mgr = AcmeManager::new(AcmeConfig {
+            default_host: Some("Example.COM.".into()), // mixed case + trailing dot
+            cert_dir: Some(dir.clone()),
+            ..Default::default()
+        })
+        .expect("manager");
+
+        // SNI present → route by it.
+        assert_eq!(
+            mgr.effective_host(Some("foo.test")).as_deref(),
+            Some("foo.test")
+        );
+        // No SNI (or empty) → the normalized default host.
+        assert_eq!(mgr.effective_host(None).as_deref(), Some("example.com"));
+        assert_eq!(mgr.effective_host(Some("")).as_deref(), Some("example.com"));
+
+        // Without a default host, no SNI → None (caller serves self-signed).
+        let mgr2 = AcmeManager::new(AcmeConfig {
+            cert_dir: Some(dir.clone()),
+            ..Default::default()
+        })
+        .expect("manager");
+        assert_eq!(mgr2.effective_host(None), None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

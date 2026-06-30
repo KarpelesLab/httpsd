@@ -113,6 +113,7 @@ OPTIONS:
         --acme-directory URL  ACME directory (default Let's Encrypt production)
         --acme-staging      use the Let's Encrypt staging environment
         --host-whitelist H1,H2  only issue certificates for these hosts
+        --default-host HOST  serve this host's certificate when a client sends no SNI
         --cert-dir DIR      certificate storage directory
         --hsts              send Strict-Transport-Security (max-age 1 year) on HTTPS
         --hsts-max-age N    HSTS max-age in seconds (implies --hsts)
@@ -143,6 +144,7 @@ struct Options {
     acme_directory: Option<String>,
     acme_staging: bool,
     host_whitelist: Option<Vec<String>>,
+    default_host: Option<String>,
     cert_dir: Option<String>,
     hsts: bool,
     hsts_max_age: Option<u64>,
@@ -173,6 +175,7 @@ impl Options {
             acme_directory: None,
             acme_staging: false,
             host_whitelist: None,
+            default_host: None,
             cert_dir: None,
             hsts: false,
             hsts_max_age: None,
@@ -211,6 +214,7 @@ impl Options {
                 "--acme-directory" => opts.acme_directory = Some(take_value(args, &mut i, arg)?),
                 "--acme-staging" => opts.acme_staging = true,
                 "--cert-dir" => opts.cert_dir = Some(take_value(args, &mut i, arg)?),
+                "--default-host" => opts.default_host = Some(take_value(args, &mut i, arg)?),
                 "--hsts" => opts.hsts = true,
                 "--hsts-include-subdomains" => opts.hsts_include_subdomains = true,
                 "--hsts-preload" => opts.hsts_preload = true,
@@ -362,6 +366,7 @@ impl Options {
             || self.acme_directory.is_some()
             || self.acme_staging
             || self.host_whitelist.is_some()
+            || self.default_host.is_some()
             || self.cert_dir.is_some()
     }
 
@@ -382,17 +387,27 @@ impl Options {
                 .clone()
                 .unwrap_or_else(|| httpsd::acme::client::LETSENCRYPT_PRODUCTION.to_owned())
         };
+        let norm = |h: &str| h.trim().trim_end_matches('.').to_ascii_lowercase();
+        let default_host = self
+            .default_host
+            .as_deref()
+            .map(norm)
+            .filter(|h| !h.is_empty());
         let whitelist = self.host_whitelist.as_ref().map(|hosts| {
-            hosts
-                .iter()
-                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
-                .collect()
+            let mut set: std::collections::HashSet<String> =
+                hosts.iter().map(|h| norm(h)).collect();
+            // A configured default host must be issuable, so keep it whitelisted.
+            if let Some(d) = &default_host {
+                set.insert(d.clone());
+            }
+            set
         });
         let cfg = httpsd::acme::AcmeConfig {
             directory_url: directory,
             accept_tos: true,
             email: self.acme_email.clone(),
             host_whitelist: whitelist,
+            default_host,
             cert_dir: self.cert_dir.clone().map(std::path::PathBuf::from),
         };
         Ok(server.acme(httpsd::acme::AcmeManager::new(cfg)?))

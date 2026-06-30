@@ -100,6 +100,8 @@ pub struct AcmeFileConfig {
     pub staging: bool,
     /// Only issue for these host names, if set.
     pub host_whitelist: Option<Vec<String>>,
+    /// Host to serve when a connection sends no SNI (bare-IP / SNI-less clients).
+    pub default_host: Option<String>,
     /// Override the certificate storage directory.
     pub cert_dir: Option<PathBuf>,
 }
@@ -297,17 +299,27 @@ impl ServerConfig {
                 .clone()
                 .unwrap_or_else(|| crate::acme::client::LETSENCRYPT_PRODUCTION.to_owned())
         };
+        let norm = |h: &str| h.trim().trim_end_matches('.').to_ascii_lowercase();
+        let default_host = acme
+            .default_host
+            .as_deref()
+            .map(norm)
+            .filter(|h| !h.is_empty());
         let whitelist = acme.host_whitelist.as_ref().map(|hosts| {
-            hosts
-                .iter()
-                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
-                .collect()
+            let mut set: std::collections::HashSet<String> =
+                hosts.iter().map(|h| norm(h)).collect();
+            // A configured default host must be issuable, so keep it whitelisted.
+            if let Some(d) = &default_host {
+                set.insert(d.clone());
+            }
+            set
         });
         let cfg = crate::acme::AcmeConfig {
             directory_url: directory,
             accept_tos: acme.accept_tos,
             email: acme.email.clone(),
             host_whitelist: whitelist,
+            default_host,
             cert_dir: acme.cert_dir.clone(),
         };
         Ok(server.acme(crate::acme::AcmeManager::new(cfg)?))
