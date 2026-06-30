@@ -7,10 +7,14 @@
 //! [`take_out`](H1Conn::take_out). A runtime driver supplies the actual I/O (and,
 //! for HTTPS, a TLS layer sits between the socket and this engine).
 
+use std::fs::File;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{Headers, Method, Request, Response, StatusCode, Version};
+use super::response::STREAM_CHUNK;
+use super::{Body, Headers, Method, Request, Response, StatusCode, Version};
 use crate::error::{Error, Result};
+use crate::proto::read_at_exact;
 
 /// Tunable limits applied while parsing requests, to bound memory use and
 /// reject abusive peers.
@@ -40,11 +44,24 @@ struct Pending {
     is_head: bool,
 }
 
+/// A response body being streamed from a file across multiple drains.
+#[derive(Debug)]
+struct FileBody {
+    file: Arc<File>,
+    /// Absolute offset of the next byte to read.
+    offset: u64,
+    /// Bytes still to send.
+    remaining: u64,
+}
+
 /// A sans-I/O HTTP/1.x server connection.
 #[derive(Debug)]
 pub struct H1Conn {
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
+    /// A file body still being streamed out. While set, [`take_out`](H1Conn::take_out)
+    /// keeps yielding the next `STREAM_CHUNK`-sized slice until EOF.
+    body_stream: Option<FileBody>,
     limits: Limits,
     /// The request currently awaiting a response, if any. While set,
     /// `poll_request` yields nothing (one in-flight request at a time).
@@ -81,6 +98,7 @@ impl H1Conn {
         H1Conn {
             inbuf: Vec::new(),
             outbuf: Vec::new(),
+            body_stream: None,
             limits,
             pending: None,
             head_scanned: 0,
@@ -101,17 +119,51 @@ impl H1Conn {
         self.inbuf.extend_from_slice(data);
     }
 
-    /// Drain and return all serialized response bytes queued so far.
+    /// Drain and return the next batch of serialized response bytes.
     ///
     /// The caller is expected to write the returned bytes to the transport in
-    /// full. Returns an empty vec when there is nothing pending.
+    /// full, then keep calling while [`has_output`](Self::has_output) is true so
+    /// a file body is streamed to completion. Returns queued buffer bytes first;
+    /// once those are drained it reads and returns the next `STREAM_CHUNK` of
+    /// any in-progress file body. Returns an empty vec when there is nothing
+    /// pending. A mid-stream read error (or a file that shrank) drops the stream
+    /// and marks the connection for close rather than panicking.
     pub fn take_out(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.outbuf)
+        if !self.outbuf.is_empty() {
+            return std::mem::take(&mut self.outbuf);
+        }
+        let Some(fb) = self.body_stream.as_mut() else {
+            return Vec::new();
+        };
+        let want = (fb.remaining as usize).min(STREAM_CHUNK);
+        let mut buf = vec![0u8; want];
+        match read_at_exact(&fb.file, fb.offset, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                fb.offset += n as u64;
+                fb.remaining -= n as u64;
+                if n < want {
+                    // The file came up short of the promised Content-Length: the
+                    // response is now corrupt, so close the connection.
+                    self.body_stream = None;
+                    self.closed = true;
+                } else if fb.remaining == 0 {
+                    self.body_stream = None;
+                }
+                buf
+            }
+            Err(_) => {
+                self.body_stream = None;
+                self.closed = true;
+                Vec::new()
+            }
+        }
     }
 
-    /// Whether there are serialized bytes waiting to be written.
+    /// Whether there is output still to be written — queued bytes or an
+    /// in-progress file body that has not reached EOF.
     pub fn has_output(&self) -> bool {
-        !self.outbuf.is_empty()
+        !self.outbuf.is_empty() || self.body_stream.is_some()
     }
 
     /// Whether the connection should be closed once `outbuf` has been written.
@@ -348,7 +400,20 @@ impl H1Conn {
         self.outbuf.extend_from_slice(b"\r\n");
 
         if !omit_body {
-            self.outbuf.extend_from_slice(&body);
+            match body {
+                Body::Bytes(bytes) => self.outbuf.extend_from_slice(&bytes),
+                // Stream a file body across subsequent `take_out` calls rather
+                // than buffering it. HEAD/bodyless responses fall in the
+                // `omit_body` arm above, so no read happens for them.
+                Body::File { file, offset, len } if len > 0 => {
+                    self.body_stream = Some(FileBody {
+                        file,
+                        offset,
+                        remaining: len,
+                    });
+                }
+                Body::File { .. } => {}
+            }
         }
 
         if !keep_alive {
@@ -778,6 +843,96 @@ pub(crate) fn http_date(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `data` to a fresh temp file and return it opened read-only.
+    fn temp_file(data: &[u8]) -> Arc<File> {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "httpsd-h1-stream-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut f = File::create(&path).unwrap();
+        f.write_all(data).unwrap();
+        f.sync_all().unwrap();
+        let opened = File::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path); // unlinked; fd keeps it alive
+        Arc::new(opened)
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// Drain a connection's output fully (headers + every streamed body chunk),
+    /// asserting it returns a result for each chunk while `has_output` is true.
+    fn drain_all(conn: &mut H1Conn) -> Vec<u8> {
+        let mut out = Vec::new();
+        while conn.has_output() {
+            let chunk = conn.take_out();
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
+
+    #[test]
+    fn streams_multichunk_file_with_correct_length() {
+        // Larger than STREAM_CHUNK so it must be served across several drains.
+        let n = 5 * STREAM_CHUNK + 123;
+        let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let file = temp_file(&data);
+
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        c.respond(Response::new(StatusCode::OK).body(Body::file(file, 0, n as u64)));
+
+        let out = drain_all(&mut c);
+        let split = find_subslice(&out, b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8(out[..split].to_vec()).unwrap();
+        assert!(
+            head.contains(&format!("Content-Length: {n}\r\n")),
+            "head: {head}"
+        );
+        assert_eq!(&out[split..], &data[..], "streamed body must be byte-exact");
+    }
+
+    #[test]
+    fn streams_file_range_span_only() {
+        let data: Vec<u8> = (0..(2 * STREAM_CHUNK)).map(|i| (i % 256) as u8).collect();
+        let file = temp_file(&data);
+        let (start, len) = (1000u64, (STREAM_CHUNK + 7) as u64);
+
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        c.respond(Response::new(StatusCode::PARTIAL_CONTENT).body(Body::file(file, start, len)));
+
+        let out = drain_all(&mut c);
+        let split = find_subslice(&out, b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(
+            &out[split..],
+            &data[start as usize..(start + len) as usize],
+            "range body must be exactly the requested span"
+        );
+    }
+
+    #[test]
+    fn head_file_sends_length_but_no_body() {
+        let data = vec![7u8; 3 * STREAM_CHUNK];
+        let file = temp_file(&data);
+
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"HEAD / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        c.respond(Response::new(StatusCode::OK).body(Body::file(file, 0, data.len() as u64)));
+
+        let out = drain_all(&mut c);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(&format!("Content-Length: {}\r\n", data.len())),
+            "head: {text}"
+        );
+        assert!(text.ends_with("\r\n\r\n"), "HEAD must send no body: {text}");
+    }
 
     fn drive(conn: &mut H1Conn, input: &[u8]) -> Option<Request> {
         conn.feed(input);

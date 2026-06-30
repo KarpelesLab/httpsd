@@ -142,12 +142,22 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
 
         // Always flush queued output before acting on a parse error: a failed
         // feed may have produced a TLS alert (e.g. a refused renegotiation), and
-        // the peer should receive it rather than a bare connection reset.
-        if let Ok(out) = session.to_send()
-            && !out.is_empty()
-        {
-            stream.write_all(&out)?;
-            stream.flush()?;
+        // the peer should receive it rather than a bare connection reset. Keep
+        // pulling until the engine has nothing more — a file body is streamed in
+        // bounded chunks across successive `to_send` calls, so we must fully
+        // drain it here before going back to read (a slow GET client sends
+        // nothing more, so a single flush would stall mid-body).
+        loop {
+            match session.to_send() {
+                Ok(out) if !out.is_empty() => {
+                    stream.write_all(&out)?;
+                    stream.flush()?;
+                    if !session.has_output() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
         }
 
         received?;

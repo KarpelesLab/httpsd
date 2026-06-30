@@ -296,13 +296,37 @@ fn drive(conn: &mut Conn, event: &Event) -> Result<()> {
                 Err(e) => return Err(Error::Io(e)),
             }
         }
+        // Queue whatever the engine produced now (handshake records or the first
+        // response chunk); `pump_writes` then streams any remaining body.
         let out = conn.session.to_send()?;
         conn.enqueue(out);
     }
 
-    // Either a writable event or freshly produced output: try to drain.
-    if event.is_writable() || conn.pending_out() {
+    // Drain the outbound buffer and, as the socket accepts more, pull the next
+    // body chunk — so a file body is streamed without buffering it whole and
+    // without stalling when the socket back-pressures.
+    pump_writes(conn)?;
+    Ok(())
+}
+
+/// Flush the outbound buffer, pulling successive body chunks from the session as
+/// the socket drains. Stops when the socket back-pressures (the buffer is left
+/// non-empty, so `WRITABLE` interest is re-armed) or the session has no more
+/// output. Memory stays bounded: at most one chunk is buffered at a time.
+fn pump_writes(conn: &mut Conn) -> Result<()> {
+    loop {
         conn.flush_out()?;
+        if conn.pending_out() {
+            break; // socket full; wait for the next WRITABLE event
+        }
+        if !conn.session.has_output() {
+            break;
+        }
+        let out = conn.session.to_send()?;
+        if out.is_empty() {
+            break;
+        }
+        conn.enqueue(out);
     }
     Ok(())
 }

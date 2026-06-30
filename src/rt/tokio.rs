@@ -121,10 +121,19 @@ async fn serve(mut stream: TcpStream, shared: &Shared) -> Result<()> {
             window_bytes = 0;
         }
         session.received(&buf[..n])?;
-        let out = session.to_send()?;
-        if !out.is_empty() {
+        // Drain fully before the next read: a file body is streamed in bounded
+        // chunks across successive `to_send` calls, and a GET client sends
+        // nothing more, so a single flush would stall mid-body.
+        loop {
+            let out = session.to_send()?;
+            if out.is_empty() {
+                break;
+            }
             stream.write_all(&out).await?;
             stream.flush().await?;
+            if !session.has_output() {
+                break;
+            }
         }
         if session.wants_close() {
             break;

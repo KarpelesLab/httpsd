@@ -231,6 +231,19 @@ impl Session {
         self.transport.encrypt(app)
     }
 
+    /// Whether the engine still has output to produce — queued bytes or a
+    /// response body (e.g. a file) being streamed in chunks. Drivers must keep
+    /// calling [`to_send`](Self::to_send) while this is true before waiting for
+    /// the next read or closing, so a body is flushed in full.
+    pub fn has_output(&self) -> bool {
+        match self.engine.as_ref() {
+            Some(Engine::H1(conn)) => conn.has_output(),
+            #[cfg(feature = "h2")]
+            Some(Engine::H2(conn)) => conn.has_output(),
+            None => false,
+        }
+    }
+
     /// Whether the connection should be closed once pending output is written.
     pub fn wants_close(&self) -> bool {
         match self.engine.as_ref() {
