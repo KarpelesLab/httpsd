@@ -1,6 +1,6 @@
 [package]
 name = "httpsd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A pure-Rust HTTP/HTTPS server — usable as a sans-I/O library with pluggable runtimes (thread pool, tokio, mio) or as a CLI that serves a directory or a TOML config."
