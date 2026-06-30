@@ -199,7 +199,7 @@ impl AcmeClient {
         let (ctype, curl, token) = self
             .select_challenge(challenges, solver)
             .ok_or_else(|| Error::Acme("no supported challenge offered".into()))?;
-        let key_auth = self.account.key_authorization(&token);
+        let key_auth = self.account.key_authorization(&token)?;
 
         solver.present(&ctype, &host, &token, &key_auth)?;
         let result = (|| {

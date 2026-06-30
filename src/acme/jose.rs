@@ -56,30 +56,36 @@ impl AccountKey {
 
     /// The public JWK as canonical JSON (members in the RFC 7638 order so it
     /// doubles as the thumbprint input): `{"crv":"P-256","kty":"EC","x":..,"y":..}`.
-    pub fn jwk_json(&self) -> String {
-        let (x, y) = self.xy();
-        format!(
+    pub fn jwk_json(&self) -> Result<String> {
+        let (x, y) = self.xy()?;
+        Ok(format!(
             r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
             b64url(&x),
             b64url(&y)
-        )
+        ))
     }
 
     /// The RFC 7638 JWK thumbprint: SHA-256 of the canonical JWK JSON.
-    pub fn thumbprint(&self) -> [u8; 32] {
-        sha256(self.jwk_json().as_bytes())
+    pub fn thumbprint(&self) -> Result<[u8; 32]> {
+        Ok(sha256(self.jwk_json()?.as_bytes()))
     }
 
     /// The ACME key authorization for a challenge `token`:
     /// `token "." base64url(thumbprint)` (RFC 8555 §8.1).
-    pub fn key_authorization(&self, token: &str) -> String {
-        format!("{token}.{}", b64url(&self.thumbprint()))
+    pub fn key_authorization(&self, token: &str) -> Result<String> {
+        Ok(format!("{token}.{}", b64url(&self.thumbprint()?)))
     }
 
     /// The affine X and Y coordinates (32 bytes each) from the SEC1 point.
-    fn xy(&self) -> (Vec<u8>, Vec<u8>) {
+    fn xy(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         let sec1 = self.key.public_key().to_sec1(); // 0x04 || X(32) || Y(32)
-        (sec1[1..33].to_vec(), sec1[33..65].to_vec())
+        if sec1.len() != 65 || sec1[0] != 0x04 {
+            return Err(Error::Tls(format!(
+                "acme jwk: expected 65-byte uncompressed SEC1 point, got {} bytes",
+                sec1.len()
+            )));
+        }
+        Ok((sec1[1..33].to_vec(), sec1[33..65].to_vec()))
     }
 
     /// Produce a flattened JWS (the JSON body ACME POSTs) over `payload` with
@@ -90,7 +96,7 @@ impl AccountKey {
     /// account URL (everything else).
     pub fn sign(&self, url: &str, nonce: &str, auth: &KeyId, payload: &str) -> Result<String> {
         let auth_field = match auth {
-            KeyId::Jwk => format!(r#""jwk":{}"#, self.jwk_json()),
+            KeyId::Jwk => format!(r#""jwk":{}"#, self.jwk_json()?),
             KeyId::Kid(kid) => format!(r#""kid":"{}""#, json::escape(kid)),
         };
         let protected = format!(
@@ -144,11 +150,11 @@ mod tests {
     #[test]
     fn jwk_and_thumbprint_are_stable() {
         let k = AccountKey::generate();
-        let j1 = k.jwk_json();
+        let j1 = k.jwk_json().unwrap();
         assert!(j1.starts_with(r#"{"crv":"P-256","kty":"EC","x":"#));
-        assert_eq!(k.thumbprint(), k.thumbprint());
+        assert_eq!(k.thumbprint().unwrap(), k.thumbprint().unwrap());
         // key authorization shape: "<token>.<43-char b64url of 32 bytes>"
-        let ka = k.key_authorization("tok");
+        let ka = k.key_authorization("tok").unwrap();
         let parts: Vec<&str> = ka.split('.').collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "tok");
