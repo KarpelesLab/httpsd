@@ -1,13 +1,14 @@
 //! A [`Handler`] that serves files from a directory on disk.
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use crate::handler::Handler;
 use crate::mime;
-use crate::proto::{Method, Request, Response, StatusCode};
+use crate::proto::{Body, Method, Request, Response, StatusCode};
 
 /// Serves static files rooted at a directory.
 ///
@@ -137,14 +138,25 @@ impl StaticFiles {
             return resp;
         }
 
-        // Range handling (single range only). For a satisfiable range we read
-        // only the requested span off disk instead of buffering the whole file.
+        // Open the file once, here, so a permission/existence error becomes a
+        // clean status BEFORE any headers are committed. The fd is shared via
+        // `Arc` and the body is streamed off it in bounded chunks (200 and 206
+        // alike) — the whole file is never buffered. A HEAD still produces a
+        // `Body::File` so `Content-Length` is correct, but the engines skip the
+        // read for bodyless responses.
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Response::status(StatusCode::NOT_FOUND);
+            }
+            Err(_) => return Response::status(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+        let file = Arc::new(file);
+
+        // Range handling (single range only). A satisfiable range streams exactly
+        // the requested span off disk.
         if let Some(range) = req.headers().get("range") {
             if let Some((start, end)) = parse_single_range(range, len) {
-                let slice = match read_span(&path, start, end - start + 1) {
-                    Ok(b) => b,
-                    Err(_) => return Response::status(StatusCode::INTERNAL_SERVER_ERROR),
-                };
                 let mut resp = Response::new(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", content_type)
                     .header("Accept-Ranges", "bytes")
@@ -154,21 +166,13 @@ impl StaticFiles {
                 if let Some(lm) = last_modified {
                     resp = resp.header("Last-Modified", lm);
                 }
-                return resp.body(slice);
+                return resp.body(Body::file(file, start, end - start + 1));
             } else if range.trim_start().starts_with("bytes=") {
                 // A syntactically present but unsatisfiable range.
                 return Response::new(StatusCode::RANGE_NOT_SATISFIABLE)
                     .header("Content-Range", format!("bytes */{len}"));
             }
         }
-
-        // NOTE (deferred): full-file responses still buffer the entire file in
-        // memory via `fs::read`. Converting this to a streaming body is a larger
-        // follow-up; only the Range path is optimized here.
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => return Response::status(StatusCode::INTERNAL_SERVER_ERROR),
-        };
 
         let mut resp = Response::new(StatusCode::OK)
             .header("Content-Type", content_type)
@@ -178,7 +182,7 @@ impl StaticFiles {
         if let Some(lm) = last_modified {
             resp = resp.header("Last-Modified", lm);
         }
-        resp.body(bytes)
+        resp.body(Body::file(file, 0, len))
     }
 }
 
@@ -197,16 +201,6 @@ fn conditional_hit(req: &Request, etag: &str, last_modified: Option<&str>) -> bo
         return ims == lm;
     }
     false
-}
-
-/// Read exactly `count` bytes starting at byte offset `start` from `path`,
-/// without buffering the rest of the file.
-fn read_span(path: &Path, start: u64, count: u64) -> io::Result<Vec<u8>> {
-    let mut f = fs::File::open(path)?;
-    f.seek(SeekFrom::Start(start))?;
-    let mut buf = vec![0u8; count as usize];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 /// Parse a single `Range: bytes=...` value into an inclusive `(start, end)`,

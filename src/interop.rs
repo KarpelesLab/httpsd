@@ -32,7 +32,7 @@
 
 use http::header::{HeaderName, HeaderValue};
 
-use crate::proto::{Headers, Method, Request, Response, StatusCode, Version};
+use crate::proto::{Body, Headers, Method, Request, Response, StatusCode, Version};
 
 /// Error converting an httpsd value into the corresponding [`http`] crate type.
 ///
@@ -217,7 +217,9 @@ impl TryFrom<Response> for http::Response<Vec<u8>> {
     type Error = HttpConvertError;
     fn try_from(resp: Response) -> Result<Self, Self::Error> {
         let (status, headers, body) = resp.into_parts();
-        let mut out = http::Response::new(body);
+        // Materialize the body (a file body is read into memory; `http` carries
+        // an owned `Vec<u8>`).
+        let mut out = http::Response::new(body.into_bytes());
         *out.status_mut() = http::StatusCode::try_from(status)?;
         *out.headers_mut() = http::HeaderMap::try_from(&headers)?;
         Ok(out)
@@ -230,7 +232,7 @@ impl From<http::Response<Vec<u8>>> for Response {
         Response::from_parts(
             StatusCode::from(parts.status),
             Headers::from(&parts.headers),
-            body,
+            Body::from(body),
         )
     }
 }
