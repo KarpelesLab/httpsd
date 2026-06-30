@@ -47,12 +47,23 @@ impl Value {
     }
 }
 
+/// Maximum nesting depth for arrays/objects. ACME responses are shallow; this
+/// bounds parser recursion so a hostile CA response cannot overflow the stack.
+const MAX_DEPTH: usize = 64;
+
+/// Maximum accepted input length. ACME documents are small; this caps work for a
+/// malicious oversized body cheaply, before any parsing.
+const MAX_INPUT: usize = 4 * 1024 * 1024;
+
 /// Parse a JSON document.
 pub fn parse(input: &str) -> Result<Value> {
     let bytes = input.as_bytes();
+    if bytes.len() > MAX_INPUT {
+        return Err(err("input too large"));
+    }
     let mut p = Parser { b: bytes, i: 0 };
     p.ws();
-    let v = p.value()?;
+    let v = p.value(0)?;
     p.ws();
     if p.i != bytes.len() {
         return Err(err("trailing data after JSON value"));
@@ -78,11 +89,14 @@ impl Parser<'_> {
             self.i += 1;
         }
     }
-    fn value(&mut self) -> Result<Value> {
+    fn value(&mut self, depth: usize) -> Result<Value> {
+        if depth >= MAX_DEPTH {
+            return Err(err("nesting too deep"));
+        }
         self.ws();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Value::Str(self.string()?)),
             Some(b't') => self.lit("true", Value::Bool(true)),
             Some(b'f') => self.lit("false", Value::Bool(false)),
@@ -99,7 +113,7 @@ impl Parser<'_> {
             Err(err("invalid literal"))
         }
     }
-    fn object(&mut self) -> Result<Value> {
+    fn object(&mut self, depth: usize) -> Result<Value> {
         self.i += 1; // {
         let mut fields = Vec::new();
         self.ws();
@@ -118,7 +132,7 @@ impl Parser<'_> {
                 return Err(err("expected ':'"));
             }
             self.i += 1;
-            let val = self.value()?;
+            let val = self.value(depth + 1)?;
             fields.push((key, val));
             self.ws();
             match self.peek() {
@@ -134,7 +148,7 @@ impl Parser<'_> {
         }
         Ok(Value::Object(fields))
     }
-    fn array(&mut self) -> Result<Value> {
+    fn array(&mut self, depth: usize) -> Result<Value> {
         self.i += 1; // [
         let mut items = Vec::new();
         self.ws();
@@ -143,7 +157,7 @@ impl Parser<'_> {
             return Ok(Value::Array(items));
         }
         loop {
-            items.push(self.value()?);
+            items.push(self.value(depth + 1)?);
             self.ws();
             match self.peek() {
                 Some(b',') => {
@@ -289,5 +303,28 @@ mod tests {
     #[test]
     fn escape_basic() {
         assert_eq!(escape("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    #[test]
+    fn rejects_deep_nesting() {
+        // Well past MAX_DEPTH: must error rather than overflow the stack.
+        let deep_arrays = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(parse(&deep_arrays).is_err());
+        let deep_objects = format!("{}1{}", r#"{"a":"#.repeat(10_000), "}".repeat(10_000));
+        assert!(parse(&deep_objects).is_err());
+    }
+
+    #[test]
+    fn accepts_shallow_nesting() {
+        // Nesting comfortably under the cap still parses.
+        let depth = 32;
+        let shallow = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(parse(&shallow).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_input() {
+        let big = "0".repeat(MAX_INPUT + 1);
+        assert!(parse(&big).is_err());
     }
 }
