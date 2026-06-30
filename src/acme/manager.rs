@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,27 @@ use crate::tls::TlsAcceptor;
 
 /// Re-issue a certificate once it is within this window of expiry.
 const RENEW_BEFORE_SECS: u64 = 30 * 86_400;
+
+/// Maximum number of successfully-issued certs kept in memory. The on-disk store
+/// is the source of truth; evicted entries are reloaded cheaply on next use.
+/// Bounding this stops the success cache growing without limit under many
+/// distinct SNIs.
+const CACHE_MAX: usize = 1024;
+
+/// After an issuance failure for a host, refuse to re-attempt for this long.
+/// This negative cache stops a non-issuable SNI from re-running the full
+/// blocking order/poll flow (which can sleep tens of seconds) on every
+/// connection.
+const NEG_CACHE_COOLDOWN_SECS: u64 = 300;
+
+/// Maximum number of remembered issuance failures. Bounds the negative cache so
+/// an attacker hitting unbounded distinct SNIs cannot grow memory without limit.
+const NEG_CACHE_MAX: usize = 4096;
+
+/// Maximum number of certificate issuances allowed to run concurrently. Each
+/// issuance can block for tens of seconds; this caps the worst-case number of
+/// threads parked in the ACME flow regardless of how many distinct SNIs arrive.
+const MAX_INFLIGHT: usize = 16;
 
 /// Configuration for automatic certificate management.
 #[derive(Debug, Clone)]
@@ -62,6 +84,46 @@ struct Cached {
     not_after: Option<u64>,
 }
 
+/// A size-bounded, approximately-LRU cache of issued acceptors. Reads bump a
+/// monotonic tick; when full, the least-recently-used entry is evicted.
+struct CertCache {
+    map: HashMap<String, (Arc<Cached>, u64)>,
+    tick: u64,
+}
+
+impl CertCache {
+    fn new() -> CertCache {
+        CertCache {
+            map: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, host: &str) -> Option<Arc<Cached>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.map.get_mut(host)?;
+        entry.1 = tick;
+        Some(Arc::clone(&entry.0))
+    }
+
+    fn put(&mut self, host: &str, value: Arc<Cached>) {
+        self.tick += 1;
+        let tick = self.tick;
+        if !self.map.contains_key(host)
+            && self.map.len() >= CACHE_MAX
+            && let Some(lru) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+        {
+            self.map.remove(&lru);
+        }
+        self.map.insert(host.to_owned(), (value, tick));
+    }
+}
+
 /// Shared automatic-certificate manager. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
 pub struct AcmeManager {
@@ -72,8 +134,12 @@ struct Inner {
     cfg: AcmeConfig,
     store: Store,
     self_signed: TlsAcceptor,
-    cache: Mutex<HashMap<String, Arc<Cached>>>,
+    cache: Mutex<CertCache>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// host → earliest Unix time we may retry issuance after a recent failure.
+    failures: Mutex<HashMap<String, u64>>,
+    /// Number of issuances currently talking to the CA (bounded by `MAX_INFLIGHT`).
+    in_flight: AtomicUsize,
     /// host → TLS-ALPN-01 challenge acceptor (present during validation).
     alpn_challenges: Arc<Mutex<HashMap<String, TlsAcceptor>>>,
     /// HTTP-01 token → key authorization (served by the HTTP listener).
@@ -91,8 +157,10 @@ impl AcmeManager {
                 cfg,
                 store,
                 self_signed,
-                cache: Mutex::new(HashMap::new()),
+                cache: Mutex::new(CertCache::new()),
                 locks: Mutex::new(HashMap::new()),
+                failures: Mutex::new(HashMap::new()),
+                in_flight: AtomicUsize::new(0),
                 alpn_challenges: Arc::new(Mutex::new(HashMap::new())),
                 http_challenges: Arc::new(Mutex::new(HashMap::new())),
             }),
@@ -170,7 +238,7 @@ impl AcmeManager {
         {
             return CertChoice::Reject;
         }
-        if let Some(c) = self.inner.cache.lock().unwrap().get(&host).cloned() {
+        if let Some(c) = self.inner.cache.lock().unwrap().get(&host) {
             return CertChoice::Serve(c.acceptor.clone());
         }
         match self.inner.store.load_cert(&host) {
@@ -192,49 +260,95 @@ impl AcmeManager {
         let now = now_secs();
 
         // Fast path: a fresh cached cert.
-        if let Some(c) = self.inner.cache.lock().unwrap().get(host).cloned()
+        if let Some(c) = self.inner.cache.lock().unwrap().get(host)
             && !near_expiry(c.not_after, now)
         {
             return Ok(c.acceptor.clone());
+        }
+
+        // Negative cache: a recent failure short-circuits to an error (→ Reject)
+        // without re-running the blocking issuance flow, until the cooldown ends.
+        if self.in_backoff(host, now) {
+            return Err(Error::Acme(format!(
+                "{host}: skipping issuance, backing off after a recent failure"
+            )));
         }
 
         // Serialize issuance per host.
         let lock = self.host_lock(host);
-        let _guard = lock.lock().unwrap();
+        let result = {
+            let _guard = lock.lock().unwrap();
 
-        // Re-check the cache now that we hold the lock.
-        if let Some(c) = self.inner.cache.lock().unwrap().get(host).cloned()
-            && !near_expiry(c.not_after, now)
-        {
-            return Ok(c.acceptor.clone());
-        }
+            // Re-check the cache and backoff now that we hold the lock (another
+            // waiter may have just succeeded or failed).
+            if let Some(c) = self.inner.cache.lock().unwrap().get(host)
+                && !near_expiry(c.not_after, now)
+            {
+                Ok(c.acceptor.clone())
+            } else if self.in_backoff(host, now) {
+                Err(Error::Acme(format!(
+                    "{host}: skipping issuance, backing off after a recent failure"
+                )))
+            } else {
+                self.try_issue(host, now)
+            }
+        };
+        // Drop the per-host lock entry if no other waiter still references it,
+        // so the lock map cannot grow without bound across distinct SNIs.
+        self.release_host_lock(host, lock);
+        result
+    }
 
+    /// Disk-then-CA issuance, recording negative-cache state on the outcome.
+    /// Assumes the per-host lock is held.
+    fn try_issue(&self, host: &str, now: u64) -> Result<TlsAcceptor> {
         // Try disk before talking to the CA.
-        if let Some(stored) = self.inner.store.load_cert(host)? {
+        let stored = self.inner.store.load_cert(host)?;
+        if let Some(stored) = &stored {
             let not_after = cert_not_after(&stored.chain_pem);
             if !near_expiry(not_after, now) {
                 let acceptor = TlsAcceptor::from_pem(&stored.chain_pem, &stored.key_pem)?;
                 self.cache_put(host, acceptor.clone(), not_after);
+                self.clear_failure(host);
                 return Ok(acceptor);
-            }
-            // Stored but near/at expiry: try to renew, fall back to it if the
-            // renewal fails but it is still valid.
-            match self.issue(host) {
-                Ok(acceptor) => return Ok(acceptor),
-                Err(e) if not_after.is_some_and(|t| t > now) => {
-                    if cfg!(debug_assertions) {
-                        eprintln!("httpsd: acme: renewal for {host} failed, serving existing: {e}");
-                    }
-                    let acceptor = TlsAcceptor::from_pem(&stored.chain_pem, &stored.key_pem)?;
-                    self.cache_put(host, acceptor.clone(), not_after);
-                    return Ok(acceptor);
-                }
-                Err(e) => return Err(e),
             }
         }
 
-        // Nothing on disk: issue fresh.
-        self.issue(host)
+        // We are about to talk to the CA: take a global in-flight permit so the
+        // number of concurrent blocking issuances stays bounded.
+        let Some(_permit) = self.acquire_permit() else {
+            // Transient capacity limit: shed load without backing the host off.
+            return Err(Error::Acme(format!(
+                "{host}: too many certificate issuances in flight, retry shortly"
+            )));
+        };
+
+        match self.issue(host) {
+            Ok(acceptor) => {
+                self.clear_failure(host);
+                Ok(acceptor)
+            }
+            Err(e) => {
+                // Renewal failed but a still-valid cert is on disk: serve it and
+                // do NOT enter backoff (we have a usable cert to present).
+                if let Some(stored) = &stored {
+                    let not_after = cert_not_after(&stored.chain_pem);
+                    if not_after.is_some_and(|t| t > now) {
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "httpsd: acme: renewal for {host} failed, serving existing: {e}"
+                            );
+                        }
+                        let acceptor = TlsAcceptor::from_pem(&stored.chain_pem, &stored.key_pem)?;
+                        self.cache_put(host, acceptor.clone(), not_after);
+                        return Ok(acceptor);
+                    }
+                }
+                // Genuine failure with no servable cert: remember it briefly.
+                self.record_failure(host, now);
+                Err(e)
+            }
+        }
     }
 
     /// Issue a brand-new certificate for `host` via ACME and persist it.
@@ -292,14 +406,88 @@ impl AcmeManager {
             .clone()
     }
 
+    /// Drop the per-host lock entry once issuance completes if no other thread
+    /// still references it. Holding the map mutex makes the strong-count check
+    /// atomic against concurrent `host_lock` callers (they need the same mutex
+    /// to clone the `Arc`). `2` = the map's copy plus the `lock` argument.
+    fn release_host_lock(&self, host: &str, lock: Arc<Mutex<()>>) {
+        let mut locks = self.inner.locks.lock().unwrap();
+        if Arc::strong_count(&lock) == 2 {
+            locks.remove(host);
+        }
+    }
+
+    /// Whether `host` is within an issuance-failure cooldown. Expired entries are
+    /// purged opportunistically.
+    fn in_backoff(&self, host: &str, now: u64) -> bool {
+        let mut failures = self.inner.failures.lock().unwrap();
+        match failures.get(host).copied() {
+            Some(retry_at) if retry_at > now => true,
+            Some(_) => {
+                failures.remove(host);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Remember an issuance failure for `host`, bounding the map's size.
+    fn record_failure(&self, host: &str, now: u64) {
+        let retry_at = now.saturating_add(NEG_CACHE_COOLDOWN_SECS);
+        let mut failures = self.inner.failures.lock().unwrap();
+        if !failures.contains_key(host) && failures.len() >= NEG_CACHE_MAX {
+            // Drop expired entries first; if still full, evict the soonest to
+            // expire so the map can never grow past the cap.
+            failures.retain(|_, &mut t| t > now);
+            if failures.len() >= NEG_CACHE_MAX
+                && let Some(oldest) = failures
+                    .iter()
+                    .min_by_key(|&(_, &t)| t)
+                    .map(|(k, _)| k.clone())
+            {
+                failures.remove(&oldest);
+            }
+        }
+        failures.insert(host.to_owned(), retry_at);
+    }
+
+    /// Clear any remembered failure for `host` (called on success).
+    fn clear_failure(&self, host: &str) {
+        self.inner.failures.lock().unwrap().remove(host);
+    }
+
+    /// Take a global in-flight issuance permit, or `None` if at capacity.
+    fn acquire_permit(&self) -> Option<Permit<'_>> {
+        let prev = self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+        if prev >= MAX_INFLIGHT {
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+            None
+        } else {
+            Some(Permit {
+                counter: &self.inner.in_flight,
+            })
+        }
+    }
+
     fn cache_put(&self, host: &str, acceptor: TlsAcceptor, not_after: Option<u64>) {
-        self.inner.cache.lock().unwrap().insert(
-            host.to_owned(),
+        self.inner.cache.lock().unwrap().put(
+            host,
             Arc::new(Cached {
                 acceptor,
                 not_after,
             }),
         );
+    }
+}
+
+/// RAII guard for a global in-flight issuance permit.
+struct Permit<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -361,7 +549,9 @@ fn now_secs() -> u64 {
 fn near_expiry(not_after: Option<u64>, now: u64) -> bool {
     match not_after {
         Some(t) => now + RENEW_BEFORE_SECS >= t,
-        None => false, // unknown expiry: don't churn
+        // Unknown expiry: treat as needing renewal rather than never-expiring,
+        // so a cert whose `notAfter` can't be parsed isn't served forever.
+        None => true,
     }
 }
 
@@ -380,7 +570,7 @@ mod tests {
         let now = 1_000_000_000;
         assert!(near_expiry(Some(now + 10 * 86_400), now)); // 10 days left → renew
         assert!(!near_expiry(Some(now + 60 * 86_400), now)); // 60 days left → keep
-        assert!(!near_expiry(None, now));
+        assert!(near_expiry(None, now)); // unknown expiry → renew, don't serve forever
     }
 
     #[test]
