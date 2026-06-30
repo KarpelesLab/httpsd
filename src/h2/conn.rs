@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use compcol::hpack::{HeaderField, HpackDecoder, HpackEncoder};
+use compcol::hpack::{DEFAULT_TABLE_SIZE, HeaderField, HpackDecoder, HpackEncoder};
 
 use super::frame::{self, CLIENT_PREFACE, FrameHeader, errcode, flag, ftype, settings};
 use crate::proto::{
@@ -21,6 +21,20 @@ const DEFAULT_MAX_FRAME: usize = 16_384;
 const OUR_WINDOW: u32 = 1 << 20;
 /// The largest frame we are willing to accept (also advertised).
 const OUR_MAX_FRAME: usize = 1 << 20;
+/// MAX_CONCURRENT_STREAMS we advertise and enforce on peer-initiated streams
+/// (RFC 9113 §5.1.2). Must match the value sent in our initial SETTINGS.
+const MAX_CONCURRENT_STREAMS: u32 = 128;
+/// Hard cap on CONTINUATION frames per header block (CONTINUATION-flood guard,
+/// CVE-2024-27316 class). Legitimate clients need only a handful.
+const MAX_CONTINUATION_FRAMES: u32 = 16;
+/// Largest HPACK dynamic table size we let the peer make us keep, regardless of
+/// the (up to 2^32-1) value it advertises.
+const MAX_HPACK_TABLE_SIZE: usize = 64 * 1024;
+/// Rapid-reset (CVE-2023-44487) heuristic: only start scrutinizing the
+/// reset:completed ratio once the peer has reset at least this many streams.
+const RST_FLOOD_MIN: u64 = 100;
+/// The largest receive flow-control window value permitted (RFC 9113 §6.9.1).
+const MAX_WINDOW: i64 = 0x7fff_ffff;
 
 /// Per-stream state: request assembly on the recv side, response framing on the
 /// send side.
@@ -28,6 +42,9 @@ struct Stream {
     // --- receive / request assembly ---
     header_block: Vec<u8>,
     assembling: bool,
+    /// Set when the stream was accepted only to keep the HPACK decoder in sync
+    /// (it exceeded MAX_CONCURRENT_STREAMS); it is RST_STREAM'd, never delivered.
+    refused: bool,
     body: Vec<u8>,
     end_stream_recv: bool,
     delivered: bool,
@@ -47,6 +64,7 @@ impl Stream {
         Stream {
             header_block: Vec::new(),
             assembling: false,
+            refused: false,
             body: Vec::new(),
             end_stream_recv: false,
             delivered: false,
@@ -88,6 +106,14 @@ pub struct H2Conn {
 
     // Header (de)assembly continuation target.
     continuation_stream: Option<u32>,
+    // CONTINUATION frames seen for the header block currently being assembled.
+    continuation_frames: u32,
+    // Current HPACK encoder dynamic-table size (to skip redundant rebuilds).
+    enc_table_size: usize,
+
+    // Rapid-reset (CVE-2023-44487) accounting.
+    peer_resets: u64,
+    completed: u64,
 
     streams: BTreeMap<u32, Stream>,
     last_peer_stream: u32,
@@ -116,6 +142,10 @@ impl H2Conn {
             peer_max_frame: DEFAULT_MAX_FRAME,
             conn_send_window: DEFAULT_WINDOW,
             continuation_stream: None,
+            continuation_frames: 0,
+            enc_table_size: DEFAULT_TABLE_SIZE,
+            peer_resets: 0,
+            completed: 0,
             streams: BTreeMap::new(),
             last_peer_stream: 0,
             ready: std::collections::VecDeque::new(),
@@ -169,7 +199,7 @@ impl H2Conn {
             &mut self.outbuf,
             &[
                 (settings::ENABLE_PUSH, 0),
-                (settings::MAX_CONCURRENT_STREAMS, 128),
+                (settings::MAX_CONCURRENT_STREAMS, MAX_CONCURRENT_STREAMS),
                 (settings::INITIAL_WINDOW_SIZE, OUR_WINDOW),
                 (settings::MAX_FRAME_SIZE, OUR_MAX_FRAME as u32),
             ],
@@ -208,7 +238,19 @@ impl H2Conn {
                 ftype::CONTINUATION => self.on_continuation(&header, &payload),
                 ftype::DATA => self.on_data(&header, &payload),
                 ftype::RST_STREAM => {
-                    self.streams.remove(&header.stream_id);
+                    if self.streams.remove(&header.stream_id).is_some() {
+                        self.pending_heads.remove(&header.stream_id);
+                        self.peer_resets += 1;
+                        // Rapid Reset (CVE-2023-44487): a peer that opens streams
+                        // and immediately resets them does cheap-for-it,
+                        // expensive-for-us work. Once resets dominate completed
+                        // requests, tear the connection down.
+                        if self.peer_resets > RST_FLOOD_MIN && self.peer_resets > 2 * self.completed
+                        {
+                            self.conn_error(errcode::ENHANCE_YOUR_CALM);
+                            return;
+                        }
+                    }
                 }
                 ftype::GOAWAY => {
                     // Peer is shutting down; finish in-flight work, then close.
@@ -246,8 +288,14 @@ impl H2Conn {
                     self.peer_max_frame = (value as usize).clamp(DEFAULT_MAX_FRAME, OUR_MAX_FRAME);
                 }
                 settings::HEADER_TABLE_SIZE => {
-                    // Bound our encoder's dynamic table to what the peer allows.
-                    self.hpack_enc = HpackEncoder::with_max_table_size(value as usize);
+                    // Bound our encoder's dynamic table to what the peer allows,
+                    // but clamp the (up to 2^32-1) value to a sane maximum and
+                    // skip the rebuild when the size is unchanged.
+                    let want = (value as usize).min(MAX_HPACK_TABLE_SIZE);
+                    if want != self.enc_table_size {
+                        self.enc_table_size = want;
+                        self.hpack_enc = HpackEncoder::with_max_table_size(want);
+                    }
                 }
                 _ => {}
             }
@@ -268,8 +316,23 @@ impl H2Conn {
         }
         if header.stream_id == 0 {
             self.conn_send_window += inc;
+            // A window that overflows 2^31-1 is a connection-level
+            // FLOW_CONTROL_ERROR (RFC 9113 §6.9.1).
+            if self.conn_send_window > MAX_WINDOW {
+                self.conn_error(errcode::FLOW_CONTROL_ERROR);
+            }
         } else if let Some(s) = self.streams.get_mut(&header.stream_id) {
             s.send_window += inc;
+            // Overflow on a stream window is a stream-level FLOW_CONTROL_ERROR.
+            if s.send_window > MAX_WINDOW {
+                frame::write_rst_stream(
+                    &mut self.outbuf,
+                    header.stream_id,
+                    errcode::FLOW_CONTROL_ERROR,
+                );
+                self.streams.remove(&header.stream_id);
+                self.pending_heads.remove(&header.stream_id);
+            }
         }
     }
 
@@ -305,19 +368,37 @@ impl H2Conn {
                 return;
             }
             self.last_peer_stream = sid;
+            // Enforce MAX_CONCURRENT_STREAMS (RFC 9113 §5.1.2). We still accept
+            // the stream so its header block can be fed to the HPACK decoder
+            // (skipping it would desync the connection's compression state), but
+            // mark it `refused`: it is RST_STREAM'd and never delivered.
+            let over_cap = self.streams.len() as u32 >= MAX_CONCURRENT_STREAMS;
             let w = self.peer_initial_window;
-            self.streams.insert(sid, Stream::new(w));
+            let mut stream = Stream::new(w);
+            stream.refused = over_cap;
+            self.streams.insert(sid, stream);
         }
+
+        // A HEADERS frame always begins a new header block, so reset the
+        // per-block CONTINUATION counter here.
+        self.continuation_frames = 0;
 
         let end_stream = header.has(flag::END_STREAM);
         let end_headers = header.has(flag::END_HEADERS);
-        {
+        let too_big = {
             let s = self.streams.get_mut(&sid).unwrap();
             s.header_block.extend_from_slice(block);
             s.assembling = true;
             if end_stream {
                 s.end_stream_recv = true;
             }
+            s.header_block.len() > self.limits.max_header_bytes
+        };
+        // Header-bomb guard (CVE-2024-27316 class): HPACK only runs at
+        // END_HEADERS, so bound the accumulated block before then.
+        if too_big {
+            self.conn_error(errcode::ENHANCE_YOUR_CALM);
+            return;
         }
         if end_headers {
             self.finish_headers(sid);
@@ -328,15 +409,29 @@ impl H2Conn {
 
     fn on_continuation(&mut self, header: &FrameHeader, payload: &[u8]) {
         let sid = header.stream_id;
-        let Some(s) = self.streams.get_mut(&sid) else {
-            self.conn_error(errcode::PROTOCOL_ERROR);
-            return;
-        };
-        if !s.assembling {
-            self.conn_error(errcode::PROTOCOL_ERROR);
+        // CONTINUATION-flood guard (CVE-2024-27316 class): cap how many
+        // CONTINUATION frames a single header block may span.
+        self.continuation_frames += 1;
+        if self.continuation_frames > MAX_CONTINUATION_FRAMES {
+            self.conn_error(errcode::ENHANCE_YOUR_CALM);
             return;
         }
-        s.header_block.extend_from_slice(payload);
+        let limit = self.limits.max_header_bytes;
+        let too_big = match self.streams.get_mut(&sid) {
+            Some(s) if s.assembling => {
+                s.header_block.extend_from_slice(payload);
+                s.header_block.len() > limit
+            }
+            // Unknown stream, or a CONTINUATION not preceded by an open HEADERS.
+            _ => {
+                self.conn_error(errcode::PROTOCOL_ERROR);
+                return;
+            }
+        };
+        if too_big {
+            self.conn_error(errcode::ENHANCE_YOUR_CALM);
+            return;
+        }
         if header.has(flag::END_HEADERS) {
             self.continuation_stream = None;
             self.finish_headers(sid);
@@ -359,6 +454,15 @@ impl H2Conn {
                 return;
             }
         };
+
+        // Over the concurrency cap: the block has now been decoded (HPACK stays
+        // in sync), so refuse the stream without delivering it.
+        if self.streams.get(&sid).is_some_and(|s| s.refused) {
+            frame::write_rst_stream(&mut self.outbuf, sid, errcode::REFUSED_STREAM);
+            self.streams.remove(&sid);
+            self.pending_heads.remove(&sid);
+            return;
+        }
 
         let end_stream = self
             .streams
@@ -394,13 +498,8 @@ impl H2Conn {
             self.conn_error(errcode::PROTOCOL_ERROR);
             return;
         };
-        // Whole DATA frame (including padding) counts against flow control;
-        // replenish both windows since we buffer immediately.
+        // Whole DATA frame (including padding) counts against flow control.
         let counted = payload.len() as u32;
-        if counted > 0 {
-            frame::write_window_update(&mut self.outbuf, 0, counted);
-            frame::write_window_update(&mut self.outbuf, sid, counted);
-        }
 
         let over_limit = match self.streams.get_mut(&sid) {
             Some(s) => {
@@ -410,14 +509,28 @@ impl H2Conn {
                 }
                 s.body.len() > self.limits.max_body_bytes
             }
-            None => return, // unknown/closed stream
+            // Unknown/closed stream: do NOT reflect WINDOW_UPDATEs back, or DATA
+            // on a nonexistent stream would elicit free window credit.
+            None => return,
         };
 
         if over_limit {
             frame::write_rst_stream(&mut self.outbuf, sid, errcode::ENHANCE_YOUR_CALM);
             self.streams.remove(&sid);
             self.pending_heads.remove(&sid);
+            // Return the octets to the connection window only (the stream is
+            // gone) so connection-level flow control stays consistent.
+            if counted > 0 {
+                frame::write_window_update(&mut self.outbuf, 0, counted);
+            }
             return;
+        }
+
+        // The stream accepted the data; replenish both windows now (we buffer
+        // immediately, so the credit can be returned).
+        if counted > 0 {
+            frame::write_window_update(&mut self.outbuf, 0, counted);
+            frame::write_window_update(&mut self.outbuf, sid, counted);
         }
 
         if header.has(flag::END_STREAM)
@@ -432,8 +545,14 @@ impl H2Conn {
         if let Some(s) = self.streams.get_mut(&sid) {
             s.delivered = true;
         }
+        self.completed += 1;
         let req = Request::new(head.method, head.target, Version::Http2, head.headers, body);
         self.ready.push_back((sid, req));
+        // The ready queue can only outgrow the concurrency cap if the
+        // application is not draining it; refuse to buffer without bound.
+        if self.ready.len() > MAX_CONCURRENT_STREAMS as usize {
+            self.conn_error(errcode::ENHANCE_YOUR_CALM);
+        }
     }
 
     /// Serialize a response for `sid`: a HEADERS frame followed by flow-control
@@ -695,5 +814,121 @@ mod tests {
         let mut c = H2Conn::new(Limits::default(), None);
         c.received(b"NOT-A-PREFACE-AT-ALL-XXXX");
         assert!(c.wants_close());
+    }
+
+    /// Return the error code of the first frame of `ty` for `sid` (last 4 bytes
+    /// of its payload), if any. Works for GOAWAY (sid 0) and RST_STREAM.
+    fn frame_code(out: &[u8], ty: u8, sid: u32) -> Option<u32> {
+        let mut pos = 0;
+        while pos + 9 <= out.len() {
+            let h = FrameHeader::parse(&out[pos..pos + 9]);
+            let body = &out[pos + 9..pos + 9 + h.length];
+            if h.ftype == ty && h.stream_id == sid && body.len() >= 4 {
+                let n = body.len();
+                return Some(u32::from_be_bytes([
+                    body[n - 4],
+                    body[n - 3],
+                    body[n - 2],
+                    body[n - 1],
+                ]));
+            }
+            pos += 9 + h.length;
+        }
+        None
+    }
+
+    #[test]
+    fn oversized_header_block_is_rejected() {
+        let limits = Limits {
+            max_header_bytes: 1024,
+            max_body_bytes: 1 << 20,
+        };
+        let mut c = H2Conn::new(limits, None);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        // A HEADERS frame without END_HEADERS whose block already exceeds the
+        // limit: the cap must fire before HPACK ever runs.
+        let big = vec![0u8; 2048];
+        frame::write_frame(&mut wire, ftype::HEADERS, 0, 1, &big);
+        c.received(&wire);
+        assert!(c.wants_close());
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::GOAWAY, 0),
+            Some(errcode::ENHANCE_YOUR_CALM)
+        );
+    }
+
+    #[test]
+    fn continuation_flood_is_rejected() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        // Open a header block and never end it, flooding CONTINUATIONs.
+        frame::write_frame(&mut wire, ftype::HEADERS, 0, 1, &[]);
+        for _ in 0..(MAX_CONTINUATION_FRAMES + 1) {
+            frame::write_frame(&mut wire, ftype::CONTINUATION, 0, 1, &[]);
+        }
+        c.received(&wire);
+        assert!(c.wants_close());
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::GOAWAY, 0),
+            Some(errcode::ENHANCE_YOUR_CALM)
+        );
+    }
+
+    #[test]
+    fn concurrent_stream_cap_refuses_excess() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        let req_fields = |path: &'static [u8]| {
+            vec![
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"a"),
+                HeaderField::new(b":path", path),
+            ]
+        };
+        // Open exactly MAX_CONCURRENT_STREAMS streams; they stay open awaiting a
+        // response, so they all count against the cap.
+        for i in 0..MAX_CONCURRENT_STREAMS {
+            let sid = 1 + 2 * i;
+            wire.extend_from_slice(&client_request(&mut enc, sid, &req_fields(b"/"), None));
+        }
+        // One more must be refused without closing the connection.
+        let extra = 1 + 2 * MAX_CONCURRENT_STREAMS;
+        wire.extend_from_slice(&client_request(&mut enc, extra, &req_fields(b"/x"), None));
+        c.received(&wire);
+
+        assert!(!c.wants_close(), "stream cap must not kill the connection");
+        let mut delivered = 0;
+        while c.poll_request().is_some() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, MAX_CONCURRENT_STREAMS as usize);
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::RST_STREAM, extra),
+            Some(errcode::REFUSED_STREAM)
+        );
+    }
+
+    #[test]
+    fn window_update_overflow_is_flow_control_error() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        // A connection-level WINDOW_UPDATE that pushes the window past 2^31-1.
+        frame::write_window_update(&mut wire, 0, 0x7fff_ffff);
+        c.received(&wire);
+        assert!(c.wants_close());
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::GOAWAY, 0),
+            Some(errcode::FLOW_CONTROL_ERROR)
+        );
     }
 }

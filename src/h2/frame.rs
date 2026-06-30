@@ -45,6 +45,7 @@ pub mod errcode {
     pub const FLOW_CONTROL_ERROR: u32 = 0x3;
     pub const SETTINGS_TIMEOUT: u32 = 0x4;
     pub const FRAME_SIZE_ERROR: u32 = 0x6;
+    pub const REFUSED_STREAM: u32 = 0x7;
     pub const COMPRESSION_ERROR: u32 = 0x9;
     pub const ENHANCE_YOUR_CALM: u32 = 0xb;
 }
