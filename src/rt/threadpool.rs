@@ -37,11 +37,13 @@ pub(crate) fn run(
     // worker that blocks issuing a certificate needs *another* worker to answer
     // the CA's validation connection to the same server. Force at least two
     // effective workers whenever ACME is active, regardless of user input.
-    let mut workers = workers.max(1);
+    let workers = workers.max(1);
     #[cfg(feature = "acme")]
-    if matches!(tls, TlsMode::Acme(_)) {
-        workers = workers.max(2);
-    }
+    let workers = if matches!(tls, TlsMode::Acme(_)) {
+        workers.max(2)
+    } else {
+        workers
+    };
     let shared = Arc::new(Shared { cfg, tls });
     // Bound the queue of accepted-but-unserved connections. Each queued stream
     // holds an open descriptor, so an unbounded queue lets a connection burst
