@@ -40,6 +40,14 @@ const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
 const H3_REQUEST_INCOMPLETE: u64 = 0x010d;
 const H3_MESSAGE_ERROR: u64 = 0x010e;
 
+/// Cap on concurrently-tracked request streams per connection. QUIC's
+/// `initial_max_streams_bidi` already bounds how many bidi streams a peer may
+/// have open at once, but a peer can reset/abandon streams and open fresh ones
+/// faster than we'd otherwise drop the state, and resets must not leak entries.
+/// This is a hard backstop on the size of `reqs`; it sits well above the
+/// advertised bidi-stream limit so legitimate clients are never affected.
+const MAX_REQ_STREAMS: usize = 256;
+
 /// In-progress state for one client-initiated bidirectional (request) stream.
 #[derive(Default)]
 struct ReqStream {
@@ -148,6 +156,22 @@ impl H3Conn {
     fn read_request(&mut self, quic: &mut QuicConnection, id: u64) {
         let (data, fin) = read_stream(quic, id);
         if data.is_empty() && !fin {
+            // The stream was reported readable yet yielded neither bytes nor a
+            // FIN: the peer reset it (RESET_STREAM), or its receive side was
+            // otherwise torn down / is gone. Reclaim any tracked state so an
+            // abandoned or reset request stream cannot leak an entry in `reqs`.
+            if self.reqs.remove(&id).is_some() {
+                // Abort our response half if we'd begun one — the request is dead.
+                let _ = quic.reset(StreamId(id), H3_REQUEST_INCOMPLETE);
+            }
+            return;
+        }
+        // Bound the number of concurrent request streams. A new stream beyond
+        // the cap is refused (reset + stop-sending) without allocating state;
+        // streams already tracked continue to make progress.
+        if !self.reqs.contains_key(&id) && self.reqs.len() >= MAX_REQ_STREAMS {
+            let _ = quic.stop_sending(StreamId(id), H3_REQUEST_INCOMPLETE);
+            let _ = quic.reset(StreamId(id), H3_REQUEST_INCOMPLETE);
             return;
         }
         let over = {
