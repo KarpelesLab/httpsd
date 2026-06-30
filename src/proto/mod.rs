@@ -26,3 +26,6 @@ pub use version::Version;
 pub(crate) use conn::http_date;
 #[cfg(any(feature = "h2", feature = "h3"))]
 pub(crate) use fields::{RequestHead, request_head, response_fields};
+#[cfg(any(feature = "h2", feature = "h3"))]
+pub(crate) use response::OutBody;
+pub(crate) use response::read_at_exact;
