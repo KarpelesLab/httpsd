@@ -12,7 +12,7 @@ use compcol::hpack::{DEFAULT_TABLE_SIZE, HeaderField, HpackDecoder, HpackEncoder
 
 use super::frame::{self, CLIENT_PREFACE, FrameHeader, errcode, flag, ftype, settings};
 use crate::proto::{
-    Headers, Limits, Request, RequestHead, Response, StatusCode, Version, request_head,
+    Headers, Limits, OutBody, Request, RequestHead, Response, StatusCode, Version, request_head,
 };
 
 const DEFAULT_WINDOW: i64 = 65_535;
@@ -52,8 +52,9 @@ struct Stream {
     send_window: i64,
     out_headers: Vec<u8>,
     out_headers_sent: bool,
-    out_body: Vec<u8>,
-    out_body_pos: usize,
+    /// The response body still to send (bytes or a file region streamed on
+    /// demand), or `None` until a response is set.
+    out_body: Option<OutBody>,
     out_end_stream: bool,
     responded: bool,
     done_sending: bool,
@@ -71,16 +72,15 @@ impl Stream {
             send_window,
             out_headers: Vec::new(),
             out_headers_sent: false,
-            out_body: Vec::new(),
-            out_body_pos: 0,
+            out_body: None,
             out_end_stream: false,
             responded: false,
             done_sending: false,
         }
     }
 
-    fn out_body_remaining(&self) -> usize {
-        self.out_body.len() - self.out_body_pos
+    fn out_body_remaining(&self) -> u64 {
+        self.out_body.as_ref().map_or(0, |b| b.remaining())
     }
 }
 
@@ -158,6 +158,13 @@ impl H2Conn {
     /// Drain and return all serialized frames queued so far.
     pub fn take_out(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.outbuf)
+    }
+
+    /// Whether there are serialized frames waiting to be written. Body that is
+    /// blocked on a closed flow-control window is not "output" yet — it resumes
+    /// (via [`pump_out`](Self::pump_out)) when a WINDOW_UPDATE reopens the window.
+    pub fn has_output(&self) -> bool {
+        !self.outbuf.is_empty()
     }
 
     /// Whether the connection should close once output is flushed.
@@ -568,7 +575,7 @@ impl H2Conn {
         {
             let s = self.streams.get_mut(&sid).unwrap();
             s.out_headers = encoded;
-            s.out_body = body;
+            s.out_body = Some(OutBody::from_body(body));
             s.out_end_stream = true;
             s.responded = true;
         }
@@ -621,6 +628,9 @@ impl H2Conn {
     /// send windows allow.
     pub fn pump_out(&mut self) {
         let mut finished = Vec::new();
+        // Streams whose body read failed mid-stream: reset rather than send a
+        // truncated, mis-framed body (never panic).
+        let mut reset = Vec::new();
         let sids: Vec<u32> = self.streams.keys().copied().collect();
         for sid in sids {
             loop {
@@ -645,15 +655,22 @@ impl H2Conn {
                     if budget <= 0 {
                         break;
                     }
-                    let n = (remaining as i64).min(budget) as usize;
-                    (n, s.out_end_stream && n == remaining)
+                    // The chunk is bounded by the available send window (and max
+                    // frame), so a file body is read in window-sized pieces — the
+                    // whole file is never pulled into memory at once.
+                    let n = remaining.min(budget as u64) as usize;
+                    (n, s.out_end_stream && (n as u64) == remaining)
                 };
 
                 let payload = {
                     let s = self.streams.get_mut(&sid).unwrap();
-                    let start = s.out_body_pos;
-                    s.out_body_pos += chunk_len;
-                    s.out_body[start..start + chunk_len].to_vec()
+                    match s.out_body.as_mut().unwrap().take_chunk(chunk_len) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            reset.push(sid);
+                            break;
+                        }
+                    }
                 };
                 self.conn_send_window -= chunk_len as i64;
                 {
@@ -673,6 +690,12 @@ impl H2Conn {
         }
         // Drop streams whose response is fully written.
         for sid in finished {
+            self.streams.remove(&sid);
+            self.pending_heads.remove(&sid);
+        }
+        // Abort streams whose body could not be read.
+        for sid in reset {
+            frame::write_rst_stream(&mut self.outbuf, sid, errcode::INTERNAL_ERROR);
             self.streams.remove(&sid);
             self.pending_heads.remove(&sid);
         }
@@ -914,6 +937,76 @@ mod tests {
             frame_code(&c.take_out(), ftype::RST_STREAM, extra),
             Some(errcode::REFUSED_STREAM)
         );
+    }
+
+    #[test]
+    fn file_body_streams_under_flow_control() {
+        use std::io::Write;
+        use std::sync::Arc;
+
+        use crate::proto::Body;
+
+        // A file body larger than the initial 65535-byte send window, so it can
+        // only finish once the peer opens the window with WINDOW_UPDATEs — proof
+        // we stream incrementally rather than dumping the whole file.
+        let total = 200_000usize;
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join(format!("httpsd-h2-stream-{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+            f.sync_all().unwrap();
+        }
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        wire.extend_from_slice(&client_request(
+            &mut enc,
+            1,
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"a"),
+                HeaderField::new(b":path", b"/big"),
+            ],
+            None,
+        ));
+        c.received(&wire);
+        let (sid, _req) = c.poll_request().expect("request");
+        c.respond(
+            sid,
+            Response::new(StatusCode::OK).body(Body::file(file, 0, total as u64)),
+        );
+
+        // First burst is bounded by the initial connection/stream window.
+        let mut body = Vec::new();
+        let (_h, d) = collect(&c.take_out(), 1);
+        body.extend_from_slice(&d);
+        assert!(
+            body.len() < total,
+            "initial window must NOT let the whole file out: got {}",
+            body.len()
+        );
+
+        // Open both windows generously and keep pumping until the body is done.
+        for _ in 0..64 {
+            if body.len() >= total {
+                break;
+            }
+            let mut wu = Vec::new();
+            frame::write_window_update(&mut wu, 0, 1 << 20);
+            frame::write_window_update(&mut wu, 1, 1 << 20);
+            c.received(&wu);
+            let (_h, d) = collect(&c.take_out(), 1);
+            body.extend_from_slice(&d);
+        }
+        assert_eq!(body.len(), total, "whole file must eventually stream out");
+        assert_eq!(body, data, "streamed body must be byte-exact");
     }
 
     #[test]
