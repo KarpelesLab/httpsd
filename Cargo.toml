@@ -48,8 +48,11 @@ http = ["dep:http"]
 # TOML configuration file loading.
 config = ["dep:serde", "dep:toml"]
 # The `httpsd` command-line binary. Pulls in config + the thread-pool runtime
-# unless another runtime is selected.
-cli = ["config", "rt-threadpool"]
+# (unless another runtime is selected) and ACME, so a default `cargo build`
+# yields a server that can actually obtain certificates — the binary accepts
+# `--acme-accept-tos` and would otherwise fail at startup. Library-only users
+# who set `default-features = false` stay lean and opt into `acme` explicitly.
+cli = ["config", "rt-threadpool", "acme"]
 
 # --- runtime drivers (pick one or more; all drive the same sans-I/O core) ---
 # Blocking std::net listener backed by a fixed worker thread pool.
