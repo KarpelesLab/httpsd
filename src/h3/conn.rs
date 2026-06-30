@@ -15,7 +15,7 @@ use compcol::qpack::{QpackDecoder, QpackEncoder};
 use purecrypto::quic::{QuicConnection, StreamId};
 
 use crate::error::Result;
-use crate::proto::{Limits, Request, Response, Version, request_head, response_fields};
+use crate::proto::{Limits, OutBody, Request, Response, Version, request_head, response_fields};
 use crate::session::SessionConfig;
 
 #[cfg(feature = "compress")]
@@ -48,14 +48,22 @@ const H3_MESSAGE_ERROR: u64 = 0x010e;
 /// advertised bidi-stream limit so legitimate clients are never affected.
 const MAX_REQ_STREAMS: usize = 256;
 
+/// Bytes of a file body framed into a single DATA frame per flush step, so a
+/// large file is streamed as QUIC stream send capacity opens rather than
+/// buffered whole.
+const H3_STREAM_CHUNK: usize = 64 * 1024;
+
 /// In-progress state for one client-initiated bidirectional (request) stream.
 #[derive(Default)]
 struct ReqStream {
     inbuf: Vec<u8>,
     fin: bool,
     delivered: bool,
+    /// Already-framed response bytes awaiting the QUIC send buffer.
     out: Vec<u8>,
     out_pos: usize,
+    /// Response body still to frame as DATA (streamed incrementally).
+    body: Option<OutBody>,
     finish_after: bool,
     finished: bool,
 }
@@ -205,10 +213,11 @@ impl H3Conn {
         // HTTP/3 is always over QUIC's TLS 1.3 — secure by definition.
         let resp = crate::session::apply_edge_headers(cfg, resp, true);
 
-        let bytes = self.encode_response(resp);
+        let (bytes, body) = self.encode_response(resp);
         let r = self.reqs.get_mut(&id).unwrap();
         r.delivered = true;
         r.out = bytes;
+        r.body = Some(body);
         r.finish_after = true;
     }
 
@@ -256,8 +265,9 @@ impl H3Conn {
         ))
     }
 
-    /// Encode a response as a HEADERS frame followed by a DATA frame.
-    fn encode_response(&mut self, resp: Response) -> Vec<u8> {
+    /// Encode a response into its HEADERS frame plus the send-side body to frame
+    /// as DATA incrementally (so a file body is never read whole here).
+    fn encode_response(&mut self, resp: Response) -> (Vec<u8>, OutBody) {
         let (status, headers, body) = resp.into_parts();
         let fields: Vec<HeaderField> =
             response_fields(status, &headers, self.server_name.as_deref())
@@ -268,25 +278,55 @@ impl H3Conn {
 
         let mut out = Vec::new();
         write_frame(&mut out, FRAME_HEADERS, &section);
-        if !body.is_empty() {
-            write_frame(&mut out, FRAME_DATA, &body);
-        }
-        out
+        (out, OutBody::from_body(body))
     }
 
     /// Write pending response bytes for every stream, honoring flow control,
-    /// and FIN streams whose response is fully sent.
+    /// framing the next body chunk as send capacity opens, and FIN-ing streams
+    /// whose response is fully sent.
     fn flush(&mut self, quic: &mut QuicConnection) -> Result<()> {
         let mut done = Vec::new();
         for (&id, r) in self.reqs.iter_mut() {
-            if r.out_pos < r.out.len() {
-                // A short write just means flow control is closed; retry next drive.
-                if let Ok(n) = quic.write(StreamId(id), &r.out[r.out_pos..]) {
-                    r.out_pos += n;
+            // Drain already-framed bytes, then frame the next body chunk and keep
+            // going until QUIC flow control closes (a short/zero write) or the
+            // body is exhausted. A read error mid-stream resets the stream.
+            let mut aborted = false;
+            loop {
+                if r.out_pos < r.out.len() {
+                    match quic.write(StreamId(id), &r.out[r.out_pos..]) {
+                        Ok(n) => r.out_pos += n,
+                        Err(_) => break, // flow control closed; retry next drive
+                    }
+                    if r.out_pos < r.out.len() {
+                        break; // partial write: stream send window is full
+                    }
+                }
+                // Buffer fully written; recycle it and frame the next chunk.
+                r.out.clear();
+                r.out_pos = 0;
+                match &mut r.body {
+                    Some(b) if b.remaining() > 0 => {
+                        let n = (b.remaining() as usize).min(H3_STREAM_CHUNK);
+                        match b.take_chunk(n) {
+                            Ok(chunk) => write_frame(&mut r.out, FRAME_DATA, &chunk),
+                            Err(()) => {
+                                let _ = quic.reset(StreamId(id), H3_REQUEST_INCOMPLETE);
+                                done.push(id);
+                                aborted = true;
+                                break;
+                            }
+                        }
+                    }
+                    _ => break, // no more body to frame
                 }
             }
+            if aborted {
+                continue;
+            }
+            let body_done = r.body.as_ref().is_none_or(|b| b.remaining() == 0);
             if r.finish_after
                 && r.out_pos >= r.out.len()
+                && body_done
                 && !r.finished
                 && quic.finish(StreamId(id)).is_ok()
             {
