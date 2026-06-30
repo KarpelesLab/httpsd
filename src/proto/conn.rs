@@ -49,6 +49,16 @@ pub struct H1Conn {
     /// The request currently awaiting a response, if any. While set,
     /// `poll_request` yields nothing (one in-flight request at a time).
     pending: Option<Pending>,
+    /// How far into `inbuf` we have already scanned for the header-terminating
+    /// `\r\n\r\n`. Lets a request fed one byte at a time resume the scan instead
+    /// of re-scanning the whole buffer every poll (otherwise O(n²)). Indexes
+    /// into `inbuf`, so it MUST be reset to 0 whenever consumed bytes are
+    /// drained from `inbuf`.
+    head_scanned: usize,
+    /// In-progress chunked-body decode state, persisted across polls so a slowly
+    /// arriving body is decoded incrementally rather than from offset 0 each
+    /// time (otherwise O(n²)). Present only while a chunked body is mid-receive.
+    chunk: Option<ChunkDecoder>,
     /// Set once a response with `Connection: close` (or a fatal error) has been
     /// serialized; the driver should close after draining `outbuf`.
     closed: bool,
@@ -73,6 +83,8 @@ impl H1Conn {
             outbuf: Vec::new(),
             limits,
             pending: None,
+            head_scanned: 0,
+            chunk: None,
             closed: false,
             interim_sent: false,
             server_name: Some(concat!("httpsd/", env!("CARGO_PKG_VERSION")).to_owned()),
@@ -124,12 +136,27 @@ impl H1Conn {
             return Ok(None);
         }
 
-        // Locate the end of the header block.
-        let Some(head_end) = find_subslice(&self.inbuf, b"\r\n\r\n") else {
-            if self.inbuf.len() > self.limits.max_header_bytes {
-                return Err(self.fail(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "headers"));
+        // Locate the end of the header block, resuming the scan where the
+        // previous poll left off so a request fed one byte at a time is not
+        // re-scanned from the start (which would be O(n²)). Back up by 3 bytes
+        // so a `\r\n\r\n` straddling the previous boundary is still found.
+        let search_from = self.head_scanned.saturating_sub(3);
+        let head_end = match find_subslice(&self.inbuf[search_from..], b"\r\n\r\n") {
+            Some(rel) => {
+                let end = search_from + rel;
+                // Resume future scans right at the terminator: while we wait for
+                // the body, re-finding it then costs O(1) instead of re-scanning
+                // the (possibly large) buffered body for the header terminator.
+                self.head_scanned = end + 3;
+                end
             }
-            return Ok(None);
+            None => {
+                self.head_scanned = self.inbuf.len();
+                if self.inbuf.len() > self.limits.max_header_bytes {
+                    return Err(self.fail(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "headers"));
+                }
+                return Ok(None);
+            }
         };
         let header_block_len = head_end; // bytes before the terminator
         if header_block_len > self.limits.max_header_bytes {
@@ -182,12 +209,18 @@ impl H1Conn {
                 consumed_total = body_start + len;
             }
             BodyFraming::Chunked => {
-                match decode_chunked(&self.inbuf[body_start..], self.limits.max_body_bytes) {
-                    Ok(Some((decoded, used))) => {
-                        body = decoded;
+                // Resume the incremental decoder where the previous poll stopped
+                // (or start a fresh one). `body_start` is stable for the lifetime
+                // of this request — `inbuf` is not drained until it completes —
+                // so the decoder's offsets remain valid across polls.
+                let mut dec = self.chunk.take().unwrap_or_default();
+                match dec.advance(&self.inbuf[body_start..], self.limits.max_body_bytes) {
+                    Ok(Some(used)) => {
+                        body = std::mem::take(&mut dec.out);
                         consumed_total = body_start + used;
                     }
                     Ok(None) => {
+                        self.chunk = Some(dec);
                         self.maybe_send_continue(&headers);
                         return Ok(None);
                     }
@@ -196,8 +229,12 @@ impl H1Conn {
             }
         }
 
-        // Commit: drop the consumed bytes and remember per-request state.
+        // Commit: drop the consumed bytes and remember per-request state. The
+        // header scan cursor indexes into `inbuf`, so reset it now that those
+        // bytes are gone; the chunked decoder (if any) was consumed above.
         self.inbuf.drain(..consumed_total);
+        self.head_scanned = 0;
+        self.chunk = None;
         self.interim_sent = false;
 
         let keep_alive = negotiate_keep_alive(version, &headers);
@@ -234,6 +271,8 @@ impl H1Conn {
         };
         let resp = Response::status(status);
         self.pending = None;
+        self.head_scanned = 0;
+        self.chunk = None;
         self.serialize(meta, resp);
         self.closed = true;
         match status.code() {
@@ -439,113 +478,167 @@ fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)>
     Ok((method, target.to_owned(), version, headers))
 }
 
-/// Decode a complete chunked body from `data`.
+/// Incremental decoder for a chunked request body.
 ///
-/// Returns `Ok(Some((body, consumed)))` once the terminating zero-length chunk
-/// (and trailing CRLF) have arrived, `Ok(None)` if more bytes are needed, or
-/// `Err(status)` on a malformed or oversized body.
-fn decode_chunked(
-    data: &[u8],
-    max_body: usize,
-) -> std::result::Result<Option<(Vec<u8>, usize)>, StatusCode> {
-    let mut pos = 0usize;
-    let mut out = Vec::new();
-    loop {
-        // Chunk size line. Bound how far we'll scan for its CRLF so a peer that
-        // never terminates the line (or pads it with megabytes of chunk
-        // extensions) cannot make us buffer without bound.
-        let eol = match find_subslice(&data[pos..], b"\r\n") {
-            Some(eol) => eol,
-            None => {
-                if data.len() - pos > MAX_CHUNK_LINE_BYTES {
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-                return Ok(None);
-            }
-        };
-        if eol > MAX_CHUNK_LINE_BYTES {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        let size_line = &data[pos..pos + eol];
-        // Strip any chunk extensions after ';'.
-        let hex = match size_line.iter().position(|&b| b == b';') {
-            Some(i) => &size_line[..i],
-            None => size_line,
-        };
-        let hex = std::str::from_utf8(hex).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let hex = hex.trim();
-        // Require a non-empty run of hex digits: this both rejects garbage and
-        // surfaces a too-large value as a parse error rather than wrapping.
-        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        // A value that does not fit in usize (e.g. `fffffffffffffff0` on a
-        // 32-bit target, or 17+ hex digits anywhere) parses to Err here rather
-        // than overflowing.
-        let size = usize::from_str_radix(hex, 16).map_err(|_| StatusCode::BAD_REQUEST)?;
-        // Cap a single chunk immediately: this both enforces the body limit and
-        // keeps every subsequent arithmetic operation far from overflow.
-        if size > max_body {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        let after_size = pos + eol + 2;
-
-        if size == 0 {
-            // Last chunk: consume the whole trailer section `*(field CRLF) CRLF`
-            // so trailer bytes are not left to be misread as the next request.
-            return match consume_trailer_section(data, after_size)? {
-                Some(consumed) => Ok(Some((out, consumed))),
-                None => Ok(None),
-            };
-        }
-
-        // Enforce the cumulative body limit with checked arithmetic.
-        match out.len().checked_add(size) {
-            Some(total) if total <= max_body => {}
-            _ => return Err(StatusCode::PAYLOAD_TOO_LARGE),
-        }
-        // Need the chunk data plus its trailing CRLF; compute the end offset with
-        // checked arithmetic so a huge `after_size + size + 2` cannot wrap.
-        let end = match after_size.checked_add(size).and_then(|e| e.checked_add(2)) {
-            Some(end) => end,
-            None => return Err(StatusCode::BAD_REQUEST),
-        };
-        if data.len() < end {
-            return Ok(None);
-        }
-        out.extend_from_slice(&data[after_size..after_size + size]);
-        if &data[after_size + size..end] != b"\r\n" {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        pos = end;
-    }
+/// Unlike a one-shot decoder, this persists its progress (`pos`, the decoded
+/// `out` accumulator, and the in-chunk `state`) across calls to [`advance`].
+/// Each call resumes where the previous one stopped and only processes
+/// newly-arrived bytes, so a body fed one byte at a time costs O(n) total work
+/// rather than O(n²) from re-decoding the whole region every poll.
+///
+/// [`advance`]: ChunkDecoder::advance
+#[derive(Debug, Default)]
+struct ChunkDecoder {
+    /// Bytes of the body region already consumed (parse cursor).
+    pos: usize,
+    /// Decoded body accumulated so far.
+    out: Vec<u8>,
+    /// What part of a chunk we are currently in.
+    state: ChunkState,
 }
 
-/// Consume the trailer section that follows the terminating zero-length chunk:
-/// `*(field CRLF) CRLF`. Returns `Ok(Some(consumed))` with `consumed` pointing
-/// just past the final empty line, `Ok(None)` if the section is not yet
-/// complete, or `Err(..)` if it exceeds [`MAX_TRAILER_BYTES`].
-fn consume_trailer_section(
-    data: &[u8],
-    start: usize,
-) -> std::result::Result<Option<usize>, StatusCode> {
-    let mut pos = start;
-    loop {
-        if pos.saturating_sub(start) > MAX_TRAILER_BYTES {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        match find_subslice(&data[pos..], b"\r\n") {
-            None => {
-                // Incomplete; bound how much we'll buffer waiting for the rest.
-                if data.len() - start > MAX_TRAILER_BYTES {
-                    return Err(StatusCode::BAD_REQUEST);
+/// The position within the chunked grammar that [`ChunkDecoder`] is resuming at.
+#[derive(Debug, Default)]
+enum ChunkState {
+    /// Awaiting (the rest of) a chunk-size line.
+    #[default]
+    Size,
+    /// In a chunk's data: `remaining` data bytes still to copy.
+    Data { remaining: usize },
+    /// Awaiting the CRLF that terminates a chunk's data.
+    DataCrlf,
+    /// In the trailer section that follows the terminating zero-length chunk;
+    /// `start` is the body offset where the trailer section began (used to bound
+    /// it against [`MAX_TRAILER_BYTES`]).
+    Trailer { start: usize },
+}
+
+impl ChunkDecoder {
+    /// Advance the decode over `data` (the full body region as buffered so far).
+    ///
+    /// Returns `Ok(Some(consumed))` once the terminating zero-length chunk and
+    /// its trailer section have arrived (`consumed` is the number of body-region
+    /// bytes the body occupies, and [`out`](Self::out) holds the decoded body),
+    /// `Ok(None)` if more bytes are needed, or `Err(status)` on a malformed or
+    /// oversized body. Every security check matches the one-shot decoder; only
+    /// the incrementality differs.
+    fn advance(
+        &mut self,
+        data: &[u8],
+        max_body: usize,
+    ) -> std::result::Result<Option<usize>, StatusCode> {
+        loop {
+            match self.state {
+                ChunkState::Size => {
+                    // Chunk size line. Bound how far we'll scan for its CRLF so a
+                    // peer that never terminates the line (or pads it with
+                    // megabytes of chunk extensions) cannot make us buffer
+                    // without bound.
+                    let eol = match find_subslice(&data[self.pos..], b"\r\n") {
+                        Some(eol) => eol,
+                        None => {
+                            if data.len() - self.pos > MAX_CHUNK_LINE_BYTES {
+                                return Err(StatusCode::BAD_REQUEST);
+                            }
+                            return Ok(None);
+                        }
+                    };
+                    if eol > MAX_CHUNK_LINE_BYTES {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    let size_line = &data[self.pos..self.pos + eol];
+                    // Strip any chunk extensions after ';'.
+                    let hex = match size_line.iter().position(|&b| b == b';') {
+                        Some(i) => &size_line[..i],
+                        None => size_line,
+                    };
+                    let hex = std::str::from_utf8(hex).map_err(|_| StatusCode::BAD_REQUEST)?;
+                    let hex = hex.trim();
+                    // Require a non-empty run of hex digits: this both rejects
+                    // garbage and surfaces a too-large value as a parse error
+                    // rather than wrapping.
+                    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    // A value that does not fit in usize (e.g. `fffffffffffffff0`
+                    // on a 32-bit target, or 17+ hex digits anywhere) parses to
+                    // Err here rather than overflowing.
+                    let size =
+                        usize::from_str_radix(hex, 16).map_err(|_| StatusCode::BAD_REQUEST)?;
+                    // Cap a single chunk immediately: this both enforces the body
+                    // limit and keeps every subsequent arithmetic operation far
+                    // from overflow.
+                    if size > max_body {
+                        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                    }
+                    let after_size = self.pos + eol + 2;
+
+                    if size == 0 {
+                        // Last chunk: consume the whole trailer section
+                        // `*(field CRLF) CRLF` so trailer bytes are not left to be
+                        // misread as the next request.
+                        self.pos = after_size;
+                        self.state = ChunkState::Trailer { start: after_size };
+                        continue;
+                    }
+
+                    // Enforce the cumulative body limit with checked arithmetic.
+                    match self.out.len().checked_add(size) {
+                        Some(total) if total <= max_body => {}
+                        _ => return Err(StatusCode::PAYLOAD_TOO_LARGE),
+                    }
+                    self.pos = after_size;
+                    self.state = ChunkState::Data { remaining: size };
                 }
-                return Ok(None);
+                ChunkState::Data { remaining } => {
+                    // Copy only the newly-arrived slice of this chunk's data; the
+                    // already-copied prefix is never revisited.
+                    let avail = data.len() - self.pos;
+                    let take = remaining.min(avail);
+                    self.out.extend_from_slice(&data[self.pos..self.pos + take]);
+                    self.pos += take;
+                    let left = remaining - take;
+                    if left > 0 {
+                        self.state = ChunkState::Data { remaining: left };
+                        return Ok(None);
+                    }
+                    self.state = ChunkState::DataCrlf;
+                }
+                ChunkState::DataCrlf => {
+                    // Each chunk's data is followed by a literal CRLF.
+                    if data.len() < self.pos + 2 {
+                        return Ok(None);
+                    }
+                    if &data[self.pos..self.pos + 2] != b"\r\n" {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    self.pos += 2;
+                    self.state = ChunkState::Size;
+                }
+                ChunkState::Trailer { start } => {
+                    // Consume the trailer section `*(field CRLF) CRLF`, resuming at
+                    // `self.pos`. Bounded against MAX_TRAILER_BYTES so a peer
+                    // cannot stream trailers forever.
+                    loop {
+                        if self.pos.saturating_sub(start) > MAX_TRAILER_BYTES {
+                            return Err(StatusCode::BAD_REQUEST);
+                        }
+                        match find_subslice(&data[self.pos..], b"\r\n") {
+                            None => {
+                                // Incomplete; bound how much we'll buffer waiting.
+                                if data.len() - start > MAX_TRAILER_BYTES {
+                                    return Err(StatusCode::BAD_REQUEST);
+                                }
+                                return Ok(None);
+                            }
+                            // An empty line terminates the trailer section.
+                            Some(0) => return Ok(Some(self.pos + 2)),
+                            // A trailer field line; skip it (trailers are not surfaced).
+                            Some(eol) => self.pos += eol + 2,
+                        }
+                    }
+                }
             }
-            // An empty line terminates the trailer section.
-            Some(0) => return Ok(Some(pos + 2)),
-            // A trailer field line; skip it (trailers are not surfaced).
-            Some(eol) => pos += eol + 2,
         }
     }
 }
@@ -606,11 +699,32 @@ fn is_valid_field_value(s: &str) -> bool {
 }
 
 /// Find the first occurrence of `needle` in `haystack`.
+///
+/// Scans for the needle's first byte and only then compares the full needle, so
+/// for the short `\r\n` / `\r\n\r\n` needles used here it is a single linear
+/// pass rather than the O(n·m) `windows().position()` it replaces.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
+    let nlen = needle.len();
+    if nlen == 0 || haystack.len() < nlen {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    let first = needle[0];
+    let last_start = haystack.len() - nlen;
+    let mut i = 0;
+    while i <= last_start {
+        // Jump straight to the next occurrence of the needle's first byte.
+        match haystack[i..=last_start].iter().position(|&b| b == first) {
+            Some(off) => {
+                let cand = i + off;
+                if haystack[cand..cand + nlen] == *needle {
+                    return Some(cand);
+                }
+                i = cand + 1;
+            }
+            None => return None,
+        }
+    }
+    None
 }
 
 /// Current Unix time in whole seconds (0 if the clock is before the epoch).
@@ -868,6 +982,130 @@ mod tests {
         assert!(!out.to_ascii_lowercase().contains("transfer-encoding"));
         assert!(!out.contains("Injected: 1"));
         assert!(out.contains("Content-Length: 2\r\n"));
+    }
+
+    #[test]
+    fn chunked_byte_by_byte_matches_all_at_once() {
+        // A body with multiple chunks, a chunk extension, and a real trailer.
+        let req_bytes: &[u8] = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\
+            5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX: y\r\n\r\n";
+
+        // All at once.
+        let mut c_all = H1Conn::default();
+        c_all.feed(req_bytes);
+        let req_all = c_all.poll_request().unwrap().unwrap();
+        assert_eq!(req_all.body(), b"hello world");
+        assert!(c_all.inbuf.is_empty());
+
+        // One byte at a time: must yield the identical parse and leave inbuf clean.
+        let mut c_inc = H1Conn::default();
+        let mut got = None;
+        for &b in req_bytes {
+            c_inc.feed(&[b]);
+            if let Some(r) = c_inc.poll_request().unwrap() {
+                got = Some(r);
+            }
+        }
+        let req_inc = got.expect("incremental feed never completed the request");
+        assert_eq!(req_inc.body(), req_all.body());
+        assert_eq!(req_inc.method(), req_all.method());
+        assert_eq!(req_inc.path(), req_all.path());
+        assert!(
+            c_inc.inbuf.is_empty(),
+            "inbuf must be drained clean after incremental parse"
+        );
+        // The decode state must have been cleared once the request completed.
+        assert!(c_inc.chunk.is_none());
+        assert_eq!(c_inc.head_scanned, 0);
+    }
+
+    #[test]
+    fn large_header_block_byte_by_byte_parses() {
+        let mut req = b"GET / HTTP/1.1\r\n".to_vec();
+        // ~40 KiB of header fields, under both the 64 KiB byte cap and the
+        // MAX_HEADER_FIELDS count cap.
+        for i in 0..50 {
+            req.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "v".repeat(800)).as_bytes());
+        }
+        req.extend_from_slice(b"Host: a\r\n\r\n");
+
+        let mut c = H1Conn::default();
+        let mut got = None;
+        for &b in &req {
+            c.feed(&[b]);
+            if let Some(r) = c.poll_request().unwrap() {
+                got = Some(r);
+            }
+        }
+        let req = got.expect("terminator never found under byte-by-byte feed");
+        assert_eq!(req.method(), &Method::Get);
+        assert_eq!(req.host(), Some("a"));
+        assert!(c.inbuf.is_empty());
+    }
+
+    #[test]
+    fn chunked_huge_size_rejected_under_incremental_feed() {
+        let bytes: &[u8] =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffff0\r\n";
+        let mut c = H1Conn::default();
+        let mut err = false;
+        for &b in bytes {
+            c.feed(&[b]);
+            match c.poll_request() {
+                Ok(_) => {}
+                Err(_) => {
+                    err = true;
+                    break;
+                }
+            }
+        }
+        assert!(err, "malicious chunk size must be rejected (no panic)");
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 413"));
+    }
+
+    #[test]
+    fn chunked_large_body_byte_by_byte_completes() {
+        // A bounded-work proof: an O(n²) re-decode of a 200 KiB body fed one byte
+        // at a time would be ~40 billion byte-copies; the incremental decoder
+        // copies each body byte exactly once, so this finishes promptly.
+        const N: usize = 200 * 1024;
+        let mut body = Vec::with_capacity(N);
+        for i in 0..N {
+            body.push(b'a' + (i % 26) as u8);
+        }
+        let mut req = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        req.extend_from_slice(format!("{:x}\r\n", N).as_bytes());
+        req.extend_from_slice(&body);
+        req.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let mut c = H1Conn::default();
+        let mut got = None;
+        for &b in &req {
+            c.feed(&[b]);
+            if let Some(r) = c.poll_request().unwrap() {
+                got = Some(r);
+            }
+        }
+        let req = got.expect("large chunked body never completed");
+        assert_eq!(req.body().len(), N);
+        assert_eq!(req.body(), &body[..]);
+        assert!(c.inbuf.is_empty());
+    }
+
+    #[test]
+    fn find_subslice_linear_correctness() {
+        assert_eq!(find_subslice(b"", b"\r\n"), None);
+        assert_eq!(find_subslice(b"\r\n", b"\r\n"), Some(0));
+        assert_eq!(find_subslice(b"ab\r\ncd", b"\r\n"), Some(2));
+        assert_eq!(find_subslice(b"a\rb\r\nc", b"\r\n"), Some(3));
+        assert_eq!(find_subslice(b"x\r\n\r\ny", b"\r\n\r\n"), Some(1));
+        assert_eq!(find_subslice(b"\r\n\r", b"\r\n\r\n"), None);
+        assert_eq!(find_subslice(b"abc", b"abc"), Some(0));
+        assert_eq!(find_subslice(b"aabc", b"abc"), Some(1));
+        assert_eq!(find_subslice(b"ab", b"abc"), None);
+        assert_eq!(find_subslice(b"hello", b"l"), Some(2));
+        assert_eq!(find_subslice(b"hello", b""), None);
     }
 
     #[test]
