@@ -255,6 +255,13 @@ impl H1Conn {
         let bodyless = status.is_bodyless();
         let omit_body = bodyless || meta.is_head;
 
+        // Strip hop-by-hop / framing headers a handler may have supplied so the
+        // engine's own framing (Content-Length / Connection) stays authoritative
+        // and no rogue Transfer-Encoding can desync the connection.
+        for h in HOP_BY_HOP_HEADERS {
+            headers.remove(h);
+        }
+
         // Framing headers.
         if !bodyless {
             // Authoritative Content-Length (handlers should not set their own).
@@ -284,6 +291,16 @@ impl H1Conn {
         self.outbuf.extend_from_slice(line.as_bytes());
 
         for (name, value) in headers.iter() {
+            // Never emit a header whose name is not a valid token or whose value
+            // carries CR/LF/NUL: that would allow response splitting / header
+            // injection from handler-controlled data.
+            if !is_token(name)
+                || value
+                    .bytes()
+                    .any(|b| b == b'\r' || b == b'\n' || b == b'\0')
+            {
+                continue;
+            }
             self.outbuf.extend_from_slice(name.as_bytes());
             self.outbuf.extend_from_slice(b": ");
             self.outbuf.extend_from_slice(value.as_bytes());
@@ -328,7 +345,13 @@ fn body_framing(headers: &Headers) -> std::result::Result<BodyFraming, ()> {
     // Multiple Content-Length values must agree.
     let mut len: Option<usize> = None;
     for v in headers.get_all("content-length") {
-        let parsed: usize = v.trim().parse().map_err(|_| ())?;
+        // Require a non-empty, all-ASCII-digit value: `parse()` would otherwise
+        // accept a leading `+` and assorted Unicode whitespace/digits.
+        let v = v.trim();
+        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(());
+        }
+        let parsed: usize = v.parse().map_err(|_| ())?;
         match len {
             Some(prev) if prev != parsed => return Err(()),
             _ => len = Some(parsed),
@@ -354,6 +377,20 @@ fn negotiate_keep_alive(version: Version, headers: &Headers) -> bool {
 /// Parse the request line and header fields from the header block (the bytes
 /// before the terminating CRLFCRLF).
 fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)> {
+    // Reject any bare CR or bare LF in the header block: every CR must be
+    // immediately followed by LF and every LF immediately preceded by CR.
+    // A stray `\n`/`\r` inside a field would otherwise enable request
+    // smuggling / response splitting downstream (RFC 9112 §2.2).
+    for (i, &b) in head.iter().enumerate() {
+        if b == b'\r' {
+            if head.get(i + 1) != Some(&b'\n') {
+                return Err(Error::BadRequest("bare CR in header block"));
+            }
+        } else if b == b'\n' && (i == 0 || head[i - 1] != b'\r') {
+            return Err(Error::BadRequest("bare LF in header block"));
+        }
+    }
+
     let text = std::str::from_utf8(head).map_err(|_| Error::BadRequest("non-UTF-8 header"))?;
     let mut lines = text.split("\r\n");
 
@@ -381,13 +418,22 @@ fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)>
         if line.starts_with(' ') || line.starts_with('\t') {
             return Err(Error::BadRequest("obsolete header folding"));
         }
+        if headers.len() >= MAX_HEADER_FIELDS {
+            return Err(Error::BadRequest("too many header fields"));
+        }
         let (name, value) = line
             .split_once(':')
             .ok_or(Error::BadRequest("header without colon"))?;
-        if name.is_empty() || name.contains(' ') {
+        // The field name must be a valid RFC 9110 token, validated on the
+        // UNtrimmed name: whitespace between the name and the colon is illegal.
+        if !is_token(name) {
             return Err(Error::BadRequest("invalid header name"));
         }
-        headers.append(name.trim(), value.trim());
+        let value = value.trim();
+        if !is_valid_field_value(value) {
+            return Err(Error::BadRequest("invalid header value"));
+        }
+        headers.append(name, value);
     }
 
     Ok((method, target.to_owned(), version, headers))
@@ -405,10 +451,21 @@ fn decode_chunked(
     let mut pos = 0usize;
     let mut out = Vec::new();
     loop {
-        // Chunk size line.
-        let Some(eol) = find_subslice(&data[pos..], b"\r\n") else {
-            return Ok(None);
+        // Chunk size line. Bound how far we'll scan for its CRLF so a peer that
+        // never terminates the line (or pads it with megabytes of chunk
+        // extensions) cannot make us buffer without bound.
+        let eol = match find_subslice(&data[pos..], b"\r\n") {
+            Some(eol) => eol,
+            None => {
+                if data.len() - pos > MAX_CHUNK_LINE_BYTES {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                return Ok(None);
+            }
         };
+        if eol > MAX_CHUNK_LINE_BYTES {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         let size_line = &data[pos..pos + eol];
         // Strip any chunk extensions after ';'.
         let hex = match size_line.iter().position(|&b| b == b';') {
@@ -416,31 +473,136 @@ fn decode_chunked(
             None => size_line,
         };
         let hex = std::str::from_utf8(hex).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let size = usize::from_str_radix(hex.trim(), 16).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let hex = hex.trim();
+        // Require a non-empty run of hex digits: this both rejects garbage and
+        // surfaces a too-large value as a parse error rather than wrapping.
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        // A value that does not fit in usize (e.g. `fffffffffffffff0` on a
+        // 32-bit target, or 17+ hex digits anywhere) parses to Err here rather
+        // than overflowing.
+        let size = usize::from_str_radix(hex, 16).map_err(|_| StatusCode::BAD_REQUEST)?;
+        // Cap a single chunk immediately: this both enforces the body limit and
+        // keeps every subsequent arithmetic operation far from overflow.
+        if size > max_body {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
         let after_size = pos + eol + 2;
 
         if size == 0 {
-            // Last chunk; consume optional trailers up to the final CRLF.
-            let Some(term) = find_subslice(&data[after_size..], b"\r\n") else {
-                return Ok(None);
+            // Last chunk: consume the whole trailer section `*(field CRLF) CRLF`
+            // so trailer bytes are not left to be misread as the next request.
+            return match consume_trailer_section(data, after_size)? {
+                Some(consumed) => Ok(Some((out, consumed))),
+                None => Ok(None),
             };
-            let consumed = after_size + term + 2;
-            return Ok(Some((out, consumed)));
         }
 
-        if out.len() + size > max_body {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        // Enforce the cumulative body limit with checked arithmetic.
+        match out.len().checked_add(size) {
+            Some(total) if total <= max_body => {}
+            _ => return Err(StatusCode::PAYLOAD_TOO_LARGE),
         }
-        // Need the chunk data plus its trailing CRLF.
-        if data.len() < after_size + size + 2 {
+        // Need the chunk data plus its trailing CRLF; compute the end offset with
+        // checked arithmetic so a huge `after_size + size + 2` cannot wrap.
+        let end = match after_size.checked_add(size).and_then(|e| e.checked_add(2)) {
+            Some(end) => end,
+            None => return Err(StatusCode::BAD_REQUEST),
+        };
+        if data.len() < end {
             return Ok(None);
         }
         out.extend_from_slice(&data[after_size..after_size + size]);
-        if &data[after_size + size..after_size + size + 2] != b"\r\n" {
+        if &data[after_size + size..end] != b"\r\n" {
             return Err(StatusCode::BAD_REQUEST);
         }
-        pos = after_size + size + 2;
+        pos = end;
     }
+}
+
+/// Consume the trailer section that follows the terminating zero-length chunk:
+/// `*(field CRLF) CRLF`. Returns `Ok(Some(consumed))` with `consumed` pointing
+/// just past the final empty line, `Ok(None)` if the section is not yet
+/// complete, or `Err(..)` if it exceeds [`MAX_TRAILER_BYTES`].
+fn consume_trailer_section(
+    data: &[u8],
+    start: usize,
+) -> std::result::Result<Option<usize>, StatusCode> {
+    let mut pos = start;
+    loop {
+        if pos.saturating_sub(start) > MAX_TRAILER_BYTES {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        match find_subslice(&data[pos..], b"\r\n") {
+            None => {
+                // Incomplete; bound how much we'll buffer waiting for the rest.
+                if data.len() - start > MAX_TRAILER_BYTES {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                return Ok(None);
+            }
+            // An empty line terminates the trailer section.
+            Some(0) => return Ok(Some(pos + 2)),
+            // A trailer field line; skip it (trailers are not surfaced).
+            Some(eol) => pos += eol + 2,
+        }
+    }
+}
+
+/// Maximum number of header fields accepted in a single request.
+const MAX_HEADER_FIELDS: usize = 100;
+
+/// Maximum length of a single chunk-size line (size + extensions), in bytes.
+const MAX_CHUNK_LINE_BYTES: usize = 16 * 1024;
+
+/// Maximum size of the trailer section after the terminating zero-length chunk.
+const MAX_TRAILER_BYTES: usize = 8 * 1024;
+
+/// Hop-by-hop / framing headers that must never be forwarded from a handler's
+/// response: the engine owns connection framing, so these are stripped before
+/// serialization (RFC 9110 §7.6.1, plus the de-facto `proxy-connection`).
+const HOP_BY_HOP_HEADERS: [&str; 7] = [
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "proxy-connection",
+];
+
+/// Whether `b` is an RFC 9110 `tchar` (a valid character in a `token`).
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Whether `s` is a non-empty RFC 9110 `token` (used for field names).
+fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_tchar)
+}
+
+/// Whether `s` is a valid field value: no control characters (0x00-0x1F) other
+/// than HTAB, and no DEL (0x7F). obs-text (0x80-0xFF) is permitted.
+fn is_valid_field_value(s: &str) -> bool {
+    s.bytes().all(|b| (b >= 0x20 && b != 0x7f) || b == b'\t')
 }
 
 /// Find the first occurrence of `needle` in `haystack`.
@@ -581,6 +743,131 @@ mod tests {
         assert!(c.wants_close());
         let out = String::from_utf8(c.take_out()).unwrap();
         assert!(out.starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
+    fn chunked_with_real_trailer_parses_and_drains() {
+        let mut c = H1Conn::default();
+        let req = drive(
+            &mut c,
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nA: 1\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(req.body(), b"hello");
+        // The trailer must be fully consumed: nothing left to misparse.
+        assert!(c.inbuf.is_empty());
+    }
+
+    #[test]
+    fn chunked_partial_trailer_waits() {
+        let mut c = H1Conn::default();
+        // Final empty line (CRLF terminating the trailer section) not yet sent.
+        c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nA: 1\r\n");
+        assert!(c.poll_request().unwrap().is_none());
+        c.feed(b"\r\n");
+        let req = c.poll_request().unwrap().unwrap();
+        assert_eq!(req.body(), b"hello");
+        assert!(c.inbuf.is_empty());
+    }
+
+    #[test]
+    fn chunked_trailer_bytes_not_smuggled_as_next_request() {
+        let mut c = H1Conn::default();
+        // Without proper trailer consumption the `GET /evil` line would be left
+        // in the buffer and parsed as a second request.
+        c.feed(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\
+              0\r\nX: y\r\n\r\nGET /evil HTTP/1.1\r\nHost: a\r\n\r\n",
+        );
+        let _ = c.poll_request().unwrap().unwrap();
+        c.respond(Response::text("ok"));
+        let next = c.poll_request().unwrap().unwrap();
+        // The smuggled request is parsed only because the client legitimately
+        // pipelined it after a *complete* trailer section.
+        assert_eq!(next.path(), "/evil");
+    }
+
+    #[test]
+    fn chunked_huge_size_is_rejected_not_panicking() {
+        let mut c = H1Conn::default();
+        c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffff0\r\n");
+        let err = c.poll_request();
+        assert!(err.is_err());
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 413"));
+    }
+
+    #[test]
+    fn chunked_non_hex_size_is_rejected() {
+        let mut c = H1Conn::default();
+        c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn chunked_oversized_size_line_is_rejected() {
+        let mut c = H1Conn::default();
+        c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        // A chunk-size line with a never-ending extension and no CRLF.
+        let mut huge = b"1;".to_vec();
+        huge.extend(std::iter::repeat_n(b'a', MAX_CHUNK_LINE_BYTES + 16));
+        c.feed(&huge);
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn rejects_bare_lf_in_headers() {
+        let mut c = H1Conn::default();
+        // Bare LF after the Host value, then the proper terminator.
+        c.feed(b"GET / HTTP/1.1\r\nHost: a\nX: y\r\n\r\n");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn rejects_control_char_in_header_value() {
+        let mut c = H1Conn::default();
+        c.feed(b"GET / HTTP/1.1\r\nX: a\x01b\r\n\r\n");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn rejects_non_token_header_name() {
+        let mut c = H1Conn::default();
+        c.feed(b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_header_fields() {
+        let mut c = H1Conn::default();
+        let mut req = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..(MAX_HEADER_FIELDS + 5) {
+            req.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        c.feed(&req);
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn rejects_non_digit_content_length() {
+        let mut c = H1Conn::default();
+        c.feed(b"POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn serialize_strips_handler_transfer_encoding_and_injection() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        let mut resp = Response::text("hi");
+        resp.headers_mut().set("Transfer-Encoding", "chunked");
+        resp.headers_mut().set("X-Evil", "a\r\nInjected: 1");
+        c.respond(resp);
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(!out.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(!out.contains("Injected: 1"));
+        assert!(out.contains("Content-Length: 2\r\n"));
     }
 
     #[test]
