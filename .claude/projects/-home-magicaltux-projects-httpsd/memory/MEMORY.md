@@ -1,1 +1,0 @@
-- [API positioning](api-positioning.md) — lean core; ergonomics behind features (dep-free→default, dep-pulling like `http`→opt-in)
