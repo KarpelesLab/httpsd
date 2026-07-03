@@ -254,12 +254,19 @@ impl H1Conn {
                 if len > self.limits.max_body_bytes {
                     return Err(self.fail(StatusCode::PAYLOAD_TOO_LARGE, "body"));
                 }
-                if self.inbuf.len() < body_start + len {
+                // Compute the body end with checked arithmetic: with a
+                // pathologically large `max_body_bytes`, `body_start + len` could
+                // otherwise wrap (release) or panic (debug), and the slice below
+                // could then panic. Mirror the chunked path's checked_add.
+                let Some(body_end) = body_start.checked_add(len) else {
+                    return Err(self.fail(StatusCode::PAYLOAD_TOO_LARGE, "body"));
+                };
+                if self.inbuf.len() < body_end {
                     self.maybe_send_continue(&headers);
                     return Ok(None);
                 }
-                body = self.inbuf[body_start..body_start + len].to_vec();
-                consumed_total = body_start + len;
+                body = self.inbuf[body_start..body_end].to_vec();
+                consumed_total = body_end;
             }
             BodyFraming::Chunked => {
                 // Resume the incremental decoder where the previous poll stopped
@@ -433,19 +440,21 @@ enum BodyFraming {
 /// Decide body framing from headers, rejecting the smuggling-prone combination
 /// of both `Transfer-Encoding` and `Content-Length`.
 fn body_framing(headers: &Headers) -> std::result::Result<BodyFraming, ()> {
-    let chunked = headers.contains_token("transfer-encoding", "chunked");
     let has_te = headers.contains("transfer-encoding");
     let has_cl = headers.contains("content-length");
 
     if has_te && has_cl {
         return Err(());
     }
-    if chunked {
-        return Ok(BodyFraming::Chunked);
-    }
     if has_te {
-        // A Transfer-Encoding we don't understand (and not chunked) is unsupported.
-        return Err(());
+        // RFC 9112 §6.1: if `Transfer-Encoding` is present, `chunked` must be the
+        // final coding, or the message length is undeterminable. Reject anything
+        // else (an unknown final coding, a non-final `chunked`, or `chunked`
+        // spread across multiple TE fields) rather than guessing the framing.
+        return match final_coding_is_chunked(headers) {
+            true => Ok(BodyFraming::Chunked),
+            false => Err(()),
+        };
     }
     // Multiple Content-Length values must agree.
     let mut len: Option<usize> = None;
@@ -466,6 +475,35 @@ fn body_framing(headers: &Headers) -> std::result::Result<BodyFraming, ()> {
         Some(0) | None => Ok(BodyFraming::None),
         Some(n) => Ok(BodyFraming::Length(n)),
     }
+}
+
+/// Whether the `Transfer-Encoding` header(s) name `chunked` as the FINAL coding
+/// and nowhere else, per RFC 9112 §6.1.
+///
+/// The codings across every `Transfer-Encoding` field are concatenated in order
+/// (multiple fields are equivalent to one comma-joined field). `chunked` is
+/// accepted only when it is exactly the last coding; if it also appears as a
+/// non-final coding (which would mean the body is chunked more than once, i.e.
+/// framing is ambiguous), or appears in more than one field, we reject.
+fn final_coding_is_chunked(headers: &Headers) -> bool {
+    let mut codings: Vec<&str> = Vec::new();
+    for v in headers.get_all("transfer-encoding") {
+        for tok in v.split(',') {
+            let tok = tok.trim();
+            if !tok.is_empty() {
+                codings.push(tok);
+            }
+        }
+    }
+    let chunked_count = codings
+        .iter()
+        .filter(|t| t.eq_ignore_ascii_case("chunked"))
+        .count();
+    // `chunked` must appear exactly once, and it must be the final coding.
+    chunked_count == 1
+        && codings
+            .last()
+            .is_some_and(|t| t.eq_ignore_ascii_case("chunked"))
 }
 
 /// Negotiate connection persistence per RFC 9112 §9.3.
@@ -509,6 +547,13 @@ fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)>
     }
     if method.is_empty() || target.is_empty() {
         return Err(Error::BadRequest("empty request-line token"));
+    }
+    // Reject control characters in the request target. CR/LF/SP are already
+    // excluded (they delimit the request line / header block), but NUL, TAB,
+    // DEL and other C0 controls must not slip through into the target, where
+    // they could enable smuggling or corrupt downstream routing.
+    if target.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(Error::BadRequest("control character in request target"));
     }
 
     let method = Method::parse(method);
@@ -1263,6 +1308,75 @@ mod tests {
         assert_eq!(find_subslice(b"ab", b"abc"), None);
         assert_eq!(find_subslice(b"hello", b"l"), Some(2));
         assert_eq!(find_subslice(b"hello", b""), None);
+    }
+
+    #[test]
+    fn huge_content_length_does_not_panic() {
+        // A Content-Length near usize::MAX combined with an operator-set body
+        // limit near usize::MAX would make `body_start + len` overflow. The
+        // checked_add must turn that into a 413 rather than panicking/wrapping.
+        let limits = Limits {
+            max_header_bytes: 64 * 1024,
+            max_body_bytes: usize::MAX,
+        };
+        let mut c = H1Conn::new(limits);
+        c.feed(format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", usize::MAX).as_bytes());
+        let res = c.poll_request();
+        assert!(res.is_err(), "overflowing body length must be rejected");
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 413"), "expected 413, got: {out}");
+    }
+
+    #[test]
+    fn te_chunked_not_final_coding_rejected() {
+        // `chunked` is not the final coding: message length is undeterminable,
+        // so this must be a 400 (RFC 9112 §6.1).
+        let mut c = H1Conn::default();
+        c.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n");
+        assert!(c.poll_request().is_err());
+        assert!(c.wants_close());
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 400"), "expected 400, got: {out}");
+    }
+
+    #[test]
+    fn te_chunked_as_final_coding_accepted() {
+        // `chunked` as the last coding is valid framing and must decode.
+        let mut c = H1Conn::default();
+        let req = drive(
+            &mut c,
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(req.body(), b"hello");
+    }
+
+    #[test]
+    fn te_chunked_in_two_fields_rejected() {
+        // `chunked` appearing in more than one TE field is ambiguous framing.
+        let mut c = H1Conn::default();
+        c.feed(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn target_with_control_byte_rejected() {
+        // An embedded NUL (a C0 control) in the request target must be a 400.
+        let mut c = H1Conn::default();
+        c.feed(b"GET /a\x00b HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert!(c.poll_request().is_err());
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 400"), "expected 400, got: {out}");
+    }
+
+    #[test]
+    fn target_with_tab_byte_rejected() {
+        // A TAB (0x09) in the target must also be rejected.
+        let mut c = H1Conn::default();
+        c.feed(b"GET /a\tb HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert!(c.poll_request().is_err());
     }
 
     #[test]
