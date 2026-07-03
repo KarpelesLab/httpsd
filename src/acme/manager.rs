@@ -54,6 +54,13 @@ pub struct AcmeConfig {
     /// Optional account contact email.
     pub email: Option<String>,
     /// If set, only these host names may be issued for; others are rejected.
+    ///
+    /// **Set this for any internet-facing deployment.** When it is `None`, every
+    /// syntactically valid SNI that reaches the server can drive an ACME order,
+    /// so an attacker pointing arbitrary DNS names at the host can make it hammer
+    /// the CA (and hit rate limits). Host names here should already be normalized
+    /// (lowercased, no trailing dot); they are compared against the validated,
+    /// normalized SNI.
     pub host_whitelist: Option<HashSet<String>>,
     /// Host to route by when a connection sends no SNI (e.g. a bare-IP TLS
     /// client, or a tool that omits SNI). When set, such connections are served
@@ -182,11 +189,14 @@ impl AcmeManager {
     /// progress. The TLS router uses this when the ClientHello offers
     /// `acme-tls/1`.
     pub fn challenge_acceptor(&self, host: &str) -> Option<TlsAcceptor> {
+        // Validate the (attacker-controlled) SNI before it is used as a map key,
+        // so a hostile name never reaches the challenge map lookup.
+        let host = validate_host(host).ok()?;
         self.inner
             .alpn_challenges
             .lock()
             .unwrap()
-            .get(&normalize(host))
+            .get(&host)
             .cloned()
     }
 
@@ -205,15 +215,18 @@ impl AcmeManager {
     /// configured [`default_host`](AcmeConfig::default_host). `None` means there
     /// is no usable host, so the caller should serve the self-signed fallback.
     fn effective_host(&self, sni: Option<&str>) -> Option<String> {
-        if let Some(h) = sni.map(normalize).filter(|h| !h.is_empty()) {
+        // Validate the SNI authoritatively here, before any CA contact or
+        // filesystem use. An invalid/hostile SNI degrades to the default-host
+        // path (and an invalid default host degrades to the self-signed
+        // fallback), rather than driving an order or a filesystem path.
+        if let Some(h) = sni.and_then(|s| validate_host(s).ok()) {
             return Some(h);
         }
         self.inner
             .cfg
             .default_host
             .as_deref()
-            .map(normalize)
-            .filter(|h| !h.is_empty())
+            .and_then(|h| validate_host(h).ok())
     }
 
     /// Decide which certificate to present for a connection.
@@ -278,6 +291,11 @@ impl AcmeManager {
 
     /// Return a ready acceptor for `host`, issuing or renewing as needed.
     fn get_or_issue(&self, host: &str) -> Result<TlsAcceptor> {
+        // Authoritative host validation before any cache/CA/filesystem use, so a
+        // hostile host can never drive an order or a filesystem path even if a
+        // caller reached here without going through `effective_host`.
+        let host = validate_host(host)?;
+        let host = host.as_str();
         let now = now_secs();
 
         // Fast path: a fresh cached cert.
@@ -374,6 +392,9 @@ impl AcmeManager {
 
     /// Issue a brand-new certificate for `host` via ACME and persist it.
     fn issue(&self, host: &str) -> Result<TlsAcceptor> {
+        // Belt-and-suspenders: never send an unvalidated host to the CA.
+        let host = validate_host(host)?;
+        let host = host.as_str();
         if !self.inner.cfg.accept_tos {
             return Err(Error::Acme(
                 "automatic issuance disabled: the CA terms of service have not been accepted"
@@ -559,6 +580,53 @@ fn normalize(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Authoritative host validation for the ACME manager's entry points.
+///
+/// Runs BEFORE any CA contact or filesystem use so an attacker-controlled SNI
+/// cannot drive an order or a filesystem path. Lowercases, trims surrounding
+/// whitespace, and strips a single trailing dot, then enforces a DNS-name
+/// charset that matches the store's `sanitize_host` (letters/digits plus `-`,
+/// `_`, and `*`, with `.` as the label separator) so the two agree. IP-literal
+/// SNIs are rejected because a public CA will not issue certificates for IP
+/// addresses in this flow.
+///
+/// Returns the normalized host on success, or an error the caller maps to
+/// `Reject` / `None` (serving the default cert or self-signed fallback instead).
+fn validate_host(host: &str) -> Result<String> {
+    let host = host.trim();
+    // Reject control/space/NUL and path metacharacters outright, before any
+    // trimming of the trailing dot lets a crafted value slip through.
+    if host.is_empty()
+        || host.contains('\0')
+        || host.contains('/')
+        || host.contains("..")
+        || host.bytes().any(|b| b.is_ascii_whitespace())
+    {
+        return Err(Error::Acme(format!("invalid host: {host:?}")));
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 {
+        return Err(Error::Acme(format!("invalid host: {host:?}")));
+    }
+    // Reject IP literals: a public CA won't issue for IPs in this flow, and an
+    // IP SNI should degrade to the default/self-signed path, not an order.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(Error::Acme(format!("host is an IP literal: {host:?}")));
+    }
+    // Charset matches store::sanitize_host so the two layers agree.
+    let ok = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'*')
+    });
+    if !ok {
+        return Err(Error::Acme(format!("invalid host: {host:?}")));
+    }
+    Ok(host)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -658,5 +726,41 @@ mod tests {
     #[test]
     fn normalize_host() {
         assert_eq!(normalize(" Example.COM. "), "example.com");
+    }
+
+    #[test]
+    fn validate_host_accepts_good_names() {
+        assert_eq!(validate_host("Example.COM.").unwrap(), "example.com");
+        assert_eq!(validate_host("  foo.test  ").unwrap(), "foo.test");
+        assert_eq!(validate_host("a-b.example.org").unwrap(), "a-b.example.org");
+        assert_eq!(validate_host("*.example.com").unwrap(), "*.example.com");
+        assert_eq!(
+            validate_host("under_score.test").unwrap(),
+            "under_score.test"
+        );
+    }
+
+    #[test]
+    fn validate_host_rejects_bad_names() {
+        assert!(validate_host("../etc").is_err());
+        assert!(validate_host("a/b").is_err());
+        assert!(validate_host("").is_err());
+        assert!(validate_host("   ").is_err());
+        assert!(validate_host("foo bar.test").is_err()); // embedded space
+        assert!(validate_host("foo\0bar.test").is_err()); // embedded NUL
+        assert!(validate_host("a..b.test").is_err()); // empty label / `..`
+        assert!(validate_host("foo.example/..").is_err());
+        // Overlong: a 300-char single label (also > 253 total).
+        assert!(validate_host(&"a".repeat(300)).is_err());
+        // Overlong label (> 63) inside an otherwise valid name.
+        assert!(validate_host(&format!("{}.example.com", "a".repeat(64))).is_err());
+        // IP literals must be rejected (no CA issuance for IPs here).
+        assert!(validate_host("127.0.0.1").is_err());
+        assert!(validate_host("1.2.3.4").is_err());
+        assert!(validate_host("::1").is_err());
+        assert!(validate_host("2001:db8::1").is_err());
+        // Disallowed charset.
+        assert!(validate_host("exämple.com").is_err());
+        assert!(validate_host("host!.com").is_err());
     }
 }
