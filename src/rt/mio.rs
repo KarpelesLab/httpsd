@@ -136,22 +136,63 @@ pub(crate) fn run(
     let mut conns: HashMap<Token, Conn> = HashMap::new();
     let mut next_token = 1usize;
     let mut next_sweep = Instant::now() + SWEEP_INTERVAL;
+    // When descriptor exhaustion (EMFILE/ENFILE) makes `accept()` fail, the
+    // listener stays readable, so retrying immediately spins the CPU. Rather
+    // than `thread::sleep` (which in this single-threaded loop would also freeze
+    // every existing connection's I/O and the idle sweep), we record a
+    // "backoff-until" instant and simply skip processing listener readiness
+    // until it passes — existing connections keep being serviced meanwhile.
+    let mut accept_backoff_until: Option<Instant> = None;
 
     loop {
         // Wake at least once per sweep interval so idle peers are reaped even
-        // when no socket is otherwise readable/writable.
-        poll.poll(&mut events, Some(SWEEP_INTERVAL))?;
+        // when no socket is otherwise readable/writable. When an accept backoff
+        // is pending, clamp the timeout so the loop also wakes to resume
+        // accepting the moment fd pressure is expected to have cleared.
+        let now = Instant::now();
+        let mut deadline = next_sweep;
+        if let Some(until) = accept_backoff_until
+            && until < deadline
+        {
+            deadline = until;
+        }
+        let timeout = deadline.saturating_duration_since(now);
+
+        // A transient EINTR must not take down the whole server; retry the poll.
+        // Genuinely fatal errors still propagate.
+        if let Err(e) = poll.poll(&mut events, Some(timeout)) {
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::Io(e));
+        }
+
+        // Is the accept backoff still in force this iteration?
+        let now = Instant::now();
+        let backing_off = matches!(accept_backoff_until, Some(until) if now < until);
+        if !backing_off {
+            accept_backoff_until = None;
+        }
+
         for event in events.iter() {
             match event.token() {
-                LISTENER => accept_ready(
-                    &listener,
-                    &poll,
-                    &cfg,
-                    #[cfg(feature = "tls")]
-                    &tls,
-                    &mut conns,
-                    &mut next_token,
-                ),
+                // Skip the listener while backing off: leave it readable so the
+                // next poll (clamped to wake near `accept_backoff_until`) will
+                // re-deliver the readiness once we are ready to accept again.
+                LISTENER if backing_off => {}
+                LISTENER => {
+                    if let Some(backoff) = accept_ready(
+                        &listener,
+                        &poll,
+                        &cfg,
+                        #[cfg(feature = "tls")]
+                        &tls,
+                        &mut conns,
+                        &mut next_token,
+                    ) {
+                        accept_backoff_until = Some(backoff);
+                    }
+                }
                 token => handle_conn(token, event, &poll, &mut conns),
             }
         }
@@ -192,6 +233,10 @@ fn bind_first(addrs: &[SocketAddr]) -> Result<TcpListener> {
         .unwrap_or_else(|| Error::Config("no listen address".into())))
 }
 
+/// Drain the listener backlog. Returns `Some(instant)` when a descriptor
+/// exhaustion error asks the caller to back off accepting until that instant
+/// (see [`note_accept_error`]); the caller must skip the listener until then
+/// rather than sleeping the whole single-thread loop.
 fn accept_ready(
     listener: &TcpListener,
     poll: &Poll,
@@ -199,7 +244,7 @@ fn accept_ready(
     #[cfg(feature = "tls")] tls: &Option<TlsAcceptor>,
     conns: &mut HashMap<Token, Conn>,
     next_token: &mut usize,
-) {
+) -> Option<Instant> {
     loop {
         match listener.accept() {
             Ok((mut stream, _addr)) => {
@@ -246,13 +291,16 @@ fn accept_ready(
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
+                // On descriptor exhaustion, ask the caller to back off (skip the
+                // listener) instead of sleeping the whole loop.
                 if crate::rt::common::note_accept_error("accept error", &e) {
-                    std::thread::sleep(crate::rt::common::ACCEPT_BACKOFF);
+                    return Some(Instant::now() + crate::rt::common::ACCEPT_BACKOFF);
                 }
                 break;
             }
         }
     }
+    None
 }
 
 fn handle_conn(token: Token, event: &Event, poll: &Poll, conns: &mut HashMap<Token, Conn>) {
