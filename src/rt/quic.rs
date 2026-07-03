@@ -83,6 +83,10 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 struct Conn {
     quic: QuicConnection,
     h3: H3Conn,
+    /// When this connection's `QuicConnection` was constructed. The purecrypto
+    /// timer API works in durations measured from construction (both
+    /// `next_timeout()` and `on_timeout()`), so we anchor deadlines to this.
+    created_at: Instant,
     /// When the next loss-recovery timer should fire.
     deadline: Option<Instant>,
     /// Last time we received a datagram for this connection (for the idle sweep).
@@ -102,7 +106,6 @@ pub(crate) fn run(
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
-    let start = Instant::now();
     let mut conns: HashMap<SocketAddr, Conn> = HashMap::new();
     let mut buf = [0u8; RECV_BUF];
 
@@ -132,7 +135,7 @@ pub(crate) fn run(
             Err(e) => return Err(Error::Io(e)),
         }
 
-        fire_timers(&socket, &mut conns, &cfg, start);
+        fire_timers(&socket, &mut conns, &cfg);
         // Reap closed connections, plus any that have been idle past the
         // backstop timeout (covers half-open / stalled handshakes that an
         // attacker could otherwise pile up faster than they expire).
@@ -182,6 +185,7 @@ fn on_datagram(
             Conn {
                 quic,
                 h3: H3Conn::new(cfg.limits, cfg.server_name.clone()),
+                created_at: Instant::now(),
                 deadline: None,
                 last_seen: Instant::now(),
             },
@@ -228,12 +232,7 @@ fn evict_one(conns: &mut HashMap<SocketAddr, Conn>) -> bool {
 }
 
 /// Fire any elapsed loss-recovery timers and service those connections.
-fn fire_timers(
-    socket: &UdpSocket,
-    conns: &mut HashMap<SocketAddr, Conn>,
-    cfg: &SessionConfig,
-    start: Instant,
-) {
+fn fire_timers(socket: &UdpSocket, conns: &mut HashMap<SocketAddr, Conn>, cfg: &SessionConfig) {
     let now = Instant::now();
     let due: Vec<SocketAddr> = conns
         .iter()
@@ -242,7 +241,11 @@ fn fire_timers(
         .collect();
     for peer in due {
         if let Some(conn) = conns.get_mut(&peer) {
-            conn.quic.on_timeout(now.saturating_duration_since(start));
+            // `on_timeout()` expects the elapsed duration since this
+            // connection's construction, so measure from its own `created_at`
+            // (not the global server start).
+            conn.quic
+                .on_timeout(now.saturating_duration_since(conn.created_at));
             let _ = service(socket, peer, conn, cfg);
         }
     }
@@ -263,8 +266,11 @@ fn service(
         }
         socket.send_to(&dg, peer)?;
     }
-    // `next_timeout` is relative to now; store it as an absolute instant.
-    conn.deadline = conn.quic.next_timeout().map(|d| Instant::now() + d);
+    // `next_timeout()` returns a duration measured from the connection's
+    // construction (not from now), so anchor the absolute deadline to
+    // `created_at`. Anchoring to `Instant::now()` would push the deadline
+    // further out as the connection ages, so PTO/idle timers would never fire.
+    conn.deadline = conn.quic.next_timeout().map(|d| conn.created_at + d);
     Ok(())
 }
 
