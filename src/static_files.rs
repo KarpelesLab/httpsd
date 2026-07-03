@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use crate::handler::Handler;
@@ -28,6 +28,12 @@ use crate::proto::{Body, Method, Request, Response, StatusCode};
 pub struct StaticFiles {
     root: PathBuf,
     index: String,
+    /// Canonicalized root, computed lazily on first successful canonicalization
+    /// and reused thereafter. Avoids re-canonicalizing the root on every request
+    /// (which would make confinement depend on transient FS state and repeat
+    /// work). If the root cannot be canonicalized yet (e.g. it does not exist),
+    /// the cell stays empty and confinement fails closed.
+    root_canon: OnceLock<PathBuf>,
 }
 
 impl StaticFiles {
@@ -36,6 +42,21 @@ impl StaticFiles {
         StaticFiles {
             root: root.into(),
             index: "index.html".to_owned(),
+            root_canon: OnceLock::new(),
+        }
+    }
+
+    /// The canonical root, computed once and cached. Returns `None` if the root
+    /// cannot currently be canonicalized (e.g. it does not exist yet).
+    fn canonical_root(&self) -> Option<&Path> {
+        if let Some(root) = self.root_canon.get() {
+            return Some(root.as_path());
+        }
+        // Attempt to canonicalize; only cache on success so a transient failure
+        // (root not yet created) can be retried on a later request.
+        match fs::canonicalize(&self.root) {
+            Ok(root) => Some(self.root_canon.get_or_init(|| root).as_path()),
+            Err(_) => None,
         }
     }
 
@@ -75,8 +96,10 @@ impl StaticFiles {
     /// Final defense: ensure the canonical target stays within the canonical
     /// root (defeats symlink escapes).
     fn within_root(&self, path: &Path) -> bool {
-        match (fs::canonicalize(&self.root), fs::canonicalize(path)) {
-            (Ok(root), Ok(target)) => target.starts_with(root),
+        // Fail closed: refuse if the root cannot be canonicalized (cached once)
+        // or the candidate path cannot be canonicalized.
+        match (self.canonical_root(), fs::canonicalize(path)) {
+            (Some(root), Ok(target)) => target.starts_with(root),
             _ => false,
         }
     }
@@ -116,7 +139,10 @@ impl StaticFiles {
             _ => return Response::status(StatusCode::NOT_FOUND),
         };
         if !self.within_root(&path) {
-            return Response::status(StatusCode::FORBIDDEN);
+            // A target that escapes the root (e.g. via a symlink) is reported as
+            // `404` — indistinguishable from a missing file — so it cannot be
+            // used as an existence/symlink oracle, matching the dotfile policy.
+            return Response::status(StatusCode::NOT_FOUND);
         }
 
         let content_type = mime::from_path(path.to_string_lossy().as_ref());
@@ -249,7 +275,7 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
             let hi = (bytes[i + 1] as char).to_digit(16);
             let lo = (bytes[i + 2] as char).to_digit(16);
             if let (Some(hi), Some(lo)) = (hi, lo) {
@@ -283,6 +309,20 @@ mod tests {
         assert_eq!(percent_decode("/a%20b"), "/a b");
         assert_eq!(percent_decode("/%2e%2e"), "/..");
         assert_eq!(percent_decode("/bad%2"), "/bad%2");
+    }
+
+    #[test]
+    fn percent_decoding_trailing_triplet() {
+        // A complete `%XX` triplet at the very end of the string must decode;
+        // previously an off-by-one bound left the final triplet un-decoded,
+        // a normalization inconsistency usable as a filter-bypass primitive.
+        assert_eq!(percent_decode("/foo%2e"), "/foo.");
+        assert_eq!(percent_decode("/foo%2f"), "/foo/");
+        assert_eq!(percent_decode("%2e"), ".");
+        assert_eq!(percent_decode("/a%2e%2e"), "/a..");
+        // An incomplete trailing escape is still passed through verbatim.
+        assert_eq!(percent_decode("/foo%2"), "/foo%2");
+        assert_eq!(percent_decode("/foo%"), "/foo%");
     }
 
     #[test]
@@ -323,5 +363,99 @@ mod tests {
         );
         // Rejected paths report 404 (not 403) so existence is not confirmed.
         assert_eq!(sf.serve(&req).status_code().code(), 404);
+    }
+
+    // Build a unique scratch directory under the system temp dir.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "httpsd-static-test-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            n,
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn get(path: &str) -> Request {
+        Request::new(
+            Method::Get,
+            path.to_owned(),
+            crate::proto::Version::Http11,
+            crate::proto::Headers::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn served_file_and_traversal_blocked_on_disk() {
+        let root = scratch_dir("serve");
+        fs::write(root.join("hello.txt"), b"hi").unwrap();
+        let sf = StaticFiles::new(&root);
+
+        // A real file inside the root is served.
+        assert_eq!(sf.serve(&get("/hello.txt")).status_code().code(), 200);
+
+        // Traversal is still blocked (reported as 404, existence not confirmed).
+        assert_eq!(sf.serve(&get("/../hello.txt")).status_code().code(), 404);
+        assert_eq!(
+            sf.serve(&get("/%2e%2e/hello.txt")).status_code().code(),
+            404
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_404_not_403() {
+        // A symlink inside the root that points to a real file OUTSIDE the root
+        // must be reported as 404 (indistinguishable from a missing file), not
+        // 403 — otherwise it is an existence/symlink oracle.
+        let base = scratch_dir("symlink");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let secret = outside.join("secret.txt");
+        fs::write(&secret, b"top secret").unwrap();
+
+        // root/leak.txt -> ../outside/secret.txt (escapes the root).
+        let link = root.join("leak.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let sf = StaticFiles::new(&root);
+
+        // The confinement check must reject the escaped target.
+        assert!(!sf.within_root(&link));
+        // And the served response must be 404, not 403.
+        assert_eq!(sf.serve(&get("/leak.txt")).status_code().code(), 404);
+
+        // A genuinely missing file also yields 404 — the two are indistinguishable.
+        assert_eq!(sf.serve(&get("/nope.txt")).status_code().code(), 404);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn canonical_root_cached_after_first_success() {
+        let root = scratch_dir("cache");
+        let sf = StaticFiles::new(&root);
+        // First access canonicalizes and caches.
+        let first = sf.canonical_root().map(|p| p.to_owned());
+        assert!(first.is_some());
+        assert!(sf.root_canon.get().is_some());
+        // Even if the underlying directory disappears, the cached value persists,
+        // so confinement no longer depends on transient FS state per request.
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sf.canonical_root().map(|p| p.to_owned()), first);
     }
 }
