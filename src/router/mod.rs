@@ -31,6 +31,18 @@
 //! (read it back with [`Request::param`]); a trailing `*name` captures the rest
 //! of the path. Everything else matches literally. Leading and trailing slashes
 //! are ignored, so `/a/b`, `a/b`, and `/a/b/` all match the pattern `/a/b`.
+//!
+//! # Percent-decoding and encoded slashes
+//!
+//! Routing is performed on the **percent-decoded** request path, so that a
+//! protective route cannot be bypassed by encoding characters (e.g. `/%61dmin`
+//! matches a route registered as `/admin`). Because the static-file layer also
+//! decodes, matching the raw path would let a request miss a route yet still
+//! reach the file on disk. To keep segment boundaries unambiguous, a request
+//! whose path contains an **encoded** slash (`%2f`/`%2F`), backslash (`%5c`),
+//! or a NUL (`%00`) is rejected with `400 Bad Request` rather than silently
+//! decoded — an encoded separator must never create or hide a segment boundary.
+//! A segment that does not percent-decode to valid UTF-8 is likewise rejected.
 
 mod response;
 
@@ -75,11 +87,13 @@ struct Route {
 }
 
 impl Route {
-    /// Match the (already-split) request path against this route's pattern,
-    /// returning the captured parameters on success (empty `Vec` when the
-    /// pattern has none). The caller splits the path once and reuses it across
-    /// every route, so matching allocates nothing until a capture is found.
-    fn matches(&self, path_segs: &[&str]) -> Option<Vec<(String, String)>> {
+    /// Match the (already-split, already percent-decoded) request path against
+    /// this route's pattern, returning the captured parameters on success
+    /// (empty `Vec` when the pattern has none). The caller splits and decodes
+    /// the path once and reuses it across every route, so matching allocates
+    /// nothing until a capture is found. Captured values are the decoded
+    /// segment values; the wildcard rejoins its segments with `/`.
+    fn matches(&self, path_segs: &[String]) -> Option<Vec<(String, String)>> {
         let mut params = Vec::new();
         let mut i = 0;
         for seg in &self.segs {
@@ -92,7 +106,7 @@ impl Route {
                 }
                 Seg::Param(name) => {
                     let value = path_segs.get(i)?;
-                    params.push((name.clone(), (*value).to_owned()));
+                    params.push((name.clone(), value.clone()));
                     i += 1;
                 }
                 Seg::Wildcard(name) => {
@@ -190,7 +204,14 @@ impl Router {
     /// Allowed` (with an `Allow` header) when the path matches but the method
     /// does not, and otherwise the fallback or a `404`.
     fn dispatch(&self, req: &Request) -> Response {
-        let path_segs = segments(req.path());
+        // Route on the percent-decoded path. Reject (400) any path that
+        // percent-encodes a segment separator (slash/backslash), a NUL, or
+        // that does not decode to valid UTF-8, so an encoded separator can
+        // never create or hide a segment boundary and thereby bypass a route.
+        let path_segs = match decode_segments(req.path()) {
+            Some(segs) => segs,
+            None => return Response::status(StatusCode::BAD_REQUEST),
+        };
         let mut allowed: Vec<&str> = Vec::new();
         for route in &self.routes {
             let Some(params) = route.matches(&path_segs) else {
@@ -238,6 +259,52 @@ fn segments(path: &str) -> Vec<&str> {
     } else {
         trimmed.split('/').collect()
     }
+}
+
+/// Split a request path into percent-decoded segments for routing.
+///
+/// Returns `None` (signalling a `400 Bad Request`) if any segment
+/// percent-decodes to contain a segment separator (`/` or `\`, i.e. an encoded
+/// `%2f`/`%2F`/`%5c`/`%5C`), a NUL byte, or is not valid UTF-8 after decoding.
+/// Rejecting rather than accepting these keeps segment boundaries unambiguous
+/// so an encoded separator cannot bypass or forge a route.
+fn decode_segments(path: &str) -> Option<Vec<String>> {
+    segments(path).into_iter().map(decode_segment).collect()
+}
+
+/// Percent-decode a single path segment, rejecting an encoded separator, a NUL,
+/// or invalid UTF-8. The input segment never contains a literal `/` (the path
+/// was already split on it); this guards against *encoded* ones.
+fn decode_segment(seg: &str) -> Option<String> {
+    let bytes = seg.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // A `%` must be followed by two hex digits. `i + 2 < len` ensures
+            // both index reads below are in bounds.
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            let byte = (hi * 16 + lo) as u8;
+            // Reject encoded separators, backslash, and NUL: they must never be
+            // introduced by decoding, since that could forge a segment boundary
+            // or terminate a C string downstream.
+            if matches!(byte, b'/' | b'\\' | 0x00) {
+                return None;
+            }
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // A decoded segment that is not valid UTF-8 is rejected rather than lossily
+    // converted, so handlers never see a `` replacement char in place of bytes.
+    String::from_utf8(out).ok()
 }
 
 /// Compile a route pattern into segments.
@@ -330,6 +397,72 @@ mod tests {
     fn query_string_ignored_in_match() {
         let app = Router::new().get("/search", |r: &Request| r.query().unwrap_or("").to_owned());
         assert_eq!(body(&app.handle(&req(Method::Get, "/search?q=hi"))), "q=hi");
+    }
+
+    #[test]
+    fn encoded_path_matches_literal_route() {
+        // `/%61dmin` decodes to `/admin` and must hit the protective route,
+        // not fall through to a more permissive handler.
+        let app = Router::new()
+            .get("/admin", |_: &Request| "admin")
+            .fallback(|_: &Request| (StatusCode::OK, "fallback"));
+        assert_eq!(body(&app.handle(&req(Method::Get, "/%61dmin"))), "admin");
+        assert_eq!(body(&app.handle(&req(Method::Get, "/ad%6din"))), "admin");
+    }
+
+    #[test]
+    fn encoded_slash_is_rejected() {
+        // `/admin%2fsub` must NOT be treated as `/admin/sub` and match a
+        // wildcard; the encoded slash is rejected as a 400.
+        let app = Router::new()
+            .get("/admin/*rest", |_: &Request| "wild")
+            .fallback(|_: &Request| (StatusCode::OK, "fallback"));
+        assert_eq!(
+            app.handle(&req(Method::Get, "/admin%2fsub")).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.handle(&req(Method::Get, "/admin%2Fsub")).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        // A backslash is likewise rejected.
+        assert_eq!(
+            app.handle(&req(Method::Get, "/admin%5csub")).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        // The genuine, unencoded path still routes normally.
+        assert_eq!(body(&app.handle(&req(Method::Get, "/admin/sub"))), "wild");
+    }
+
+    #[test]
+    fn encoded_nul_is_rejected() {
+        let app = Router::new().get("/file/:name", |_: &Request| "ok");
+        assert_eq!(
+            app.handle(&req(Method::Get, "/file/a%00b")).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn param_capture_is_decoded() {
+        // `:id` capture of `/user/%6a%6f%65` yields `joe`.
+        let app = Router::new().get("/user/:id", |r: &Request| {
+            r.param("id").unwrap_or("?").to_owned()
+        });
+        assert_eq!(
+            body(&app.handle(&req(Method::Get, "/user/%6a%6f%65"))),
+            "joe"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_segment_is_rejected() {
+        // `%ff` alone is not valid UTF-8; reject rather than lossily convert.
+        let app = Router::new().get("/x/:id", |_: &Request| "ok");
+        assert_eq!(
+            app.handle(&req(Method::Get, "/x/%ff")).status_code(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
