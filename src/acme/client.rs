@@ -67,6 +67,15 @@ impl AcmeClient {
         account: AccountKey,
         email: Option<String>,
     ) -> Result<AcmeClient> {
+        // The directory URL must be HTTPS: a plaintext (or otherwise MITM-able)
+        // directory would let an attacker rewrite the endpoints we then POST
+        // signed orders to. TLS verification of the CA is delegated to `rsurl`'s
+        // defaults; an insecure/skip-verify mode must never be enabled here.
+        if !directory_url.starts_with("https://") {
+            return Err(Error::Acme(format!(
+                "ACME directory URL must be https:// (got {directory_url})"
+            )));
+        }
         let resp = http_get(directory_url)?;
         let doc = parse_json(&resp.body)?;
         let dir = Directory {
@@ -400,6 +409,21 @@ mod tests {
     fn problem_detail_extracted() {
         let e = acme_err("newOrder", br#"{"type":"x","detail":"rejected: bad id"}"#);
         assert!(format!("{e}").contains("rejected: bad id"));
+    }
+
+    #[test]
+    fn rejects_non_https_directory_url() {
+        // A plaintext directory URL must be refused before any network contact.
+        match AcmeClient::new(
+            "http://acme.example/directory",
+            AccountKey::generate(),
+            None,
+        ) {
+            Ok(_) => panic!("http:// directory must be rejected"),
+            Err(e) => assert!(format!("{e}").contains("https://")),
+        }
+        // A bare host with no scheme is likewise rejected.
+        assert!(AcmeClient::new("acme.example/directory", AccountKey::generate(), None).is_err());
     }
 
     #[test]
