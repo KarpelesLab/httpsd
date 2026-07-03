@@ -175,6 +175,10 @@ impl PrivDrop {
 /// but the resulting effective uid is still `0`, **unless** root was explicitly
 /// requested (`uid == Some(0)`). Factored out of the syscall path so it can be
 /// unit-tested without dropping real privileges.
+///
+/// Only the `apply_unix` path calls this, so on non-unix targets it has no
+/// non-test caller; keep it compiled (and unit-tested) everywhere regardless.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn still_root_after_drop(
     uid: Option<u32>,
     gid: Option<u32>,
