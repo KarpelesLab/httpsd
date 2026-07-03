@@ -105,12 +105,25 @@ impl PrivDrop {
 
         // 2. Drop supplementary groups, then set the primary group. This must
         // happen before setuid — once we drop the uid we lose the privilege to
-        // change groups.
+        // change groups. Supplementary groups are deliberately reset to just the
+        // primary gid (a single-entry `setgroups`) rather than reconstructed
+        // from the target user's group memberships via `initgroups`: keeping no
+        // supplementary groups is the more restrictive, safer choice (finding
+        // 2, informational).
         if let Some(gid) = self.gid {
             let gid = gid as libc::gid_t;
             let groups = [gid];
             check(unsafe { libc::setgroups(1, groups.as_ptr()) }, "setgroups")?;
             check(unsafe { libc::setgid(gid) }, "setgid")?;
+            // Verify the gid drop stuck: both the real and effective gid must
+            // now be the target. (setgid as root sets both.)
+            let egid = unsafe { libc::getegid() };
+            let rgid = unsafe { libc::getgid() };
+            if egid != gid || rgid != gid {
+                return Err(Error::Config(format!(
+                    "privilege drop failed: gid is rgid={rgid}/egid={egid}, expected {gid}"
+                )));
+            }
         }
 
         // 3. Drop the user id.
@@ -139,8 +152,38 @@ impl PrivDrop {
             }
         }
 
+        // 5. A drop was requested (any of user/group/chroot) but the process is
+        // still effectively root, and root was not explicitly requested. This
+        // happens e.g. when only a group or chroot is configured: the sequence
+        // above succeeds yet leaves uid 0. Treat it as a hard error so the
+        // caller never reports "dropped privileges" while still root.
+        let euid = unsafe { libc::geteuid() };
+        if still_root_after_drop(self.uid, self.gid, self.chroot.is_some(), euid) {
+            return Err(Error::Config(
+                "privilege drop requested but process is still uid 0 (specify a non-root user)"
+                    .into(),
+            ));
+        }
+
         Ok(())
     }
+}
+
+/// Decide whether a completed drop left the process unsafely at root.
+///
+/// Returns `true` when a drop was *requested* (any of user/group/chroot set)
+/// but the resulting effective uid is still `0`, **unless** root was explicitly
+/// requested (`uid == Some(0)`). Factored out of the syscall path so it can be
+/// unit-tested without dropping real privileges.
+fn still_root_after_drop(
+    uid: Option<u32>,
+    gid: Option<u32>,
+    chroot: bool,
+    resulting_euid: u32,
+) -> bool {
+    let drop_requested = uid.is_some() || gid.is_some() || chroot;
+    let root_explicitly_requested = uid == Some(0);
+    drop_requested && resulting_euid == 0 && !root_explicitly_requested
 }
 
 /// Resolve a user spec component to `(uid, primary_gid)`. Numeric values parse
@@ -317,5 +360,32 @@ mod tests {
     fn parse_unknown_user_name_errors() {
         let r = PrivDrop::parse(Some("definitely-not-a-real-user-xyz"), None);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn still_root_group_or_chroot_only_is_error() {
+        // Group-only drop that leaves euid 0 is a still-root error.
+        assert!(still_root_after_drop(None, Some(2000), false, 0));
+        // Chroot-only drop that leaves euid 0 is a still-root error.
+        assert!(still_root_after_drop(None, None, true, 0));
+    }
+
+    #[test]
+    fn still_root_dropped_to_nonroot_is_ok() {
+        // A drop to a non-root uid that took effect is fine.
+        assert!(!still_root_after_drop(Some(1000), Some(2000), false, 1000));
+    }
+
+    #[test]
+    fn still_root_explicit_root_is_allowed() {
+        // Admin explicitly asked for uid 0 ("root"): not an error even at euid 0.
+        assert!(!still_root_after_drop(Some(0), Some(0), false, 0));
+        assert!(!still_root_after_drop(Some(0), None, true, 0));
+    }
+
+    #[test]
+    fn still_root_no_drop_requested_is_not_error() {
+        // Nothing was requested; euid 0 is just the status quo, not a failure.
+        assert!(!still_root_after_drop(None, None, false, 0));
     }
 }
