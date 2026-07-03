@@ -232,6 +232,13 @@ impl H3Conn {
         while pos < buf.len() {
             let (ty, p1) = read_varint(buf, pos).ok_or(())?;
             let (len, p2) = read_varint(buf, p1).ok_or(())?;
+            // `len` is a peer-controlled varint (up to 2^62-1); casting it to
+            // `usize` truncates on 32-bit targets and could wrap the bounds
+            // check. Reject anything that cannot fit the remaining buffer in
+            // u64 space before narrowing to `usize`.
+            if len > buf.len() as u64 {
+                return Err(()); // truncated frame on a finished stream
+            }
             let end = p2.checked_add(len as usize).ok_or(())?;
             if end > buf.len() {
                 return Err(()); // truncated frame on a finished stream
@@ -250,6 +257,13 @@ impl H3Conn {
         }
 
         let block = header_block.ok_or(())?;
+        // Enforce the SETTINGS_MAX_FIELD_SECTION_SIZE we advertised: reject an
+        // over-large HEADERS block before decoding it (the caller turns this
+        // into an H3_MESSAGE_ERROR stream reset). This bounds decode work and
+        // honors the limit we told the peer about.
+        if block.len() > self.limits.max_header_bytes {
+            return Err(());
+        }
         let fields = self
             .qpack_dec
             .decode_field_section(&block)
@@ -472,5 +486,25 @@ mod tests {
         assert_eq!(ty, FRAME_HEADERS);
         assert_eq!(len, 3);
         assert_eq!(&out[p2..], b"abc");
+    }
+
+    // A HEADERS block larger than the advertised SETTINGS_MAX_FIELD_SECTION_SIZE
+    // must be rejected before decoding, so the caller can reset the stream with
+    // H3_MESSAGE_ERROR. `parse_request` takes only `&mut self` and `&[u8]`, so
+    // this exercises the limit without constructing a QUIC connection.
+    #[test]
+    fn oversized_header_block_rejected() {
+        let limits = Limits {
+            max_header_bytes: 64,
+            max_body_bytes: 16 * 1024 * 1024,
+        };
+        let mut h3 = H3Conn::new(limits, None);
+        // HEADERS frame whose payload is one byte over the limit. The payload
+        // bytes are never decoded (we reject on length first), so any content
+        // works.
+        let payload = vec![0u8; limits.max_header_bytes + 1];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, FRAME_HEADERS, &payload);
+        assert!(h3.parse_request(&buf).is_err());
     }
 }
