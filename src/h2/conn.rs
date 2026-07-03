@@ -33,7 +33,23 @@ const MAX_CONTINUATION_FRAMES: u32 = 16;
 const MAX_HPACK_TABLE_SIZE: usize = 64 * 1024;
 /// Rapid-reset (CVE-2023-44487) heuristic: only start scrutinizing the
 /// reset:completed ratio once the peer has reset at least this many streams.
+/// This is an early tripwire; the absolute cap below catches low-rate churn.
 const RST_FLOOD_MIN: u64 = 100;
+/// Rapid-reset absolute cap: a hard bound on the number of streams the peer may
+/// abandon (reset or GOAWAY-orphaned) without a corresponding completed request,
+/// independent of how many requests it interleaves. Every abandoned stream costs
+/// us a full HPACK decode + per-stream allocation, so once this many streams have
+/// been reset-before-response AND resets still outpace completions, the peer is
+/// churning streams and we tear the connection down. Chosen well above any sane
+/// concurrent-stream count (128) so legitimate clients never approach it.
+const RST_ABSOLUTE_CAP: u64 = 500;
+/// Control-frame flood cap: the maximum number of SETTINGS-ACK + PING-ACK
+/// responses we will queue into `outbuf` within a single `received()` parse
+/// pass. A peer that streams tiny SETTINGS/PING frames would otherwise force us
+/// to queue one ACK/PONG each into an unbounded buffer; past this bound the peer
+/// is flooding and we tear the connection down. A few hundred comfortably covers
+/// legitimate settings/keep-alive traffic in one pass.
+const MAX_CONTROL_ACKS_PER_PASS: u32 = 256;
 /// The largest receive flow-control window value permitted (RFC 9113 §6.9.1).
 const MAX_WINDOW: i64 = 0x7fff_ffff;
 
@@ -119,6 +135,15 @@ pub struct H2Conn {
     // Rapid-reset (CVE-2023-44487) accounting.
     peer_resets: u64,
     completed: u64,
+    /// Total streams the peer has opened over the connection lifetime
+    /// (monotonic; incremented once per new peer-initiated stream in `on_headers`).
+    streams_opened: u64,
+    /// Streams that were reset or orphaned (removed) before we delivered/answered
+    /// them — the "reset-before-response" churn the absolute cap bounds.
+    reset_before_response: u64,
+    /// Control-frame ACK/PONG responses queued in the current `received()` pass
+    /// (reset at the top of each pass; guarded by `MAX_CONTROL_ACKS_PER_PASS`).
+    control_acks_this_pass: u32,
 
     streams: BTreeMap<u32, Stream>,
     last_peer_stream: u32,
@@ -151,6 +176,9 @@ impl H2Conn {
             enc_table_size: DEFAULT_TABLE_SIZE,
             peer_resets: 0,
             completed: 0,
+            streams_opened: 0,
+            reset_before_response: 0,
+            control_acks_this_pass: 0,
             streams: BTreeMap::new(),
             last_peer_stream: 0,
             ready: std::collections::VecDeque::new(),
@@ -214,6 +242,13 @@ impl H2Conn {
                 (settings::MAX_CONCURRENT_STREAMS, MAX_CONCURRENT_STREAMS),
                 (settings::INITIAL_WINDOW_SIZE, OUR_WINDOW),
                 (settings::MAX_FRAME_SIZE, OUR_MAX_FRAME as u32),
+                // Advertise the decoded-header-list bound so conforming peers
+                // never send a header list that expands past our limit. We also
+                // enforce it after HPACK decode (an expansion bomb ignores this).
+                (
+                    settings::MAX_HEADER_LIST_SIZE,
+                    self.limits.max_header_bytes as u32,
+                ),
             ],
         );
         // Raise the connection-level receive window from the 65535 default.
@@ -222,6 +257,8 @@ impl H2Conn {
     }
 
     fn parse_frames(&mut self) {
+        // Per-pass control-ack flood accounting is reset for each parse pass.
+        self.control_acks_this_pass = 0;
         while !self.closed && self.inbuf.len() >= 9 {
             let header = FrameHeader::parse(&self.inbuf[..9]);
             if header.length > OUR_MAX_FRAME {
@@ -250,14 +287,37 @@ impl H2Conn {
                 ftype::CONTINUATION => self.on_continuation(&header, &payload),
                 ftype::DATA => self.on_data(&header, &payload),
                 ftype::RST_STREAM => {
-                    if self.streams.remove(&header.stream_id).is_some() {
+                    if let Some(s) = self.streams.remove(&header.stream_id) {
                         self.pending_heads.remove(&header.stream_id);
                         self.peer_resets += 1;
+                        // A stream reset before we ever delivered/answered it is
+                        // pure churn: we did a full HPACK decode + allocation for
+                        // work the peer threw away. Count it toward the absolute
+                        // cap below.
+                        if !s.delivered {
+                            self.reset_before_response += 1;
+                        }
                         // Rapid Reset (CVE-2023-44487): a peer that opens streams
                         // and immediately resets them does cheap-for-it,
-                        // expensive-for-us work. Once resets dominate completed
-                        // requests, tear the connection down.
+                        // expensive-for-us work.
+                        //
+                        // Early tripwire: once resets dominate completed requests
+                        // (and there are enough of them to be meaningful), close.
+                        // This catches high-rate bursts quickly.
                         if self.peer_resets > RST_FLOOD_MIN && self.peer_resets > 2 * self.completed
+                        {
+                            self.conn_error(errcode::ENHANCE_YOUR_CALM);
+                            return;
+                        }
+                        // Absolute cap: the ratio above scales the allowed reset
+                        // budget with `completed`, so a peer that interleaves a
+                        // trickle of real requests (or uses "complete-then-reset")
+                        // can churn streams unboundedly without ever tripping it.
+                        // Independently bound total reset-before-response churn: if
+                        // it crosses a fixed hard cap while still outpacing
+                        // completions, the peer is abusing the connection.
+                        if self.reset_before_response > RST_ABSOLUTE_CAP
+                            && self.reset_before_response > self.completed
                         {
                             self.conn_error(errcode::ENHANCE_YOUR_CALM);
                             return;
@@ -292,8 +352,19 @@ impl H2Conn {
                     }
                     let delta = value as i64 - self.peer_initial_window;
                     self.peer_initial_window = value as i64;
+                    // Applying the delta must not push any stream's send window
+                    // past 2^31-1. Unlike WINDOW_UPDATE this is a CONNECTION-level
+                    // FLOW_CONTROL_ERROR (RFC 9113 §6.9.2).
+                    let mut overflow = false;
                     for s in self.streams.values_mut() {
                         s.send_window += delta;
+                        if s.send_window > MAX_WINDOW {
+                            overflow = true;
+                        }
+                    }
+                    if overflow {
+                        self.conn_error(errcode::FLOW_CONTROL_ERROR);
+                        return;
                     }
                 }
                 settings::MAX_FRAME_SIZE => {
@@ -313,6 +384,7 @@ impl H2Conn {
             }
         }
         frame::write_settings_ack(&mut self.outbuf);
+        self.note_control_ack();
     }
 
     fn on_window_update(&mut self, header: &FrameHeader, payload: &[u8]) {
@@ -353,6 +425,19 @@ impl H2Conn {
             return;
         }
         frame::write_frame(&mut self.outbuf, ftype::PING, flag::ACK, 0, payload);
+        self.note_control_ack();
+    }
+
+    /// Account for one control-frame ACK/PONG queued into `outbuf` this parse
+    /// pass. A peer flooding tiny SETTINGS/PING frames would otherwise force us to
+    /// queue an unbounded number of ACKs in a single `received()` call; past the
+    /// per-pass cap the peer is flooding and we tear the connection down
+    /// (control-frame-flood guard, RFC 9113 §5.5 / CVE-2019-9512/9515 class).
+    fn note_control_ack(&mut self) {
+        self.control_acks_this_pass += 1;
+        if self.control_acks_this_pass > MAX_CONTROL_ACKS_PER_PASS {
+            self.conn_error(errcode::ENHANCE_YOUR_CALM);
+        }
     }
 
     fn on_headers(&mut self, header: &FrameHeader, payload: &[u8]) {
@@ -374,12 +459,34 @@ impl H2Conn {
             block = &block[5..];
         }
 
+        // HEADERS arriving on a stream that already received END_STREAM
+        // (half-closed(remote)) or was already delivered is a violation
+        // (RFC 9113 §5.1): trailers may not follow END_STREAM, and a delivered
+        // stream must not reopen. Reset it rather than appending to its
+        // header_block (which would grow unbounded and could re-trigger a
+        // decode). STREAM_CLOSED is error code 0x5 (RFC 9113 §7); there is no
+        // named constant for it in `frame::errcode`, which we may not modify.
+        const STREAM_CLOSED: u32 = 0x5;
+        if let Some(s) = self.streams.get(&sid)
+            && (s.end_stream_recv || s.delivered)
+        {
+            frame::write_rst_stream(&mut self.outbuf, sid, STREAM_CLOSED);
+            if self.streams.remove(&sid).is_some_and(|s| !s.delivered) {
+                self.reset_before_response += 1;
+            }
+            self.pending_heads.remove(&sid);
+            return;
+        }
+
         if !self.streams.contains_key(&sid) {
             if sid <= self.last_peer_stream {
                 self.conn_error(errcode::PROTOCOL_ERROR);
                 return;
             }
             self.last_peer_stream = sid;
+            // Monotonic count of peer-initiated streams over the connection's
+            // lifetime (rapid-reset absolute-cap accounting).
+            self.streams_opened += 1;
             // Enforce MAX_CONCURRENT_STREAMS (RFC 9113 §5.1.2). We still accept
             // the stream so its header block can be fed to the HPACK decoder
             // (skipping it would desync the connection's compression state), but
@@ -467,6 +574,26 @@ impl H2Conn {
             }
         };
 
+        // Decoded-header-list bound (HPACK expansion-bomb guard): the compressed
+        // block was capped by `max_header_bytes`, but HPACK can expand a tiny
+        // block (e.g. repeated dynamic-table references) into a huge field list.
+        // Size the DECODED list using the RFC 9113 §6.5.2 accounting (name + value
+        // + 32 bytes of per-field overhead) and reject if it exceeds our limit,
+        // WITHOUT building a request. HPACK has already stayed in sync (we decoded
+        // the whole block), so a per-stream RST_STREAM suffices.
+        let list_size: usize = fields
+            .iter()
+            .map(|f| f.name.len() + f.value.len() + 32)
+            .sum();
+        if list_size > self.limits.max_header_bytes {
+            frame::write_rst_stream(&mut self.outbuf, sid, errcode::ENHANCE_YOUR_CALM);
+            if self.streams.remove(&sid).is_some_and(|s| !s.delivered) {
+                self.reset_before_response += 1;
+            }
+            self.pending_heads.remove(&sid);
+            return;
+        }
+
         // Over the concurrency cap: the block has now been decoded (HPACK stays
         // in sync), so refuse the stream without delivering it.
         if self.streams.get(&sid).is_some_and(|s| s.refused) {
@@ -512,6 +639,31 @@ impl H2Conn {
         };
         // Whole DATA frame (including padding) counts against flow control.
         let counted = payload.len() as u32;
+
+        // DATA on a stream that already received END_STREAM (half-closed(remote))
+        // or was already delivered is a protocol violation (RFC 9113 §5.1): the
+        // peer must not send more DATA. Do NOT buffer it or refund flow-control
+        // credit (that would let a peer keep a delivered stream alive and grow
+        // `body` unbounded). Reset the stream with STREAM_CLOSED and drop it.
+        // Connection-level credit for the octets is still returned below so
+        // connection flow control stays consistent.
+        //
+        // STREAM_CLOSED is error code 0x5 (RFC 9113 §7); there is no named
+        // constant for it in `frame::errcode`, which we may not modify here.
+        const STREAM_CLOSED: u32 = 0x5;
+        if let Some(s) = self.streams.get(&sid)
+            && (s.end_stream_recv || s.delivered)
+        {
+            frame::write_rst_stream(&mut self.outbuf, sid, STREAM_CLOSED);
+            if self.streams.remove(&sid).is_some_and(|s| !s.delivered) {
+                self.reset_before_response += 1;
+            }
+            self.pending_heads.remove(&sid);
+            if counted > 0 {
+                frame::write_window_update(&mut self.outbuf, 0, counted);
+            }
+            return;
+        }
 
         let over_limit = match self.streams.get_mut(&sid) {
             Some(s) => {
@@ -1078,6 +1230,229 @@ mod tests {
         assert_eq!(
             frame_code(&c.take_out(), ftype::GOAWAY, 0),
             Some(errcode::FLOW_CONTROL_ERROR)
+        );
+    }
+
+    /// STREAM_CLOSED is error code 0x5 (RFC 9113 §7); mirror the constant used in
+    /// the non-test code (which cannot add it to `frame::errcode`).
+    const STREAM_CLOSED: u32 = 0x5;
+
+    fn req_fields(path: &'static [u8]) -> Vec<HeaderField> {
+        vec![
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(b":scheme", b"https"),
+            HeaderField::new(b":authority", b"a"),
+            HeaderField::new(b":path", path),
+        ]
+    }
+
+    /// Finding 2: an HPACK expansion bomb (small compressed block that decodes to
+    /// a header list exceeding `max_header_bytes`) is rejected with RST_STREAM,
+    /// without a request ever being delivered, and without killing the connection.
+    #[test]
+    fn header_list_size_bomb_is_rejected() {
+        let limits = Limits {
+            max_header_bytes: 1024,
+            max_body_bytes: 1 << 20,
+        };
+        let mut c = H2Conn::new(limits, None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+
+        // Build a valid request whose DECODED header list far exceeds 1024 bytes
+        // (each field also carries 32 bytes of accounting overhead) while the
+        // compressed block stays small enough to pass the pre-decode block cap.
+        let mut fields = req_fields(b"/");
+        let big_value = vec![b'x'; 64];
+        for _ in 0..64 {
+            fields.push(HeaderField::new(b"x-pad", &big_value));
+        }
+        let block = enc.encode(&fields);
+        assert!(
+            block.len() <= 1024,
+            "compressed block must be under the pre-decode cap for this test to exercise the post-decode check"
+        );
+        frame::write_frame(
+            &mut wire,
+            ftype::HEADERS,
+            flag::END_HEADERS | flag::END_STREAM,
+            1,
+            &block,
+        );
+        c.received(&wire);
+
+        assert!(
+            !c.wants_close(),
+            "header-list bomb must reset the stream, not kill the connection"
+        );
+        assert!(
+            c.poll_request().is_none(),
+            "no request must be delivered for an over-large header list"
+        );
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::RST_STREAM, 1),
+            Some(errcode::ENHANCE_YOUR_CALM)
+        );
+    }
+
+    /// Finding 3: DATA arriving after END_STREAM (half-closed(remote)) is reset
+    /// with STREAM_CLOSED and not buffered.
+    #[test]
+    fn data_after_end_stream_is_stream_closed() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        // A complete GET (END_STREAM on HEADERS) — stream is half-closed(remote).
+        wire.extend_from_slice(&client_request(&mut enc, 1, &req_fields(b"/"), None));
+        // Then an illegal DATA frame on that same stream.
+        frame::write_frame(&mut wire, ftype::DATA, flag::END_STREAM, 1, b"late-bytes");
+        c.received(&wire);
+
+        assert!(!c.wants_close(), "stray DATA must not kill the connection");
+        // The request is still delivered (the DATA arrived after it completed).
+        let (sid, _req) = c.poll_request().expect("request delivered");
+        assert_eq!(sid, 1);
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::RST_STREAM, 1),
+            Some(STREAM_CLOSED)
+        );
+    }
+
+    /// Finding 5: an INITIAL_WINDOW_SIZE delta that pushes an existing stream's
+    /// send window past 2^31-1 is a connection-level FLOW_CONTROL_ERROR.
+    #[test]
+    fn initial_window_size_overflow_is_flow_control_error() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        // Open a stream awaiting a response (POST with body) so it stays in
+        // `streams` with a send window that later SETTINGS can bump.
+        wire.extend_from_slice(&client_request(
+            &mut enc,
+            1,
+            &[
+                HeaderField::new(b":method", b"POST"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"a"),
+                HeaderField::new(b":path", b"/u"),
+            ],
+            Some(b"x"),
+        ));
+        // Push the stream's send window above the initial baseline so that a
+        // subsequent INITIAL_WINDOW_SIZE = 2^31-1 delta overflows it.
+        frame::write_window_update(&mut wire, 1, 1000);
+        c.received(&wire);
+        // Drain the delivered request so the stream lingers awaiting a response.
+        let _ = c.poll_request();
+        assert!(!c.wants_close(), "setup must not close the connection");
+
+        // Now send SETTINGS raising INITIAL_WINDOW_SIZE to the maximum; the delta
+        // added to the stream's already-boosted window overflows 2^31-1.
+        let mut wire2 = Vec::new();
+        frame::write_settings(&mut wire2, &[(settings::INITIAL_WINDOW_SIZE, 0x7fff_ffff)]);
+        c.received(&wire2);
+
+        assert!(c.wants_close());
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::GOAWAY, 0),
+            Some(errcode::FLOW_CONTROL_ERROR)
+        );
+    }
+
+    /// Finding 4: a flood of tiny PING frames in one pass trips ENHANCE_YOUR_CALM
+    /// rather than queuing an unbounded number of PONGs into `outbuf`.
+    #[test]
+    fn ping_flood_trips_enhance_your_calm() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        // Well past MAX_CONTROL_ACKS_PER_PASS PINGs in a single received() pass.
+        for _ in 0..(MAX_CONTROL_ACKS_PER_PASS + 50) {
+            frame::write_frame(&mut wire, ftype::PING, 0, 0, b"12345678");
+        }
+        c.received(&wire);
+
+        assert!(c.wants_close());
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::GOAWAY, 0),
+            Some(errcode::ENHANCE_YOUR_CALM)
+        );
+    }
+
+    /// Finding 1: reset-before-response churn that deliberately stays UNDER the
+    /// ratio tripwire (by interleaving enough completed requests that
+    /// `peer_resets <= 2*completed` throughout) still trips the absolute cap.
+    /// This is the case the ratio-only heuristic missed.
+    #[test]
+    fn rapid_reset_absolute_cap_defeats_ratio_evasion() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut preface = Vec::new();
+        preface.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut preface, &[]);
+        c.received(&preface);
+
+        // Each round: complete 2 real requests, then open-and-reset 3 streams.
+        // Over the run peer_resets = 1.5 * completed, so `peer_resets > 2*completed`
+        // (the ratio tripwire) is NEVER true — only the absolute cap can catch
+        // this. Run enough rounds to push reset_before_response past
+        // RST_ABSOLUTE_CAP (3 resets/round → need > 500/3 ≈ 167 rounds; do 250).
+        // Feed and drain per round so the completed requests don't overflow the
+        // undrained `ready` queue (an unrelated ENHANCE_YOUR_CALM path).
+        let mut next_sid = 1u32;
+        for _ in 0..250 {
+            let mut wire = Vec::new();
+            for _ in 0..2 {
+                // A complete request (END_STREAM on HEADERS) → counts as completed.
+                wire.extend_from_slice(&client_request(
+                    &mut enc,
+                    next_sid,
+                    &req_fields(b"/"),
+                    None,
+                ));
+                next_sid += 2;
+            }
+            for _ in 0..3 {
+                // Open a stream (HEADERS *without* END_STREAM, so it is not
+                // delivered) then immediately reset it → reset-before-response.
+                let block = enc.encode(&req_fields(b"/"));
+                frame::write_frame(
+                    &mut wire,
+                    ftype::HEADERS,
+                    flag::END_HEADERS,
+                    next_sid,
+                    &block,
+                );
+                frame::write_rst_stream(&mut wire, next_sid, errcode::NO_ERROR);
+                next_sid += 2;
+            }
+            c.received(&wire);
+            if c.wants_close() {
+                break;
+            }
+            // Drain AND respond to delivered requests so they retire out of the
+            // `streams` map (otherwise 128 undrained delivered streams would hit
+            // the concurrency cap and stop `completed` from growing).
+            while let Some((sid, _req)) = c.poll_request() {
+                c.respond(sid, Response::text("ok"));
+                let _ = c.take_out();
+            }
+        }
+
+        assert!(
+            c.wants_close(),
+            "ratio-evading reset churn must still be torn down by the absolute cap"
+        );
+        assert_eq!(
+            frame_code(&c.take_out(), ftype::GOAWAY, 0),
+            Some(errcode::ENHANCE_YOUR_CALM)
         );
     }
 }
