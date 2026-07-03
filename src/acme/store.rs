@@ -164,15 +164,53 @@ fn write_public(path: &Path, data: &[u8]) -> Result<()> {
 
 fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // A per-call unique, hard-to-predict temp name in the *same* directory as the
+    // target (so `rename` stays atomic). There is no random source here, so we
+    // combine the pid with a process-wide counter. The name must vary across
+    // retries because we create the file with O_EXCL below.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!("{file_name}.{}.{n}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        // Create the temp file atomically with the target mode and O_EXCL, so a
+        // private key never exists on disk with a wider mode even briefly, and so
+        // an existing symlink at `tmp` is refused rather than followed.
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true) // O_EXCL: refuse to follow/overwrite an existing path
+                .mode(mode)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+
+        // `mode` above is still masked by umask, so force the exact bits.
         set_mode(&tmp, mode)?;
         f.write_all(data)?;
         f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+
+    // On any error, best-effort remove the temp file so a later O_EXCL create
+    // with the same name isn't wedged by a stale leftover.
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    result
 }
 
 #[cfg(unix)]
@@ -246,5 +284,48 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cert_chain_is_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Store::open(Some(tmpdir("perm-pub"))).unwrap();
+        s.save_cert("example.com", "CHAIN", "KEY").unwrap();
+        let dir = s.host_dir("example.com").unwrap();
+        let chain_mode = std::fs::metadata(dir.join("fullchain.pem"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let key_mode = std::fs::metadata(dir.join("key.pem"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(chain_mode, 0o644);
+        assert_eq!(key_mode, 0o600);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp() {
+        // A successful write must clean up after itself (the tmp file is renamed
+        // into place, not left behind), and repeated writes must keep working —
+        // O_EXCL with a stale leftover would otherwise wedge the second write.
+        let base = tmpdir("atomic");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("account.key");
+        atomic_write(&target, b"one", 0o600).unwrap();
+        atomic_write(&target, b"two", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "two");
+        let leftovers: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stale tmp files left behind: {leftovers:?}"
+        );
     }
 }
