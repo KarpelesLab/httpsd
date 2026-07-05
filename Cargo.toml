@@ -20,7 +20,7 @@ required-features = ["cli"]
 [features]
 # The default build is a complete, self-contained HTTPS server CLI: a worker
 # thread pool, TLS, HTTP/2, response compression, and TOML config loading.
-default = ["cli", "rt-threadpool", "tls", "compress", "h2", "h3", "router"]
+default = ["cli", "rt-threadpool", "tls", "compress", "h2", "h3", "router", "hardened-fs"]
 
 # TLS / HTTPS support, built on the sans-I/O `purecrypto::tls` engine.
 tls = ["dep:purecrypto"]
@@ -44,6 +44,11 @@ router = []
 # Unix only; needs `libc` for the syscalls. Pulled into `cli` so the default
 # binary can `--user`/`--chroot`.
 privdrop = ["dep:libc"]
+# Race-free confined file opening beneath the static-file root via
+# `openat2(RESOLVE_BENEATH)` on Linux; no-op fallback elsewhere. Closes a
+# static-file TOCTOU/symlink-escape window by making open+confinement a single
+# atomic syscall. Reuses the (already optional) `libc` dependency.
+hardened-fs = ["dep:libc"]
 # Interop with the `http` crate: `From`/`TryFrom` conversions between httpsd's
 # `Method`/`StatusCode`/`Version`/`Headers`/`Request`/`Response` and the
 # ecosystem-standard `http` types (and `IntoResponse for http::Response` when

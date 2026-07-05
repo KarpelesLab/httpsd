@@ -36,12 +36,17 @@
 //! - `cli` — build the `httpsd` binary.
 //! - `rt-threadpool` (default), `rt-tokio`, `rt-mio` — runtime drivers.
 
-// The crate is unsafe-free except for the optional `privdrop` module, whose
-// privilege-dropping syscalls (setuid/setgid/chroot via libc) require `unsafe`.
-// When that feature is off we keep the hard `forbid`; when it is on we downgrade
-// to `deny` so the single module can opt back in with a scoped `allow`.
-#![cfg_attr(not(feature = "privdrop"), forbid(unsafe_code))]
-#![cfg_attr(feature = "privdrop", deny(unsafe_code))]
+// The crate is unsafe-free except for two optional modules that need `unsafe`
+// for libc syscalls: the `privdrop` module (setuid/setgid/chroot) and the
+// `hardened-fs` confined-open module (`openat2(RESOLVE_BENEATH)` in
+// `static_files`). When neither feature is on we keep the hard `forbid`; when
+// either is on we downgrade to `deny` so those scoped modules can opt back in
+// with a local `allow`.
+#![cfg_attr(
+    not(any(feature = "privdrop", feature = "hardened-fs")),
+    forbid(unsafe_code)
+)]
+#![cfg_attr(any(feature = "privdrop", feature = "hardened-fs"), deny(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod error;
