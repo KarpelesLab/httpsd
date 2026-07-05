@@ -105,6 +105,7 @@ OPTIONS:
         --tls-key FILE      PEM private key
         --self-signed[=H]   generate a self-signed certificate (default host localhost)
         --workers N         number of worker threads
+        --max-conns-per-ip N  cap concurrent connections per client IP (0 = unlimited)
         --no-http3          do not serve HTTP/3 (on by default with a TLS cert)
         --http ADDR         also bind a plain-HTTP listener for redirects + ACME HTTP-01
         --allow-http        serve content over HTTP instead of redirecting to HTTPS
@@ -135,6 +136,7 @@ struct Options {
     tls_key: Option<String>,
     self_signed: Option<String>,
     workers: Option<usize>,
+    max_conns_per_ip: Option<u32>,
     no_http3: bool,
     no_compress: bool,
     allow_http: bool,
@@ -166,6 +168,7 @@ impl Options {
             tls_key: None,
             self_signed: None,
             workers: None,
+            max_conns_per_ip: None,
             no_http3: false,
             no_compress: false,
             allow_http: false,
@@ -205,6 +208,13 @@ impl Options {
                 "--workers" => {
                     let v = take_value(args, &mut i, arg)?;
                     opts.workers = Some(v.parse().map_err(|_| format!("invalid --workers: {v}"))?);
+                }
+                "--max-conns-per-ip" => {
+                    let v = take_value(args, &mut i, arg)?;
+                    opts.max_conns_per_ip = Some(
+                        v.parse()
+                            .map_err(|_| format!("invalid --max-conns-per-ip: {v}"))?,
+                    );
                 }
                 "--no-compress" => opts.no_compress = true,
                 "--allow-http" => opts.allow_http = true,
@@ -273,6 +283,9 @@ impl Options {
         let mut server = Server::bind(self.listen.as_str())?.serve_dir(self.dir.clone());
         if let Some(workers) = self.workers {
             server = server.workers(workers);
+        }
+        if let Some(n) = self.max_conns_per_ip {
+            server = server.max_conns_per_ip(n);
         }
         if self.no_server_header {
             server = server.server_name(None);

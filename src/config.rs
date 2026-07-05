@@ -168,6 +168,10 @@ pub struct ServerConfig {
     pub no_server_header: bool,
     /// Worker thread count (thread-pool runtime).
     pub workers: Option<usize>,
+    /// Cap on concurrent connections from a single client IP (0 = unlimited,
+    /// the default). Bounds any single source's share of the connection budget.
+    #[serde(default)]
+    pub max_conns_per_ip: Option<u32>,
     /// TLS settings.
     pub tls: Option<TlsConfig>,
     /// Compression settings.
@@ -255,6 +259,9 @@ impl ServerConfig {
         }
         if let Some(workers) = self.workers {
             server = server.workers(workers);
+        }
+        if let Some(n) = self.max_conns_per_ip {
+            server = server.max_conns_per_ip(n);
         }
         if self.no_server_header {
             server = server.server_name(None);
