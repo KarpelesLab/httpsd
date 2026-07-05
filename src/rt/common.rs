@@ -1,12 +1,68 @@
 //! Pieces shared across the blocking runtimes.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::sync::Mutex;
+use std::net::{IpAddr, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::session::Session;
+
+/// Bounds concurrent connections per client IP so one source cannot consume the
+/// whole global connection budget. A `max_per_ip` of 0 disables limiting.
+pub(crate) struct PeerLimiter {
+    counts: Mutex<HashMap<IpAddr, u32>>,
+    max_per_ip: u32,
+}
+
+impl PeerLimiter {
+    pub(crate) fn new(max_per_ip: u32) -> Arc<PeerLimiter> {
+        Arc::new(PeerLimiter {
+            counts: Mutex::new(HashMap::new()),
+            max_per_ip,
+        })
+    }
+
+    /// Admit a connection from `ip`. `ip == None` (peer address unavailable)
+    /// always admits — it cannot be attributed, so the global caps govern it.
+    /// Returns a guard that releases the slot on drop, or `None` when `ip` is at
+    /// the per-IP cap (caller must drop the connection).
+    pub(crate) fn admit(self: &Arc<Self>, ip: Option<IpAddr>) -> Option<PeerGuard> {
+        let Some(ip) = ip.filter(|_| self.max_per_ip > 0) else {
+            return Some(PeerGuard { limiter: None });
+        };
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = counts.entry(ip).or_insert(0);
+        if *slot >= self.max_per_ip {
+            return None;
+        }
+        *slot += 1;
+        Some(PeerGuard {
+            limiter: Some((Arc::clone(self), ip)),
+        })
+    }
+}
+
+/// Releases a per-IP connection slot when dropped. A `None` limiter is a no-op
+/// guard (limiting disabled or peer unattributable).
+pub(crate) struct PeerGuard {
+    limiter: Option<(Arc<PeerLimiter>, IpAddr)>,
+}
+
+impl Drop for PeerGuard {
+    fn drop(&mut self) {
+        if let Some((limiter, ip)) = &self.limiter {
+            let mut counts = limiter.counts.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = counts.get_mut(ip) {
+                *slot -= 1;
+                if *slot == 0 {
+                    counts.remove(ip); // don't leak entries for departed IPs
+                }
+            }
+        }
+    }
+}
 
 /// Read buffer size used by the blocking drive loop.
 pub(crate) const READ_BUF: usize = 16 * 1024;
@@ -166,4 +222,61 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerLimiter;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(n: u8) -> Option<IpAddr> {
+        Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    }
+
+    #[test]
+    fn caps_per_ip_and_releases_on_drop() {
+        let limiter = PeerLimiter::new(2);
+
+        // A cap of 2 admits two connections from the same IP...
+        let g1 = limiter.admit(ip(1)).expect("first admits");
+        let g2 = limiter.admit(ip(1)).expect("second admits");
+        // ...then rejects the third.
+        assert!(limiter.admit(ip(1)).is_none(), "third is over the cap");
+
+        // A different IP is unaffected by the first IP's usage.
+        let other = limiter.admit(ip(2)).expect("distinct IP admits");
+
+        // Dropping a guard frees a slot for that IP.
+        drop(g1);
+        let g3 = limiter.admit(ip(1)).expect("freed slot re-admits");
+
+        drop((g2, g3, other));
+
+        // The map does not retain zero-count entries: once every guard for an IP
+        // is dropped, admitting again must start from a fresh count.
+        assert!(
+            limiter.counts.lock().unwrap().is_empty(),
+            "no zero-count entries retained after all guards drop"
+        );
+    }
+
+    #[test]
+    fn cap_zero_always_admits() {
+        let limiter = PeerLimiter::new(0);
+        // Unlimited: many connections from one IP all admit, and no entries are
+        // tracked at all.
+        let guards: Vec<_> = (0..100).map(|_| limiter.admit(ip(1)).unwrap()).collect();
+        assert_eq!(guards.len(), 100);
+        assert!(limiter.counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn none_ip_always_admits() {
+        let limiter = PeerLimiter::new(1);
+        // An unattributable peer (no address) always admits, even past the cap,
+        // and is not recorded in the map.
+        let _a = limiter.admit(None).expect("None admits");
+        let _b = limiter.admit(None).expect("None admits again");
+        assert!(limiter.counts.lock().unwrap().is_empty());
+    }
 }
