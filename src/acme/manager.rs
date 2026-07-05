@@ -185,6 +185,17 @@ impl AcmeManager {
         self.inner.self_signed.clone()
     }
 
+    /// Drop all in-memory cached certificates (and any negative-cache entries) so
+    /// the next connection re-reads certificates from disk (or re-issues). Used to
+    /// pick up a renewed/replaced certificate without a restart.
+    pub fn reload(&self) {
+        *self.inner.cache.lock().unwrap() = CertCache::new();
+        // Clear the negative/failure cache too, so a host that failed to issue
+        // before is retried immediately after an operator-triggered reload rather
+        // than staying in its cooldown.
+        self.inner.failures.lock().unwrap().clear();
+    }
+
     /// The TLS-ALPN-01 challenge acceptor for `host`, if a validation is in
     /// progress. The TLS router uses this when the ClientHello offers
     /// `acme-tls/1`.
@@ -726,6 +737,49 @@ mod tests {
     #[test]
     fn normalize_host() {
         assert_eq!(normalize(" Example.COM. "), "example.com");
+    }
+
+    #[test]
+    fn reload_empties_the_cache_and_failures() {
+        let dir = std::env::temp_dir().join(format!("httpsd-acme-reload-{}", std::process::id()));
+        let mgr = AcmeManager::new(AcmeConfig {
+            cert_dir: Some(dir.clone()),
+            ..Default::default()
+        })
+        .expect("manager");
+
+        // Seed the success cache and the negative-cache directly.
+        mgr.cache_put("example.test", mgr.self_signed(), Some(now_secs() + 86_400));
+        mgr.record_failure("bad.test", now_secs());
+        assert!(
+            mgr.inner
+                .cache
+                .lock()
+                .unwrap()
+                .get("example.test")
+                .is_some()
+        );
+        assert!(!mgr.inner.failures.lock().unwrap().is_empty());
+
+        mgr.reload();
+
+        // Both caches are now empty: the success entry misses and the failure is
+        // cleared (so the host is retryable immediately).
+        assert!(
+            mgr.inner
+                .cache
+                .lock()
+                .unwrap()
+                .get("example.test")
+                .is_none(),
+            "cache must be empty after reload"
+        );
+        assert!(
+            mgr.inner.failures.lock().unwrap().is_empty(),
+            "failure cache must be empty after reload"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
