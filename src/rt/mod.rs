@@ -26,6 +26,9 @@ pub(crate) mod common;
 pub(crate) mod redirect;
 #[cfg(feature = "acme")]
 pub(crate) mod route;
+pub(crate) mod shutdown;
+
+pub use shutdown::Shutdown;
 
 #[cfg(feature = "rt-mio")]
 mod mio;
@@ -89,6 +92,10 @@ pub struct Server {
     /// [`notify_bound`](Server::notify_bound).
     #[cfg(any(feature = "rt-threadpool", feature = "h3"))]
     ready_tx: Option<std::sync::mpsc::Sender<()>>,
+    /// Optional graceful-shutdown handle. When triggered, the runtime stops
+    /// accepting, drains in-flight connections (bounded by a grace period), and
+    /// returns from `run*`. `None` preserves the run-forever behavior.
+    shutdown: Option<Shutdown>,
 }
 
 impl Server {
@@ -116,6 +123,7 @@ impl Server {
             acme: None,
             #[cfg(any(feature = "rt-threadpool", feature = "h3"))]
             ready_tx: None,
+            shutdown: None,
         })
     }
 
@@ -222,6 +230,13 @@ impl Server {
         self
     }
 
+    /// Install a [`Shutdown`] handle. When triggered, `run*` stops accepting,
+    /// drains in-flight connections (up to a grace period), and returns `Ok(())`.
+    pub fn graceful(mut self, shutdown: Shutdown) -> Server {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
     /// Build the shared session configuration.
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
@@ -271,12 +286,16 @@ impl Server {
         let cfg = self.session_config();
         let tls_mode = self.tls_mode();
         let limiter = common::PeerLimiter::new(self.max_conns_per_ip);
+        let shutdown = self.shutdown.clone().unwrap_or_default();
 
         if !self.http_addrs.is_empty() {
             let http = std::net::TcpListener::bind(self.http_addrs.as_slice())?;
             let ctx = self.http_ctx();
             let redirect_limiter = Arc::clone(&limiter);
-            std::thread::spawn(move || threadpool::run_http_redirect(http, ctx, redirect_limiter));
+            let redirect_shutdown = shutdown.clone();
+            std::thread::spawn(move || {
+                threadpool::run_http_redirect(http, ctx, redirect_limiter, redirect_shutdown)
+            });
         }
 
         // Both the main listener and (if any) the redirect listener are now
@@ -289,6 +308,7 @@ impl Server {
             self.workers,
             limiter,
             self.ready_tx,
+            shutdown,
         )
     }
 
@@ -298,12 +318,14 @@ impl Server {
     pub async fn run_tokio(self) -> Result<()> {
         let cfg = self.session_config();
         let limiter = common::PeerLimiter::new(self.max_conns_per_ip);
+        let shutdown = self.shutdown.clone().unwrap_or_default();
         tokio::run(
             self.addrs.clone(),
             cfg,
             limiter,
             #[cfg(feature = "tls")]
             self.tls,
+            shutdown,
         )
         .await
     }
@@ -314,12 +336,14 @@ impl Server {
     pub fn run_mio(self) -> Result<()> {
         let cfg = self.session_config();
         let limiter = common::PeerLimiter::new(self.max_conns_per_ip);
+        let shutdown = self.shutdown.clone().unwrap_or_default();
         mio::run(
             self.addrs.clone(),
             cfg,
             limiter,
             #[cfg(feature = "tls")]
             self.tls,
+            shutdown,
         )
     }
 
@@ -335,7 +359,8 @@ impl Server {
     pub fn run_h3(self) -> Result<()> {
         let certs = self.h3_cert_source()?;
         let cfg = self.session_config();
-        quic::run(self.addrs.clone(), cfg, certs, self.ready_tx)
+        let shutdown = self.shutdown.clone().unwrap_or_default();
+        quic::run(self.addrs.clone(), cfg, certs, self.ready_tx, shutdown)
     }
 
     #[cfg(feature = "h3")]

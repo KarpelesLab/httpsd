@@ -101,3 +101,6 @@ pub use config::ServerConfig;
 
 #[cfg(any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio"))]
 pub use rt::Server;
+
+#[cfg(any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio"))]
+pub use rt::Shutdown;

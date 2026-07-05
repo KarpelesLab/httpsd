@@ -100,6 +100,16 @@ pub(crate) fn apply_timeouts(stream: &TcpStream) {
 /// Backoff applied after a descriptor-exhaustion `accept()` error.
 pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How long a graceful shutdown waits for in-flight connections to finish
+/// before returning anyway. Each connection is already bounded by `IO_TIMEOUT`,
+/// so this is a backstop. Used by the runtimes that actively drain (tokio, mio);
+/// the thread pool drains by joining its workers instead.
+#[cfg(any(feature = "rt-tokio", feature = "rt-mio"))]
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Poll cadence for noticing a shutdown request on an otherwise-idle accept loop.
+#[cfg(any(feature = "rt-threadpool", feature = "rt-tokio"))]
+pub(crate) const SHUTDOWN_POLL: Duration = Duration::from_millis(25);
+
 /// Minimum gap between logged accept errors; identical errors in between are
 /// counted and reported as a suppressed total on the next emitted line.
 const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(5);

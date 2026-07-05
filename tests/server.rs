@@ -382,6 +382,46 @@ fn tls_handshake_and_request_in_process() {
     assert!(text.contains("secure hello"), "decrypted: {text}");
 }
 
+#[test]
+fn graceful_shutdown_returns_after_trigger() {
+    use httpsd::Shutdown;
+    use std::sync::mpsc;
+
+    let addr = free_addr();
+    let shutdown = Shutdown::new();
+    let server_shutdown = shutdown.clone();
+
+    // Signal `Ok(())` back from the server thread the moment `run()` returns.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        Server::bind(addr)
+            .unwrap()
+            .handler(|_: &httpsd::Request| Response::text("ok"))
+            .workers(2)
+            .graceful(server_shutdown)
+            .run()
+            .unwrap();
+        // Only reached if `run()` returned (i.e. it drained and stopped).
+        let _ = done_tx.send(());
+    });
+
+    // One successful request proves the server is up and serving.
+    let ok = String::from_utf8(request(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    ))
+    .unwrap();
+    assert!(ok.contains("200 OK"), "server should serve before shutdown");
+
+    // Ask for graceful shutdown; the accept loop must notice within a poll tick,
+    // drain (no in-flight connections), and return.
+    shutdown.trigger();
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server did not return within 5s of shutdown trigger");
+    handle.join().expect("server thread panicked");
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }

@@ -5,6 +5,7 @@
 //! is effectively single-threaded; with N workers up to N connections are
 //! served concurrently. There is no async runtime involved.
 
+use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
@@ -15,6 +16,7 @@ use crate::error::Result;
 use crate::rt::TlsMode;
 use crate::rt::common::{self, serve_blocking};
 use crate::rt::redirect::{self, HttpCtx};
+use crate::rt::shutdown::Shutdown;
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "acme")]
@@ -38,6 +40,7 @@ pub(crate) fn run(
     workers: usize,
     limiter: Arc<common::PeerLimiter>,
     ready: Option<Sender<()>>,
+    shutdown: Shutdown,
 ) -> Result<()> {
     // On-demand ACME (TLS-ALPN-01) can self-deadlock with a single worker: the
     // worker that blocks issuing a certificate needs *another* worker to answer
@@ -63,11 +66,19 @@ pub(crate) fn run(
     let (tx, rx): (SyncSender<Job>, Receiver<Job>) = std::sync::mpsc::sync_channel(backlog);
     let rx = Arc::new(Mutex::new(rx));
 
+    let mut workers_handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let rx = Arc::clone(&rx);
         let shared = Arc::clone(&shared);
-        thread::spawn(move || worker_loop(rx, shared));
+        workers_handles.push(thread::spawn(move || worker_loop(rx, shared)));
     }
+
+    // A shutdown-aware accept loop needs a non-blocking listener so the loop can
+    // periodically re-check the shutdown flag instead of parking forever in
+    // `accept()`. On Unix an accepted stream does NOT inherit this flag, so
+    // workers still receive blocking streams (`serve_blocking` keeps working);
+    // we deliberately never set the accepted stream non-blocking.
+    listener.set_nonblocking(true)?;
 
     // The listener (and any redirect listener bound by the caller) is up and the
     // workers are spawned: signal readiness before blocking on accept, so an
@@ -76,9 +87,12 @@ pub(crate) fn run(
         let _ = ready.send(());
     }
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
+    loop {
+        if shutdown.is_triggered() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => {
                 // Enforce the per-IP cap before queueing. `continue` drops
                 // `stream`, closing the over-limit connection (shed silently,
                 // like the global caps).
@@ -90,12 +104,23 @@ pub(crate) fn run(
                     break;
                 }
             }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(common::SHUTDOWN_POLL);
+            }
             Err(e) => {
                 if common::note_accept_error("accept error", &e) {
                     thread::sleep(common::ACCEPT_BACKOFF);
                 }
             }
         }
+    }
+
+    // Draining: close the job channel so workers finish their queued and
+    // in-flight connections and then exit as the channel empties. Each
+    // connection self-terminates within `IO_TIMEOUT`, so the join is bounded.
+    drop(tx);
+    for h in workers_handles {
+        let _ = h.join();
     }
     Ok(())
 }
@@ -186,15 +211,27 @@ pub(crate) fn run_http_redirect(
     listener: TcpListener,
     ctx: HttpCtx,
     limiter: Arc<common::PeerLimiter>,
+    shutdown: Shutdown,
 ) {
     /// Maximum redirect connections served concurrently; excess is shed.
     const MAX_INFLIGHT: usize = 256;
 
     let ctx = Arc::new(ctx);
     let inflight = Arc::new(AtomicUsize::new(0));
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(mut stream) => {
+    // Non-blocking so the loop can re-check the shutdown flag rather than
+    // parking in `accept()`. Accepted streams do not inherit the flag, so the
+    // per-connection serving stays blocking.
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    loop {
+        if shutdown.is_triggered() {
+            // Redirect connections are sub-second; we simply stop accepting and
+            // let this thread end (it is not joined by the caller).
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
                 common::apply_timeouts(&stream);
                 stream.set_nodelay(true).ok();
                 // Enforce the per-IP cap; `continue` drops the connection.
@@ -219,6 +256,9 @@ pub(crate) fn run_http_redirect(
                     }
                     inflight.fetch_sub(1, Ordering::Relaxed);
                 });
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(common::SHUTDOWN_POLL);
             }
             Err(e) => {
                 if common::note_accept_error("http accept error", &e) {

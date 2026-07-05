@@ -18,6 +18,7 @@ use purecrypto::quic::QuicConnection;
 
 use crate::error::{Error, Result};
 use crate::h3::H3Conn;
+use crate::rt::shutdown::Shutdown;
 use crate::session::SessionConfig;
 use crate::tls::TlsAcceptor;
 
@@ -99,6 +100,7 @@ pub(crate) fn run(
     cfg: SessionConfig,
     certs: CertSource,
     ready: Option<Sender<()>>,
+    shutdown: Shutdown,
 ) -> Result<()> {
     let socket = bind_first(&addrs)?;
     // The UDP socket is bound; signal readiness before entering the event loop so
@@ -110,6 +112,26 @@ pub(crate) fn run(
     let mut buf = [0u8; RECV_BUF];
 
     loop {
+        // Graceful shutdown: stop the loop and return. This is best-effort — a
+        // full QUIC CONNECTION_CLOSE drain (notifying every peer) is a future
+        // improvement; for now H3 clients fall back to TCP or retry. We do flush
+        // any already-queued outbound datagrams once, without blocking, so
+        // responses in flight get one last chance to leave.
+        if shutdown.is_triggered() {
+            for (peer, conn) in conns.iter_mut() {
+                loop {
+                    let dg = conn.quic.pop_datagram();
+                    if dg.is_empty() {
+                        break;
+                    }
+                    if socket.send_to(&dg, *peer).is_err() {
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         // Wake at the soonest pending timer, or after the idle interval.
         let now = Instant::now();
         let wait = conns

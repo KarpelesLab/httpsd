@@ -19,6 +19,7 @@ use mio::{Events, Interest, Poll, Token};
 
 use crate::error::{Error, Result};
 use crate::rt::common::{self, IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
+use crate::rt::shutdown::Shutdown;
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "tls")]
@@ -131,6 +132,7 @@ pub(crate) fn run(
     cfg: SessionConfig,
     limiter: Arc<common::PeerLimiter>,
     #[cfg(feature = "tls")] tls: Option<TlsAcceptor>,
+    shutdown: Shutdown,
 ) -> Result<()> {
     let mut listener = bind_first(&addrs)?;
     let mut poll = Poll::new()?;
@@ -141,6 +143,9 @@ pub(crate) fn run(
     let mut conns: HashMap<Token, Conn> = HashMap::new();
     let mut next_token = 1usize;
     let mut next_sweep = Instant::now() + SWEEP_INTERVAL;
+    // Once shutdown is requested we stop accepting and drain existing
+    // connections until the map empties or this deadline passes.
+    let mut drain_deadline: Option<Instant> = None;
     // When descriptor exhaustion (EMFILE/ENFILE) makes `accept()` fail, the
     // listener stays readable, so retrying immediately spins the CPU. Rather
     // than `thread::sleep` (which in this single-threaded loop would also freeze
@@ -150,6 +155,17 @@ pub(crate) fn run(
     let mut accept_backoff_until: Option<Instant> = None;
 
     loop {
+        // Enter drain mode the first time shutdown is observed: stop accepting,
+        // set a grace deadline, and return once no connections remain.
+        if shutdown.is_triggered() && drain_deadline.is_none() {
+            drain_deadline = Some(Instant::now() + common::SHUTDOWN_GRACE);
+        }
+        if let Some(deadline) = drain_deadline
+            && (conns.is_empty() || Instant::now() >= deadline)
+        {
+            return Ok(());
+        }
+
         // Wake at least once per sweep interval so idle peers are reaped even
         // when no socket is otherwise readable/writable. When an accept backoff
         // is pending, clamp the timeout so the loop also wakes to resume
@@ -160,6 +176,14 @@ pub(crate) fn run(
             && until < deadline
         {
             deadline = until;
+        }
+        // While draining, clamp the poll timeout so the loop exits promptly once
+        // the connection map empties, rather than waiting a full sweep interval.
+        if drain_deadline.is_some() {
+            let drain_wake = now + Duration::from_millis(100);
+            if drain_wake < deadline {
+                deadline = drain_wake;
+            }
         }
         let timeout = deadline.saturating_duration_since(now);
 
@@ -178,13 +202,17 @@ pub(crate) fn run(
         if !backing_off {
             accept_backoff_until = None;
         }
+        // While draining we must not accept new connections; leave the listener
+        // readiness undrained (readable) just like the backoff case does.
+        let draining = drain_deadline.is_some();
 
         for event in events.iter() {
             match event.token() {
-                // Skip the listener while backing off: leave it readable so the
-                // next poll (clamped to wake near `accept_backoff_until`) will
+                // Skip the listener while backing off or draining: leave it
+                // readable so the next poll (clamped to wake near
+                // `accept_backoff_until`, or promptly while draining) will
                 // re-deliver the readiness once we are ready to accept again.
-                LISTENER if backing_off => {}
+                LISTENER if backing_off || draining => {}
                 LISTENER => {
                     if let Some(backoff) = accept_ready(
                         &listener,

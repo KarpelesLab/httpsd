@@ -8,13 +8,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
 use crate::rt::common::{self, IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
+use crate::rt::shutdown::Shutdown;
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "tls")]
@@ -41,6 +42,7 @@ pub(crate) async fn run(
     cfg: SessionConfig,
     limiter: Arc<common::PeerLimiter>,
     #[cfg(feature = "tls")] tls: Option<TlsAcceptor>,
+    shutdown: Shutdown,
 ) -> Result<()> {
     let listener = bind_first(&addrs).await?;
     let shared = Arc::new(Shared {
@@ -51,44 +53,60 @@ pub(crate) async fn run(
     });
 
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                // Shed load past the global cap by dropping the connection.
-                if shared.inflight.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT {
-                    shared.inflight.fetch_sub(1, Ordering::Relaxed);
-                    drop(stream);
-                    continue;
-                }
-                // Enforce the per-IP cap. On rejection, release the inflight
-                // slot we just claimed and drop the connection.
-                let guard = match limiter.admit(Some(peer.ip())) {
-                    Some(g) => g,
-                    None => {
+        if shutdown.is_triggered() {
+            break;
+        }
+        // Bound the accept so the loop periodically re-checks the shutdown flag
+        // rather than parking indefinitely with no incoming connections.
+        match tokio::time::timeout(common::SHUTDOWN_POLL, listener.accept()).await {
+            Ok(accept_result) => match accept_result {
+                Ok((stream, peer)) => {
+                    // Shed load past the global cap by dropping the connection.
+                    if shared.inflight.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT {
                         shared.inflight.fetch_sub(1, Ordering::Relaxed);
                         drop(stream);
                         continue;
                     }
-                };
-                let shared = Arc::clone(&shared);
-                tokio::spawn(async move {
-                    // Hold the per-IP slot for the whole connection.
-                    let _guard = guard;
-                    let outcome = serve(stream, &shared).await;
-                    shared.inflight.fetch_sub(1, Ordering::Relaxed);
-                    if cfg!(debug_assertions)
-                        && let Err(e) = outcome
-                    {
-                        eprintln!("httpsd: connection ended: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                if crate::rt::common::note_accept_error("accept error", &e) {
-                    tokio::time::sleep(crate::rt::common::ACCEPT_BACKOFF).await;
+                    // Enforce the per-IP cap. On rejection, release the inflight
+                    // slot we just claimed and drop the connection.
+                    let guard = match limiter.admit(Some(peer.ip())) {
+                        Some(g) => g,
+                        None => {
+                            shared.inflight.fetch_sub(1, Ordering::Relaxed);
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    let shared = Arc::clone(&shared);
+                    tokio::spawn(async move {
+                        // Hold the per-IP slot for the whole connection.
+                        let _guard = guard;
+                        let outcome = serve(stream, &shared).await;
+                        shared.inflight.fetch_sub(1, Ordering::Relaxed);
+                        if cfg!(debug_assertions)
+                            && let Err(e) = outcome
+                        {
+                            eprintln!("httpsd: connection ended: {e}");
+                        }
+                    });
                 }
-            }
+                Err(e) => {
+                    if common::note_accept_error("accept error", &e) {
+                        tokio::time::sleep(common::ACCEPT_BACKOFF).await;
+                    }
+                }
+            },
+            // Poll tick: no connection within the window, re-check shutdown.
+            Err(_elapsed) => continue,
         }
     }
+
+    // Drain: wait for in-flight tasks to finish, bounded by the grace period.
+    let deadline = Instant::now() + common::SHUTDOWN_GRACE;
+    while shared.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
 }
 
 async fn bind_first(addrs: &[SocketAddr]) -> Result<TcpListener> {
