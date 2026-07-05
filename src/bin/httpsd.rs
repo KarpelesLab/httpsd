@@ -21,6 +21,13 @@ use std::process::ExitCode;
 
 use httpsd::Server;
 
+/// The shared ACME manager passed around the CLI. When the `acme` feature is
+/// off it degrades to `Option<()>` so the same plumbing compiles either way.
+#[cfg(feature = "acme")]
+type AcmeShared = Option<httpsd::acme::AcmeManager>;
+#[cfg(not(feature = "acme"))]
+type AcmeShared = Option<()>;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -29,6 +36,76 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by the SIGTERM/SIGINT handler; observed by the watcher thread, which then
+/// triggers the graceful [`httpsd::Shutdown`].
+static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
+/// Set by the SIGHUP handler; observed (and cleared) by the watcher thread,
+/// which then reloads the ACME certificate cache.
+static RELOAD_REQ: AtomicBool = AtomicBool::new(false);
+
+/// Signal handler. Runs in async-signal context, so it does ONLY
+/// async-signal-safe work: atomic stores (no allocation, no locks, no I/O).
+#[cfg(all(unix, feature = "privdrop"))]
+extern "C" fn handle_signal(sig: libc::c_int) {
+    match sig {
+        libc::SIGTERM | libc::SIGINT => SHUTDOWN_REQ.store(true, Ordering::SeqCst),
+        libc::SIGHUP => RELOAD_REQ.store(true, Ordering::SeqCst),
+        _ => {}
+    }
+}
+
+/// Install handlers for SIGTERM, SIGINT (graceful shutdown) and SIGHUP (reload).
+/// `libc` is available whenever `privdrop` is (and the CLI binary always pulls
+/// `privdrop` in via the `cli` feature), so this is the real implementation for
+/// every CLI build; the no-op fallback below covers any exotic feature combo.
+#[cfg(all(unix, feature = "privdrop"))]
+fn install_signal_handlers() {
+    // SAFETY: `sigaction` with a valid, initialized `struct sigaction` whose
+    // `sa_sigaction` points at our `extern "C"` handler. The handler only does
+    // atomic stores, which are async-signal-safe. `SA_RESTART` transparently
+    // restarts interrupted syscalls, which the accept/poll loops tolerate.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_signal as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+/// No-op fallback when `libc` is unavailable (e.g. `privdrop` disabled) or on a
+/// non-Unix target: the server simply runs without signal-driven shutdown.
+#[cfg(not(all(unix, feature = "privdrop")))]
+fn install_signal_handlers() {}
+
+/// Spawn the watcher thread that owns the shutdown handle and the shared ACME
+/// manager. It polls the signal flags every ~100ms, triggers graceful shutdown
+/// on SIGTERM/SIGINT (then exits), and reloads certificates on SIGHUP.
+fn spawn_signal_watcher(shutdown: httpsd::Shutdown, acme: AcmeShared) {
+    use std::time::Duration;
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if SHUTDOWN_REQ.load(Ordering::SeqCst) {
+                shutdown.trigger();
+                break;
+            }
+            if RELOAD_REQ.swap(false, Ordering::SeqCst) {
+                #[cfg(feature = "acme")]
+                if let Some(mgr) = &acme {
+                    mgr.reload();
+                }
+                let _ = &acme;
+                eprintln!("httpsd: reloaded (SIGHUP): certificate cache cleared");
+            }
+        }
+    });
 }
 
 fn run() -> httpsd::Result<()> {
@@ -62,12 +139,18 @@ fn run() -> httpsd::Result<()> {
         ));
     }
 
+    // One graceful-shutdown handle and one shared ACME manager, threaded into
+    // every server (TCP + HTTP/3) so a SIGHUP reload clears the single cache and
+    // a SIGTERM/SIGINT drains every listener.
+    let shutdown = httpsd::Shutdown::new();
+    let acme = build_acme_shared(&opts)?;
+
     // Serve HTTP/3 on UDP alongside the TCP server by default whenever we have a
     // static TLS certificate. It runs on its own thread; the TCP server
     // (HTTP/1.1 + HTTP/2) stays in the foreground.
     #[cfg(feature = "h3")]
     if opts.http3_enabled() {
-        let h3 = opts.build_server()?;
+        let h3 = opts.build_server(&acme, &shutdown)?;
         let addr = opts.listen.clone();
         std::thread::spawn(move || {
             if let Err(e) = h3.run_h3() {
@@ -77,7 +160,7 @@ fn run() -> httpsd::Result<()> {
         eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
     }
 
-    let server = opts.build_server()?;
+    let server = opts.build_server(&acme, &shutdown)?;
     let addr = opts.listen.clone();
     let scheme = if opts.is_tls() || opts.acme_accept_tos {
         "https"
@@ -88,7 +171,30 @@ fn run() -> httpsd::Result<()> {
     if let Some(http) = &opts.http_listen {
         eprintln!("httpsd: redirecting HTTP→HTTPS on {http}");
     }
+
+    // Install signal handlers and start the watcher before serving, so a signal
+    // arriving during startup is still honored.
+    install_signal_handlers();
+    spawn_signal_watcher(shutdown, acme);
+
     server.run()
+}
+
+/// Build the shared ACME manager if the `acme` feature is on, else `None`.
+/// Kept feature-agnostic so the same call site works either way.
+#[cfg(feature = "acme")]
+fn build_acme_shared(opts: &Options) -> httpsd::Result<AcmeShared> {
+    opts.build_acme_manager()
+}
+#[cfg(not(feature = "acme"))]
+fn build_acme_shared(opts: &Options) -> httpsd::Result<AcmeShared> {
+    // Surface the same "acme not enabled" error the old apply_acme did.
+    if opts.acme_requested() {
+        return Err(httpsd::Error::Config(
+            "automatic certificates requested but the `acme` feature is not enabled".into(),
+        ));
+    }
+    Ok(None)
 }
 
 const HELP: &str = "\
@@ -126,6 +232,10 @@ OPTIONS:
         --user NAME[:GROUP] drop to this user (and group) after binding; NAME/GROUP may be numeric
         --chroot DIR        chroot into DIR after binding, before dropping privileges
     -h, --help              print this help
+
+SIGNALS (Unix):
+    SIGTERM/SIGINT          graceful shutdown (stop accepting, drain in-flight)
+    SIGHUP                  reload certificates (clear the ACME cache)
 ";
 
 struct Options {
@@ -274,10 +384,16 @@ impl Options {
         self.tls_cert.is_some() || self.self_signed.is_some()
     }
 
-    fn build_server(&self) -> httpsd::Result<Server> {
+    fn build_server(
+        &self,
+        acme: &AcmeShared,
+        shutdown: &httpsd::Shutdown,
+    ) -> httpsd::Result<Server> {
         // A config file takes over completely.
         if let Some(path) = &self.config {
-            return httpsd::ServerConfig::from_file(path)?.into_server();
+            return Ok(httpsd::ServerConfig::from_file(path)?
+                .into_server()?
+                .graceful(shutdown.clone()));
         }
 
         let mut server = Server::bind(self.listen.as_str())?.serve_dir(self.dir.clone());
@@ -306,14 +422,14 @@ impl Options {
         if let Some(http) = &self.http_listen {
             server = server.http_redirect(http.as_str())?;
         }
-        server = self.apply_acme(server)?;
+        server = self.apply_acme(server, acme)?;
         // Advertise HTTP/3 via Alt-Svc when we'll be serving it.
         #[cfg(feature = "h3")]
         if self.http3_enabled() {
             let port = self.listen_port();
             server = server.alt_svc(Some(format!("h3=\":{port}\"; ma=86400")));
         }
-        Ok(server)
+        Ok(server.graceful(shutdown.clone()))
     }
 
     /// Whether HTTP/3 should run: on by default whenever HTTPS is served (a
@@ -383,10 +499,14 @@ impl Options {
             || self.cert_dir.is_some()
     }
 
+    /// Build the ACME manager once from the CLI options, if ACME was requested.
+    /// The same manager is shared across the TCP and HTTP/3 servers so they use
+    /// one certificate cache (required for SIGHUP reload to take effect, and a
+    /// latent-bug fix since each `build_server` used to build its own).
     #[cfg(feature = "acme")]
-    fn apply_acme(&self, server: Server) -> httpsd::Result<Server> {
+    fn build_acme_manager(&self) -> httpsd::Result<Option<httpsd::acme::AcmeManager>> {
         if !self.acme_requested() {
-            return Ok(server);
+            return Ok(None);
         }
         if !self.acme_accept_tos {
             return Err(httpsd::Error::Config(
@@ -423,11 +543,24 @@ impl Options {
             default_host,
             cert_dir: self.cert_dir.clone().map(std::path::PathBuf::from),
         };
-        Ok(server.acme(httpsd::acme::AcmeManager::new(cfg)?))
+        Ok(Some(httpsd::acme::AcmeManager::new(cfg)?))
+    }
+
+    /// Attach the (already-built, shared) ACME manager to a server.
+    #[cfg(feature = "acme")]
+    fn apply_acme(
+        &self,
+        server: Server,
+        acme: &Option<httpsd::acme::AcmeManager>,
+    ) -> httpsd::Result<Server> {
+        match acme {
+            Some(mgr) => Ok(server.acme(mgr.clone())),
+            None => Ok(server),
+        }
     }
 
     #[cfg(not(feature = "acme"))]
-    fn apply_acme(&self, server: Server) -> httpsd::Result<Server> {
+    fn apply_acme(&self, server: Server, _acme: &Option<()>) -> httpsd::Result<Server> {
         if self.acme_requested() {
             return Err(httpsd::Error::Config(
                 "automatic certificates requested but the `acme` feature is not enabled".into(),
@@ -494,6 +627,11 @@ fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> h
 
     let (tx, rx) = mpsc::channel::<()>();
 
+    // One shutdown handle and one shared ACME manager for every listener, built
+    // before the servers so `.graceful(...)` is installed prior to spawning.
+    let shutdown = httpsd::Shutdown::new();
+    let acme = build_acme_shared(opts)?;
+
     #[cfg(feature = "h3")]
     let h3_on = opts.http3_enabled();
     #[cfg(not(feature = "h3"))]
@@ -504,13 +642,17 @@ fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> h
 
     #[cfg(feature = "h3")]
     if h3_on {
-        let h3 = opts.build_server()?.notify_bound(tx.clone());
+        let h3 = opts
+            .build_server(&acme, &shutdown)?
+            .notify_bound(tx.clone());
         let addr = opts.listen.clone();
         eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
         handles.push(std::thread::spawn(move || h3.run_h3()));
     }
 
-    let server = opts.build_server()?.notify_bound(tx.clone());
+    let server = opts
+        .build_server(&acme, &shutdown)?
+        .notify_bound(tx.clone());
     let addr = opts.listen.clone();
     let scheme = if opts.is_tls() || opts.acme_accept_tos {
         "https"
@@ -564,8 +706,15 @@ fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> h
     priv_drop.apply()?;
     eprintln!("httpsd: dropped privileges");
 
-    // Serve. join blocks on the (forever-running) serving threads; an error is
-    // surfaced if one ever returns.
+    // Now that privileges are dropped and the listeners are serving, install the
+    // signal handlers and start the watcher. On SIGTERM/SIGINT it triggers the
+    // shared shutdown, so the serving threads drain and exit and `join_all`
+    // returns `Ok(())`; on SIGHUP it reloads the shared ACME cache.
+    install_signal_handlers();
+    spawn_signal_watcher(shutdown, acme);
+
+    // Serve. join blocks on the serving threads; they return once they finish
+    // draining after a shutdown request (or immediately on a fatal error).
     join_all(handles)
 }
 
