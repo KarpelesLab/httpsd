@@ -26,12 +26,17 @@ struct Shared {
     tls: TlsMode,
 }
 
+/// An accepted connection queued to a worker, paired with the per-IP slot guard
+/// that must live for the connection's whole lifetime.
+type Job = (TcpStream, common::PeerGuard);
+
 /// Run a blocking accept loop, dispatching connections to `workers` threads.
 pub(crate) fn run(
     listener: TcpListener,
     cfg: SessionConfig,
     tls: TlsMode,
     workers: usize,
+    limiter: Arc<common::PeerLimiter>,
     ready: Option<Sender<()>>,
 ) -> Result<()> {
     // On-demand ACME (TLS-ALPN-01) can self-deadlock with a single worker: the
@@ -55,8 +60,7 @@ pub(crate) fn run(
     // the queue is full `send` blocks the accept loop; further connections wait
     // in the kernel backlog and are shed there if it too fills.
     let backlog = workers.saturating_mul(64).clamp(256, 4096);
-    let (tx, rx): (SyncSender<TcpStream>, Receiver<TcpStream>) =
-        std::sync::mpsc::sync_channel(backlog);
+    let (tx, rx): (SyncSender<Job>, Receiver<Job>) = std::sync::mpsc::sync_channel(backlog);
     let rx = Arc::new(Mutex::new(rx));
 
     for _ in 0..workers {
@@ -75,7 +79,14 @@ pub(crate) fn run(
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                if tx.send(stream).is_err() {
+                // Enforce the per-IP cap before queueing. `continue` drops
+                // `stream`, closing the over-limit connection (shed silently,
+                // like the global caps).
+                let guard = match limiter.admit(stream.peer_addr().ok().map(|a| a.ip())) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                if tx.send((stream, guard)).is_err() {
                     break;
                 }
             }
@@ -89,18 +100,22 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn worker_loop(rx: Arc<Mutex<Receiver<TcpStream>>>, shared: Arc<Shared>) {
+fn worker_loop(rx: Arc<Mutex<Receiver<Job>>>, shared: Arc<Shared>) {
     loop {
-        let stream = {
-            let guard = match rx.lock() {
+        let received = {
+            let lock = match rx.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            guard.recv()
+            lock.recv()
         };
-        let Ok(stream) = stream else {
+        let Ok((stream, guard)) = received else {
             return;
         };
+        // Hold the per-IP slot for the whole connection: keep `guard` alive
+        // across `catch_unwind` and drop it (releasing the slot) only after the
+        // handler returns — even if it panics.
+        let _guard = guard;
         // Isolate each connection: a panic while serving one client must not
         // kill the worker thread, which would permanently shrink the pool and,
         // once every worker died, wedge the whole server.
@@ -167,7 +182,11 @@ fn handle_acme(
 /// Accept loop for the plain-HTTP listener (redirects + ACME HTTP-01). It spawns
 /// a thread per connection — these are short-lived (read a request, reply, close)
 /// — but caps how many run at once so a flood can't spawn unbounded threads.
-pub(crate) fn run_http_redirect(listener: TcpListener, ctx: HttpCtx) {
+pub(crate) fn run_http_redirect(
+    listener: TcpListener,
+    ctx: HttpCtx,
+    limiter: Arc<common::PeerLimiter>,
+) {
     /// Maximum redirect connections served concurrently; excess is shed.
     const MAX_INFLIGHT: usize = 256;
 
@@ -178,6 +197,11 @@ pub(crate) fn run_http_redirect(listener: TcpListener, ctx: HttpCtx) {
             Ok(mut stream) => {
                 common::apply_timeouts(&stream);
                 stream.set_nodelay(true).ok();
+                // Enforce the per-IP cap; `continue` drops the connection.
+                let guard = match limiter.admit(stream.peer_addr().ok().map(|a| a.ip())) {
+                    Some(g) => g,
+                    None => continue,
+                };
                 // Shed load past the cap by closing the connection (drop).
                 if inflight.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT {
                     inflight.fetch_sub(1, Ordering::Relaxed);
@@ -186,6 +210,8 @@ pub(crate) fn run_http_redirect(listener: TcpListener, ctx: HttpCtx) {
                 let ctx = Arc::clone(&ctx);
                 let inflight = Arc::clone(&inflight);
                 thread::spawn(move || {
+                    // Hold the per-IP slot until the redirect finishes.
+                    let _guard = guard;
                     if let Err(e) = redirect::serve(&mut stream, &ctx)
                         && cfg!(debug_assertions)
                     {

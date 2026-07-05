@@ -67,6 +67,8 @@ pub struct Server {
     handler: Arc<dyn Handler>,
     server_name: Option<String>,
     workers: usize,
+    /// Cap on concurrent connections from a single client IP (0 = unlimited).
+    max_conns_per_ip: u32,
     #[cfg(feature = "tls")]
     tls: Option<TlsAcceptor>,
     #[cfg(feature = "compress")]
@@ -101,6 +103,7 @@ impl Server {
             handler: Arc::new(not_found),
             server_name: Some(concat!("httpsd/", env!("CARGO_PKG_VERSION")).to_owned()),
             workers: default_workers(),
+            max_conns_per_ip: 0,
             #[cfg(feature = "tls")]
             tls: None,
             #[cfg(feature = "compress")]
@@ -136,6 +139,15 @@ impl Server {
     /// Set the number of worker threads for the thread-pool runtime.
     pub fn workers(mut self, workers: usize) -> Server {
         self.workers = workers.max(1);
+        self
+    }
+
+    /// Cap the number of concurrent connections from a single client IP (0 =
+    /// unlimited, the default). Applies to the TCP runtimes and the HTTP redirect
+    /// listener; a single source that exceeds the cap has further connections
+    /// dropped so it cannot exhaust the global connection budget.
+    pub fn max_conns_per_ip(mut self, max: u32) -> Server {
+        self.max_conns_per_ip = max;
         self
     }
 
@@ -258,17 +270,26 @@ impl Server {
         let listener = std::net::TcpListener::bind(self.addrs.as_slice())?;
         let cfg = self.session_config();
         let tls_mode = self.tls_mode();
+        let limiter = common::PeerLimiter::new(self.max_conns_per_ip);
 
         if !self.http_addrs.is_empty() {
             let http = std::net::TcpListener::bind(self.http_addrs.as_slice())?;
             let ctx = self.http_ctx();
-            std::thread::spawn(move || threadpool::run_http_redirect(http, ctx));
+            let redirect_limiter = Arc::clone(&limiter);
+            std::thread::spawn(move || threadpool::run_http_redirect(http, ctx, redirect_limiter));
         }
 
         // Both the main listener and (if any) the redirect listener are now
         // bound; the readiness signal is emitted inside `threadpool::run` right
         // before the accept loop.
-        threadpool::run(listener, cfg, tls_mode, self.workers, self.ready_tx)
+        threadpool::run(
+            listener,
+            cfg,
+            tls_mode,
+            self.workers,
+            limiter,
+            self.ready_tx,
+        )
     }
 
     /// Run on a tokio runtime. Requires being called from within a tokio
@@ -276,9 +297,11 @@ impl Server {
     #[cfg(feature = "rt-tokio")]
     pub async fn run_tokio(self) -> Result<()> {
         let cfg = self.session_config();
+        let limiter = common::PeerLimiter::new(self.max_conns_per_ip);
         tokio::run(
             self.addrs.clone(),
             cfg,
+            limiter,
             #[cfg(feature = "tls")]
             self.tls,
         )
@@ -290,9 +313,11 @@ impl Server {
     #[cfg(feature = "rt-mio")]
     pub fn run_mio(self) -> Result<()> {
         let cfg = self.session_config();
+        let limiter = common::PeerLimiter::new(self.max_conns_per_ip);
         mio::run(
             self.addrs.clone(),
             cfg,
+            limiter,
             #[cfg(feature = "tls")]
             self.tls,
         )

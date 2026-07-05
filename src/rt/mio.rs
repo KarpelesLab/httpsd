@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mio::event::Event;
@@ -17,7 +18,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use crate::error::{Error, Result};
-use crate::rt::common::{IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
+use crate::rt::common::{self, IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "tls")]
@@ -50,6 +51,9 @@ struct Conn {
     progress_since: Instant,
     /// Bytes received in the current window (reset once it reaches the floor).
     progress_bytes: usize,
+    /// Holds this connection's per-IP slot; releases it when the `Conn` is
+    /// dropped (idle sweep, done, or error).
+    _peer_guard: common::PeerGuard,
 }
 
 impl Conn {
@@ -125,6 +129,7 @@ impl Conn {
 pub(crate) fn run(
     addrs: Vec<SocketAddr>,
     cfg: SessionConfig,
+    limiter: Arc<common::PeerLimiter>,
     #[cfg(feature = "tls")] tls: Option<TlsAcceptor>,
 ) -> Result<()> {
     let mut listener = bind_first(&addrs)?;
@@ -185,6 +190,7 @@ pub(crate) fn run(
                         &listener,
                         &poll,
                         &cfg,
+                        &limiter,
                         #[cfg(feature = "tls")]
                         &tls,
                         &mut conns,
@@ -241,6 +247,7 @@ fn accept_ready(
     listener: &TcpListener,
     poll: &Poll,
     cfg: &SessionConfig,
+    limiter: &Arc<common::PeerLimiter>,
     #[cfg(feature = "tls")] tls: &Option<TlsAcceptor>,
     conns: &mut HashMap<Token, Conn>,
     next_token: &mut usize,
@@ -255,6 +262,14 @@ fn accept_ready(
                     drop(stream);
                     continue;
                 }
+                // Enforce the per-IP cap; dropping `stream` closes the connection.
+                let guard = match limiter.admit(stream.peer_addr().ok().map(|a| a.ip())) {
+                    Some(g) => g,
+                    None => {
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let session = match build_session(
                     cfg,
                     #[cfg(feature = "tls")]
@@ -285,6 +300,7 @@ fn accept_ready(
                         read_closed: false,
                         progress_since: Instant::now(),
                         progress_bytes: 0,
+                        _peer_guard: guard,
                     },
                 );
             }

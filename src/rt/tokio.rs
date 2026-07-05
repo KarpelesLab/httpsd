@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
-use crate::rt::common::{IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
+use crate::rt::common::{self, IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "tls")]
@@ -39,6 +39,7 @@ struct Shared {
 pub(crate) async fn run(
     addrs: Vec<SocketAddr>,
     cfg: SessionConfig,
+    limiter: Arc<common::PeerLimiter>,
     #[cfg(feature = "tls")] tls: Option<TlsAcceptor>,
 ) -> Result<()> {
     let listener = bind_first(&addrs).await?;
@@ -51,15 +52,27 @@ pub(crate) async fn run(
 
     loop {
         match listener.accept().await {
-            Ok((stream, _peer)) => {
+            Ok((stream, peer)) => {
                 // Shed load past the global cap by dropping the connection.
                 if shared.inflight.fetch_add(1, Ordering::Relaxed) >= MAX_INFLIGHT {
                     shared.inflight.fetch_sub(1, Ordering::Relaxed);
                     drop(stream);
                     continue;
                 }
+                // Enforce the per-IP cap. On rejection, release the inflight
+                // slot we just claimed and drop the connection.
+                let guard = match limiter.admit(Some(peer.ip())) {
+                    Some(g) => g,
+                    None => {
+                        shared.inflight.fetch_sub(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
+                    // Hold the per-IP slot for the whole connection.
+                    let _guard = guard;
                     let outcome = serve(stream, &shared).await;
                     shared.inflight.fetch_sub(1, Ordering::Relaxed);
                     if cfg!(debug_assertions)
