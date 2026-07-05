@@ -93,6 +93,12 @@ pub(crate) fn run(
         }
         match listener.accept() {
             Ok((stream, _addr)) => {
+                // The listener is non-blocking so the accept loop can poll the
+                // shutdown flag, but the per-connection code (`serve_blocking`)
+                // needs a BLOCKING stream. On Unix the accepted socket does not
+                // inherit the flag, but Winsock does, so reset it explicitly for
+                // portability rather than relying on non-inheritance.
+                let _ = stream.set_nonblocking(false);
                 // Enforce the per-IP cap before queueing. `continue` drops
                 // `stream`, closing the over-limit connection (shed silently,
                 // like the global caps).
@@ -232,6 +238,10 @@ pub(crate) fn run_http_redirect(
         }
         match listener.accept() {
             Ok((mut stream, _addr)) => {
+                // Reset the accepted socket to blocking (Winsock inherits the
+                // listener's non-blocking flag; Unix does not) — the redirect
+                // serve loop is blocking like the main path.
+                let _ = stream.set_nonblocking(false);
                 common::apply_timeouts(&stream);
                 stream.set_nodelay(true).ok();
                 // Enforce the per-IP cap; `continue` drops the connection.
