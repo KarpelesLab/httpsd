@@ -6,7 +6,8 @@
 //! push application bytes to encrypt, and drain ciphertext to write back.
 //! [`crate::session::Session`] drives this together with the HTTP engine.
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
@@ -203,6 +204,73 @@ impl TlsAcceptor {
 impl std::fmt::Debug for TlsAcceptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsAcceptor").finish_non_exhaustive()
+    }
+}
+
+/// A [`TlsAcceptor`] that can be atomically swapped at runtime — e.g. on SIGHUP
+/// when its certificate files change on disk — without dropping connections.
+/// Cheap to clone (all clones share one cell). Every accepted connection reads
+/// the acceptor currently in effect via [`current`](Self::current).
+#[derive(Clone)]
+pub struct ReloadableAcceptor {
+    current: Arc<RwLock<Arc<TlsAcceptor>>>,
+    /// (cert, key) paths to re-read on reload; `None` for sources with no file
+    /// backing (e.g. self-signed), whose `reload` is a no-op.
+    source: Option<Arc<(PathBuf, PathBuf)>>,
+}
+
+impl ReloadableAcceptor {
+    /// Build a reloadable acceptor from a PEM certificate file and key file,
+    /// remembering the paths so [`reload`](Self::reload) can re-read them.
+    pub fn from_pem_files(
+        cert: impl AsRef<Path>,
+        key: impl AsRef<Path>,
+    ) -> Result<ReloadableAcceptor> {
+        let cert = cert.as_ref().to_path_buf();
+        let key = key.as_ref().to_path_buf();
+        let acceptor = TlsAcceptor::from_pem_files(&cert, &key)?;
+        Ok(ReloadableAcceptor {
+            current: Arc::new(RwLock::new(Arc::new(acceptor))),
+            source: Some(Arc::new((cert, key))),
+        })
+    }
+
+    /// Wrap a fixed acceptor with no file backing; its [`reload`](Self::reload)
+    /// is a no-op. Preserves existing callers that pass a bare [`TlsAcceptor`].
+    pub fn fixed(acceptor: TlsAcceptor) -> ReloadableAcceptor {
+        ReloadableAcceptor {
+            current: Arc::new(RwLock::new(Arc::new(acceptor))),
+            source: None,
+        }
+    }
+
+    /// A cheap `Arc` clone of the acceptor currently in effect. Poison-safe: a
+    /// panic elsewhere while holding the lock does not wedge this read.
+    pub fn current(&self) -> Arc<TlsAcceptor> {
+        Arc::clone(&self.current.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Re-read the certificate files and swap in a fresh acceptor. Fail-safe: on
+    /// a read/parse error the old acceptor is kept and the error returned (the
+    /// cell is neither poisoned nor cleared). A no-op `Ok(())` when there is no
+    /// file backing (a [`fixed`](Self::fixed) acceptor).
+    pub fn reload(&self) -> Result<()> {
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        // Build the new acceptor before taking the write lock, so a failure
+        // leaves the old one untouched and readers are never blocked on I/O.
+        let fresh = TlsAcceptor::from_pem_files(&source.0, &source.1)?;
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(fresh);
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ReloadableAcceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadableAcceptor")
+            .field("reloadable", &self.source.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -447,6 +515,103 @@ mod tests {
     fn self_signed_round_trips() {
         let acceptor = TlsAcceptor::self_signed(&["localhost"]).expect("self-signed");
         let _stream = acceptor.accept().expect("accept");
+    }
+
+    #[test]
+    fn reloadable_fixed_is_usable_and_reload_is_noop() {
+        let acc = ReloadableAcceptor::fixed(
+            TlsAcceptor::self_signed(&["localhost"]).expect("self-signed"),
+        );
+        // `current()` yields a usable acceptor.
+        let _stream = acc.current().accept().expect("accept");
+        // A fixed acceptor has no file backing: reload is a no-op success.
+        acc.reload().expect("no-op reload");
+        let _again = acc.current().accept().expect("accept after reload");
+    }
+
+    /// Generate a self-signed cert + key and return them as PEM strings, so a
+    /// file-based reload test has real material to write. `TlsAcceptor::self_signed`
+    /// does not expose PEM, so build the pieces directly: the SEC1 key PEM comes
+    /// from the key, and the leaf DER is wrapped into a `CERTIFICATE` PEM block.
+    #[cfg(test)]
+    fn self_signed_pem(host: &str) -> (String, String) {
+        let mut rng = OsRng;
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let key_pem = key.to_sec1_pem();
+        let name = DistinguishedName::common_name(host);
+        let validity = Validity::new(
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2040, 1, 1, 0, 0, 0),
+        );
+        let any = AnyPrivateKey::Ecdsa(key);
+        let cert = Certificate::self_signed_with_sans(&any, &name, &validity, 1, false, &[host])
+            .expect("self-sign");
+        let cert_pem = der_to_pem("CERTIFICATE", &cert.to_der());
+        (cert_pem, key_pem)
+    }
+
+    /// Wrap DER bytes in a PEM block with the given label (standard 64-col base64).
+    #[cfg(test)]
+    fn der_to_pem(label: &str, der: &[u8]) -> String {
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in der.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+            b64.push(ALPHA[(n >> 18 & 63) as usize] as char);
+            b64.push(ALPHA[(n >> 12 & 63) as usize] as char);
+            b64.push(if chunk.len() > 1 {
+                ALPHA[(n >> 6 & 63) as usize] as char
+            } else {
+                '='
+            });
+            b64.push(if chunk.len() > 2 {
+                ALPHA[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        let mut out = format!("-----BEGIN {label}-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out.push_str(&format!("-----END {label}-----\n"));
+        out
+    }
+
+    #[test]
+    fn reloadable_from_files_reloads_and_keeps_old_on_missing() {
+        let dir = std::env::temp_dir().join(format!("httpsd-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let (cert_pem, key_pem) = self_signed_pem("localhost");
+        std::fs::write(&cert_path, &cert_pem).expect("write cert");
+        std::fs::write(&key_path, &key_pem).expect("write key");
+
+        let acc = ReloadableAcceptor::from_pem_files(&cert_path, &key_path).expect("build");
+        acc.current().accept().expect("accept before reload");
+
+        // Rewrite the files with a fresh identity and reload: it succeeds.
+        let (cert2, key2) = self_signed_pem("localhost");
+        std::fs::write(&cert_path, &cert2).expect("rewrite cert");
+        std::fs::write(&key_path, &key2).expect("rewrite key");
+        acc.reload().expect("reload after rewrite");
+        acc.current().accept().expect("accept after reload");
+
+        // Now delete a file: reload fails, but the old acceptor is kept usable.
+        std::fs::remove_file(&cert_path).expect("rm cert");
+        assert!(acc.reload().is_err(), "reload with missing cert must Err");
+        acc.current()
+            .accept()
+            .expect("old acceptor still usable after failed reload");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
