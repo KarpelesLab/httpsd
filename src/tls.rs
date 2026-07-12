@@ -546,7 +546,7 @@ mod tests {
         let any = AnyPrivateKey::Ecdsa(key);
         let cert = Certificate::self_signed_with_sans(&any, &name, &validity, 1, false, &[host])
             .expect("self-sign");
-        let cert_pem = der_to_pem("CERTIFICATE", &cert.to_der());
+        let cert_pem = der_to_pem("CERTIFICATE", cert.to_der());
         (cert_pem, key_pem)
     }
 
