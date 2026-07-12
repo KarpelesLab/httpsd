@@ -19,7 +19,7 @@ use crate::rt::shutdown::Shutdown;
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "tls")]
-use crate::tls::TlsAcceptor;
+use crate::tls::ReloadableAcceptor;
 
 /// Global ceiling on connections served concurrently. Every accept spawns an
 /// unbounded task otherwise, so a connection flood can exhaust memory and file
@@ -31,7 +31,7 @@ const MAX_INFLIGHT: usize = 8192;
 struct Shared {
     cfg: SessionConfig,
     #[cfg(feature = "tls")]
-    tls: Option<TlsAcceptor>,
+    tls: Option<ReloadableAcceptor>,
     /// Number of connections currently being served (gated by [`MAX_INFLIGHT`]).
     inflight: AtomicUsize,
 }
@@ -41,7 +41,7 @@ pub(crate) async fn run(
     addrs: Vec<SocketAddr>,
     cfg: SessionConfig,
     limiter: Arc<common::PeerLimiter>,
-    #[cfg(feature = "tls")] tls: Option<TlsAcceptor>,
+    #[cfg(feature = "tls")] tls: Option<ReloadableAcceptor>,
     shutdown: Shutdown,
 ) -> Result<()> {
     let listener = bind_first(&addrs).await?;
@@ -176,7 +176,8 @@ async fn serve(mut stream: TcpStream, shared: &Shared) -> Result<()> {
 fn build_session(shared: &Shared) -> Result<Session> {
     #[cfg(feature = "tls")]
     if let Some(acceptor) = &shared.tls {
-        return Ok(Session::tls(shared.cfg.clone(), acceptor.accept()?));
+        let acc = acceptor.current();
+        return Ok(Session::tls(shared.cfg.clone(), acc.accept()?));
     }
     Ok(Session::plain(shared.cfg.clone()))
 }

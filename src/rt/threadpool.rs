@@ -173,8 +173,11 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> Result<()> {
             serve_blocking(&mut stream, &mut session)
         }
         #[cfg(feature = "tls")]
-        TlsMode::Static(acceptor) => {
-            let tls = acceptor.accept()?;
+        TlsMode::Static(reloadable) => {
+            // Read the acceptor in effect right now, so a mid-run reload is
+            // picked up by subsequent connections.
+            let acc = reloadable.current();
+            let tls = acc.accept()?;
             let mut session = Session::tls(shared.cfg.clone(), tls);
             serve_blocking(&mut stream, &mut session)
         }

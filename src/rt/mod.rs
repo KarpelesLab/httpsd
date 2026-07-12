@@ -20,7 +20,7 @@ use crate::static_files::StaticFiles;
 #[cfg(feature = "compress")]
 use crate::compress;
 #[cfg(feature = "tls")]
-use crate::tls::TlsAcceptor;
+use crate::tls::{ReloadableAcceptor, TlsAcceptor};
 
 pub(crate) mod common;
 pub(crate) mod redirect;
@@ -47,12 +47,44 @@ use crate::acme::AcmeManager;
 pub(crate) enum TlsMode {
     /// Plain HTTP, no TLS.
     Plain,
-    /// A single static certificate.
+    /// A single static certificate (reloadable from disk on SIGHUP).
     #[cfg(feature = "tls")]
-    Static(TlsAcceptor),
+    Static(ReloadableAcceptor),
     /// Per-connection certificates via ACME (SNI-routed).
     #[cfg(feature = "acme")]
     Acme(AcmeManager),
+}
+
+/// A handle to a running server's reloadable certificate sources. Obtained from
+/// [`Server::reload_handle`] and used (e.g. from a SIGHUP handler) to pick up
+/// renewed certificates without a restart: it clears the ACME cache and re-reads
+/// any static certificate files.
+///
+/// All fields are `Arc`-backed, so the handle is cheap to clone and `Send +
+/// Sync` — it can move into a watcher thread.
+#[derive(Clone)]
+pub struct ReloadHandle {
+    #[cfg(feature = "acme")]
+    acme: Option<AcmeManager>,
+    #[cfg(feature = "tls")]
+    tls: Option<ReloadableAcceptor>,
+}
+
+impl ReloadHandle {
+    /// Reload every source. Best-effort: it attempts all of them and returns the
+    /// first error (only the static file re-read can fail; the ACME cache clear
+    /// cannot).
+    pub fn reload(&self) -> Result<()> {
+        #[cfg(feature = "acme")]
+        if let Some(mgr) = &self.acme {
+            mgr.reload();
+        }
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &self.tls {
+            tls.reload()?;
+        }
+        Ok(())
+    }
 }
 
 /// A default handler used when none is configured: replies `404` to everything.
@@ -73,7 +105,7 @@ pub struct Server {
     /// Cap on concurrent connections from a single client IP (0 = unlimited).
     max_conns_per_ip: u32,
     #[cfg(feature = "tls")]
-    tls: Option<TlsAcceptor>,
+    tls: Option<ReloadableAcceptor>,
     #[cfg(feature = "compress")]
     compression: compress::Options,
     /// `Strict-Transport-Security` value sent on secure responses, if any.
@@ -165,9 +197,20 @@ impl Server {
         self
     }
 
-    /// Enable TLS with the given acceptor (turns the server into HTTPS).
+    /// Enable TLS with the given acceptor (turns the server into HTTPS). The
+    /// acceptor is fixed — its certificate cannot be reloaded at runtime; use
+    /// [`tls_reloadable`](Server::tls_reloadable) for that.
     #[cfg(feature = "tls")]
     pub fn tls(mut self, acceptor: TlsAcceptor) -> Server {
+        self.tls = Some(ReloadableAcceptor::fixed(acceptor));
+        self
+    }
+
+    /// Enable TLS with a [`ReloadableAcceptor`], whose certificate files can be
+    /// re-read at runtime (e.g. on SIGHUP) via the [`ReloadHandle`] returned by
+    /// [`reload_handle`](Server::reload_handle).
+    #[cfg(feature = "tls")]
+    pub fn tls_reloadable(mut self, acceptor: ReloadableAcceptor) -> Server {
         self.tls = Some(acceptor);
         self
     }
@@ -235,6 +278,20 @@ impl Server {
     pub fn graceful(mut self, shutdown: Shutdown) -> Server {
         self.shutdown = Some(shutdown);
         self
+    }
+
+    /// Obtain a [`ReloadHandle`] for this server's reloadable certificate
+    /// sources (its ACME manager and/or static [`ReloadableAcceptor`]). Call it
+    /// after configuring TLS/ACME; the handle can move into a signal watcher and
+    /// reload certificates without a restart. Works regardless of the cert kind,
+    /// so the caller need not know whether ACME or a static file backs the server.
+    pub fn reload_handle(&self) -> ReloadHandle {
+        ReloadHandle {
+            #[cfg(feature = "acme")]
+            acme: self.acme.clone(),
+            #[cfg(feature = "tls")]
+            tls: self.tls.clone(),
+        }
     }
 
     /// Build the shared session configuration.

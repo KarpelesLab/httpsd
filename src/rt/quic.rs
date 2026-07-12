@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,15 +21,15 @@ use crate::error::{Error, Result};
 use crate::h3::H3Conn;
 use crate::rt::shutdown::Shutdown;
 use crate::session::SessionConfig;
-use crate::tls::TlsAcceptor;
+use crate::tls::{ReloadableAcceptor, TlsAcceptor};
 
 #[cfg(feature = "acme")]
 use crate::acme::{AcmeManager, CertChoice};
 
 /// Where the QUIC listener gets a certificate for each new connection.
 pub(crate) enum CertSource {
-    /// One static certificate for every connection.
-    Static(TlsAcceptor),
+    /// One static certificate for every connection (reloadable on SIGHUP).
+    Static(ReloadableAcceptor),
     /// Per-SNI certificates from ACME, selected by peeking the QUIC Initial.
     #[cfg(feature = "acme")]
     Acme(AcmeManager),
@@ -38,10 +39,14 @@ impl CertSource {
     /// Choose the acceptor for a new connection given its first datagram.
     /// Returns `None` to drop the datagram (SNI not yet available, host not
     /// permitted, or no cert issued yet — the client retries / falls back).
+    ///
+    /// Returns an `Arc<TlsAcceptor>` so both arms unify: the static source
+    /// hands out the reloadable cell's current acceptor by shared reference,
+    /// while ACME yields a freshly owned one wrapped in an `Arc`.
     #[cfg_attr(not(feature = "acme"), allow(unused_variables))]
-    fn acceptor_for(&self, peer: SocketAddr, first_datagram: &[u8]) -> Option<TlsAcceptor> {
+    fn acceptor_for(&self, peer: SocketAddr, first_datagram: &[u8]) -> Option<Arc<TlsAcceptor>> {
         match self {
-            CertSource::Static(acceptor) => Some(acceptor.clone()),
+            CertSource::Static(reloadable) => Some(reloadable.current()),
             #[cfg(feature = "acme")]
             CertSource::Acme(mgr) => {
                 // The QUIC ClientHello rides in the encrypted Initial; peek its
@@ -52,7 +57,7 @@ impl CertSource {
                     Ok(None) | Err(_) => return None,
                 };
                 match mgr.choose_cached(info.server_name.as_deref(), peer.ip().is_loopback()) {
-                    CertChoice::Serve(acceptor) => Some(acceptor),
+                    CertChoice::Serve(acceptor) => Some(Arc::new(acceptor)),
                     CertChoice::Reject => None,
                 }
             }

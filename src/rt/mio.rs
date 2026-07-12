@@ -23,7 +23,7 @@ use crate::rt::shutdown::Shutdown;
 use crate::session::{Session, SessionConfig};
 
 #[cfg(feature = "tls")]
-use crate::tls::TlsAcceptor;
+use crate::tls::ReloadableAcceptor;
 
 const LISTENER: Token = Token(0);
 
@@ -131,7 +131,7 @@ pub(crate) fn run(
     addrs: Vec<SocketAddr>,
     cfg: SessionConfig,
     limiter: Arc<common::PeerLimiter>,
-    #[cfg(feature = "tls")] tls: Option<TlsAcceptor>,
+    #[cfg(feature = "tls")] tls: Option<ReloadableAcceptor>,
     shutdown: Shutdown,
 ) -> Result<()> {
     let mut listener = bind_first(&addrs)?;
@@ -276,7 +276,7 @@ fn accept_ready(
     poll: &Poll,
     cfg: &SessionConfig,
     limiter: &Arc<common::PeerLimiter>,
-    #[cfg(feature = "tls")] tls: &Option<TlsAcceptor>,
+    #[cfg(feature = "tls")] tls: &Option<ReloadableAcceptor>,
     conns: &mut HashMap<Token, Conn>,
     next_token: &mut usize,
 ) -> Option<Instant> {
@@ -425,11 +425,12 @@ fn pump_writes(conn: &mut Conn) -> Result<()> {
 
 fn build_session(
     cfg: &SessionConfig,
-    #[cfg(feature = "tls")] tls: &Option<TlsAcceptor>,
+    #[cfg(feature = "tls")] tls: &Option<ReloadableAcceptor>,
 ) -> Result<Session> {
     #[cfg(feature = "tls")]
     if let Some(acceptor) = tls {
-        return Ok(Session::tls(cfg.clone(), acceptor.accept()?));
+        let acc = acceptor.current();
+        return Ok(Session::tls(cfg.clone(), acc.accept()?));
     }
     Ok(Session::plain(cfg.clone()))
 }
