@@ -19,7 +19,7 @@
 
 use std::process::ExitCode;
 
-use httpsd::Server;
+use httpsd::{ReloadHandle, Server};
 
 /// The shared ACME manager passed around the CLI. When the `acme` feature is
 /// off it degrades to `Option<()>` so the same plumbing compiles either way.
@@ -27,6 +27,15 @@ use httpsd::Server;
 type AcmeShared = Option<httpsd::acme::AcmeManager>;
 #[cfg(not(feature = "acme"))]
 type AcmeShared = Option<()>;
+
+/// The shared reloadable static-TLS acceptor passed around the CLI. When the
+/// `tls` feature is off it degrades to `Option<()>` so the plumbing compiles
+/// either way. A single cell is shared between the TCP and HTTP/3 servers so one
+/// SIGHUP reload updates both.
+#[cfg(feature = "tls")]
+type TlsShared = Option<httpsd::tls::ReloadableAcceptor>;
+#[cfg(not(feature = "tls"))]
+type TlsShared = Option<()>;
 
 fn main() -> ExitCode {
     match run() {
@@ -84,10 +93,15 @@ fn install_signal_handlers() {
 #[cfg(not(all(unix, feature = "privdrop")))]
 fn install_signal_handlers() {}
 
-/// Spawn the watcher thread that owns the shutdown handle and the shared ACME
-/// manager. It polls the signal flags every ~100ms, triggers graceful shutdown
-/// on SIGTERM/SIGINT (then exits), and reloads certificates on SIGHUP.
-fn spawn_signal_watcher(shutdown: httpsd::Shutdown, acme: AcmeShared) {
+/// Spawn the watcher thread that owns the shutdown handle and the servers'
+/// [`ReloadHandle`]s. It polls the signal flags every ~100ms, triggers graceful
+/// shutdown on SIGTERM/SIGINT (then exits), and reloads certificates on SIGHUP.
+///
+/// The handles uniformly cover the CLI-flag static-cert case, ACME, and config
+/// mode: each server contributes a handle regardless of how its certificates are
+/// sourced, so one SIGHUP clears the ACME cache and re-reads any static cert
+/// files across every listener.
+fn spawn_signal_watcher(shutdown: httpsd::Shutdown, handles: Vec<ReloadHandle>) {
     use std::time::Duration;
     std::thread::spawn(move || {
         loop {
@@ -97,12 +111,15 @@ fn spawn_signal_watcher(shutdown: httpsd::Shutdown, acme: AcmeShared) {
                 break;
             }
             if RELOAD_REQ.swap(false, Ordering::SeqCst) {
-                #[cfg(feature = "acme")]
-                if let Some(mgr) = &acme {
-                    mgr.reload();
+                // Reload every handle; log per-handle errors but keep going so a
+                // single failed re-read does not skip the others. Reloading the
+                // shared ACME manager or acceptor more than once is idempotent.
+                for handle in &handles {
+                    if let Err(e) = handle.reload() {
+                        eprintln!("httpsd: reload error: {e}");
+                    }
                 }
-                let _ = &acme;
-                eprintln!("httpsd: reloaded (SIGHUP): certificate cache cleared");
+                eprintln!("httpsd: reloaded (SIGHUP): certificates reloaded");
             }
         }
     });
@@ -139,18 +156,25 @@ fn run() -> httpsd::Result<()> {
         ));
     }
 
-    // One graceful-shutdown handle and one shared ACME manager, threaded into
-    // every server (TCP + HTTP/3) so a SIGHUP reload clears the single cache and
-    // a SIGTERM/SIGINT drains every listener.
+    // One graceful-shutdown handle, one shared ACME manager, and one shared
+    // reloadable static-TLS acceptor, threaded into every server (TCP + HTTP/3)
+    // so a SIGHUP reload clears the single cache / re-reads the single cert cell
+    // and a SIGTERM/SIGINT drains every listener.
     let shutdown = httpsd::Shutdown::new();
     let acme = build_acme_shared(&opts)?;
+    let tls = build_reloadable_tls_shared(&opts)?;
+
+    // Collect each server's reload handle so the SIGHUP watcher can reload every
+    // certificate source (static files + ACME cache) uniformly.
+    let mut reload_handles: Vec<ReloadHandle> = Vec::new();
 
     // Serve HTTP/3 on UDP alongside the TCP server by default whenever we have a
     // static TLS certificate. It runs on its own thread; the TCP server
     // (HTTP/1.1 + HTTP/2) stays in the foreground.
     #[cfg(feature = "h3")]
     if opts.http3_enabled() {
-        let h3 = opts.build_server(&acme, &shutdown)?;
+        let h3 = opts.build_server(&acme, &tls, &shutdown)?;
+        reload_handles.push(h3.reload_handle());
         let addr = opts.listen.clone();
         std::thread::spawn(move || {
             if let Err(e) = h3.run_h3() {
@@ -160,7 +184,8 @@ fn run() -> httpsd::Result<()> {
         eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
     }
 
-    let server = opts.build_server(&acme, &shutdown)?;
+    let server = opts.build_server(&acme, &tls, &shutdown)?;
+    reload_handles.push(server.reload_handle());
     let addr = opts.listen.clone();
     let scheme = if opts.is_tls() || opts.acme_accept_tos {
         "https"
@@ -175,7 +200,7 @@ fn run() -> httpsd::Result<()> {
     // Install signal handlers and start the watcher before serving, so a signal
     // arriving during startup is still honored.
     install_signal_handlers();
-    spawn_signal_watcher(shutdown, acme);
+    spawn_signal_watcher(shutdown, reload_handles);
 
     server.run()
 }
@@ -194,6 +219,19 @@ fn build_acme_shared(opts: &Options) -> httpsd::Result<AcmeShared> {
             "automatic certificates requested but the `acme` feature is not enabled".into(),
         ));
     }
+    Ok(None)
+}
+
+/// Build the one shared reloadable static-TLS acceptor for the CLI-flag
+/// `--tls-cert`/`--tls-key` case, if any, so the TCP and HTTP/3 servers share a
+/// single cell and one SIGHUP reload updates both. Kept feature-agnostic so the
+/// same call site works either way.
+#[cfg(feature = "tls")]
+fn build_reloadable_tls_shared(opts: &Options) -> httpsd::Result<TlsShared> {
+    opts.build_reloadable_tls()
+}
+#[cfg(not(feature = "tls"))]
+fn build_reloadable_tls_shared(_opts: &Options) -> httpsd::Result<TlsShared> {
     Ok(None)
 }
 
@@ -235,7 +273,7 @@ OPTIONS:
 
 SIGNALS (Unix):
     SIGTERM/SIGINT          graceful shutdown (stop accepting, drain in-flight)
-    SIGHUP                  reload certificates (clear the ACME cache)
+    SIGHUP                  reload certificates (ACME cache + static cert files)
 ";
 
 struct Options {
@@ -387,9 +425,11 @@ impl Options {
     fn build_server(
         &self,
         acme: &AcmeShared,
+        tls: &TlsShared,
         shutdown: &httpsd::Shutdown,
     ) -> httpsd::Result<Server> {
-        // A config file takes over completely.
+        // A config file takes over completely. Its static certs are already made
+        // reloadable inside `into_server`, so its `reload_handle()` covers them.
         if let Some(path) = &self.config {
             return Ok(httpsd::ServerConfig::from_file(path)?
                 .into_server()?
@@ -409,7 +449,7 @@ impl Options {
             server = server.server_name(Some(name.clone()));
         }
 
-        server = self.apply_tls(server)?;
+        server = self.apply_tls(server, tls)?;
         if self.no_compress {
             server = self.disable_compress(server);
         }
@@ -569,24 +609,41 @@ impl Options {
         Ok(server)
     }
 
+    /// Build the shared reloadable acceptor for the CLI-flag `--tls-cert`/
+    /// `--tls-key` case. Self-signed certs have no file backing and are attached
+    /// (as fixed acceptors) directly in `apply_tls`, so they are not built here.
     #[cfg(feature = "tls")]
-    fn apply_tls(&self, server: Server) -> httpsd::Result<Server> {
-        match (&self.tls_cert, &self.tls_key, &self.self_signed) {
-            (Some(cert), Some(key), _) => {
-                Ok(server.tls(httpsd::tls::TlsAcceptor::from_pem_files(cert, key)?))
-            }
-            (Some(_), None, _) | (None, Some(_), _) => Err(httpsd::Error::Config(
+    fn build_reloadable_tls(&self) -> httpsd::Result<Option<httpsd::tls::ReloadableAcceptor>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Ok(Some(httpsd::tls::ReloadableAcceptor::from_pem_files(
+                cert, key,
+            )?)),
+            (Some(_), None) | (None, Some(_)) => Err(httpsd::Error::Config(
                 "--tls-cert requires --tls-key".into(),
             )),
-            (None, None, Some(host)) => {
-                Ok(server.tls(httpsd::tls::TlsAcceptor::self_signed(&[host.as_str()])?))
-            }
-            (None, None, None) => Ok(server),
+            (None, None) => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    fn apply_tls(&self, server: Server, tls: &TlsShared) -> httpsd::Result<Server> {
+        // A file-backed cert was built once (shared across TCP + HTTP/3) as a
+        // reloadable acceptor; attach that shared cell so one SIGHUP updates both.
+        if let Some(acceptor) = tls {
+            return Ok(server.tls_reloadable(acceptor.clone()));
+        }
+        // Otherwise fall back to a self-signed cert (no file backing, so fixed),
+        // or plain HTTP. The cert+key/only-one-of validation happened in
+        // `build_reloadable_tls`, so here `tls` is `None` only when neither
+        // cert+key was given.
+        match &self.self_signed {
+            Some(host) => Ok(server.tls(httpsd::tls::TlsAcceptor::self_signed(&[host.as_str()])?)),
+            None => Ok(server),
         }
     }
 
     #[cfg(not(feature = "tls"))]
-    fn apply_tls(&self, server: Server) -> httpsd::Result<Server> {
+    fn apply_tls(&self, server: Server, _tls: &TlsShared) -> httpsd::Result<Server> {
         if self.is_tls() {
             return Err(httpsd::Error::Config(
                 "TLS requested but the `tls` feature is not enabled".into(),
@@ -627,10 +684,15 @@ fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> h
 
     let (tx, rx) = mpsc::channel::<()>();
 
-    // One shutdown handle and one shared ACME manager for every listener, built
-    // before the servers so `.graceful(...)` is installed prior to spawning.
+    // One shutdown handle, one shared ACME manager, and one shared reloadable
+    // static-TLS acceptor for every listener, built before the servers so
+    // `.graceful(...)` is installed prior to spawning.
     let shutdown = httpsd::Shutdown::new();
     let acme = build_acme_shared(opts)?;
+    let tls = build_reloadable_tls_shared(opts)?;
+
+    // Collect each server's reload handle for the SIGHUP watcher.
+    let mut reload_handles: Vec<ReloadHandle> = Vec::new();
 
     #[cfg(feature = "h3")]
     let h3_on = opts.http3_enabled();
@@ -643,16 +705,18 @@ fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> h
     #[cfg(feature = "h3")]
     if h3_on {
         let h3 = opts
-            .build_server(&acme, &shutdown)?
+            .build_server(&acme, &tls, &shutdown)?
             .notify_bound(tx.clone());
+        reload_handles.push(h3.reload_handle());
         let addr = opts.listen.clone();
         eprintln!("httpsd: also serving HTTP/3 on udp/{addr}");
         handles.push(std::thread::spawn(move || h3.run_h3()));
     }
 
     let server = opts
-        .build_server(&acme, &shutdown)?
+        .build_server(&acme, &tls, &shutdown)?
         .notify_bound(tx.clone());
+    reload_handles.push(server.reload_handle());
     let addr = opts.listen.clone();
     let scheme = if opts.is_tls() || opts.acme_accept_tos {
         "https"
@@ -709,9 +773,10 @@ fn run_with_privdrop(opts: &Options, priv_drop: httpsd::privdrop::PrivDrop) -> h
     // Now that privileges are dropped and the listeners are serving, install the
     // signal handlers and start the watcher. On SIGTERM/SIGINT it triggers the
     // shared shutdown, so the serving threads drain and exit and `join_all`
-    // returns `Ok(())`; on SIGHUP it reloads the shared ACME cache.
+    // returns `Ok(())`; on SIGHUP it reloads every certificate source via the
+    // collected handles (shared ACME cache + shared static cert files).
     install_signal_handlers();
-    spawn_signal_watcher(shutdown, acme);
+    spawn_signal_watcher(shutdown, reload_handles);
 
     // Serve. join blocks on the serving threads; they return once they finish
     // draining after a shutdown request (or immediately on a fatal error).

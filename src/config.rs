@@ -353,19 +353,23 @@ impl ServerConfig {
         let Some(tls) = &self.tls else {
             return Ok(server);
         };
-        let acceptor = match (&tls.cert, &tls.key, &tls.self_signed) {
-            (Some(cert), Some(key), _) => crate::tls::TlsAcceptor::from_pem_files(cert, key)?,
+        match (&tls.cert, &tls.key, &tls.self_signed) {
+            // File-backed cert: use the reloadable path so a SIGHUP re-reads the
+            // files without a restart.
+            (Some(cert), Some(key), _) => {
+                Ok(server
+                    .tls_reloadable(crate::tls::ReloadableAcceptor::from_pem_files(cert, key)?))
+            }
+            // Self-signed is generated in memory with no file backing; keep it a
+            // fixed acceptor (nothing to reload).
             (_, _, Some(names)) => {
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                crate::tls::TlsAcceptor::self_signed(&refs)?
+                Ok(server.tls(crate::tls::TlsAcceptor::self_signed(&refs)?))
             }
-            _ => {
-                return Err(Error::Config(
-                    "[tls] requires either cert+key or self_signed".into(),
-                ));
-            }
-        };
-        Ok(server.tls(acceptor))
+            _ => Err(Error::Config(
+                "[tls] requires either cert+key or self_signed".into(),
+            )),
+        }
     }
 
     #[cfg(all(
