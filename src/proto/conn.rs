@@ -824,16 +824,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i <= last_start {
         // Jump straight to the next occurrence of the needle's first byte.
-        match haystack[i..=last_start].iter().position(|&b| b == first) {
-            Some(off) => {
-                let cand = i + off;
-                if haystack[cand..cand + nlen] == *needle {
-                    return Some(cand);
-                }
-                i = cand + 1;
-            }
-            None => return None,
+        let off = haystack[i..=last_start].iter().position(|&b| b == first)?;
+        let cand = i + off;
+        if haystack[cand..cand + nlen] == *needle {
+            return Some(cand);
         }
+        i = cand + 1;
     }
     None
 }
