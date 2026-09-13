@@ -575,14 +575,13 @@ impl Options {
             }
             set
         });
-        let cfg = httpsd::acme::AcmeConfig {
-            directory_url: directory,
-            accept_tos: true,
-            email: self.acme_email.clone(),
-            host_whitelist: whitelist,
-            default_host,
-            cert_dir: self.cert_dir.clone().map(std::path::PathBuf::from),
-        };
+        let mut cfg = httpsd::acme::AcmeConfig::default();
+        cfg.directory_url = directory;
+        cfg.accept_tos = true;
+        cfg.email = self.acme_email.clone();
+        cfg.host_whitelist = whitelist;
+        cfg.default_host = default_host;
+        cfg.cert_dir = self.cert_dir.clone().map(std::path::PathBuf::from);
         Ok(Some(httpsd::acme::AcmeManager::new(cfg)?))
     }
 

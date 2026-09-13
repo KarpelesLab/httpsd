@@ -44,7 +44,12 @@ const NEG_CACHE_MAX: usize = 4096;
 const MAX_INFLIGHT: usize = 16;
 
 /// Configuration for automatic certificate management.
+///
+/// Build one from [`AcmeConfig::default`] and assign the fields you care
+/// about; the struct is `#[non_exhaustive]` so that adding a setting later is
+/// not a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AcmeConfig {
     /// ACME directory URL (defaults to Let's Encrypt production).
     pub directory_url: String,

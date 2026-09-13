@@ -85,8 +85,13 @@ impl Default for CompressConfig {
 }
 
 /// Automatic-certificate (ACME) settings.
+///
+/// Build one from [`AcmeFileConfig::default`] and assign the fields you care
+/// about; the struct is `#[non_exhaustive]` so that adding a setting later is
+/// not a breaking change.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AcmeFileConfig {
     /// Must be `true` to enable automatic issuance (accepts the CA's ToS).
     #[serde(default)]
