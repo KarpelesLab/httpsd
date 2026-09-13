@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "httpsd"
-version = "0.2.0"
+version = "0.1.2"
 dependencies = [
  "compcol 0.6.11",
  "http",
