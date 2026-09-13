@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/KarpelesLab/httpsd/compare/v0.1.1...v0.1.2) - 2026-09-13
+
+### Fixed
+
+- *(h3)* enforce max field-section size and harden frame-length cast
+- *(quic)* anchor loss-recovery timers to connection construction
+
+### Other
+
+- mark AcmeConfig and AcmeFileConfig non_exhaustive
+- pin the MSRV job to 1.89, matching Cargo.toml
+- use as_chunks in parse_settings (newer clippy)
+- update to purecrypto 0.8, toml 1.1, and latest minors
+- use ? instead of match in find_subslice (newer clippy)
+- drop needless borrow in reload test helper
+- SIGHUP reloads static certs + works in config mode
+- thread ReloadableAcceptor through the static-TLS path
+- add ReloadableAcceptor for hot cert reload
+- reset accepted sockets to blocking for Windows portability
+- signal-driven graceful shutdown + SIGHUP cert reload
+- add AcmeManager::reload() to clear cached certs
+- Shutdown primitive + graceful drain across runtimes
+- expose max_conns_per_ip (F6)
+- thread the per-IP limiter through the TCP runtimes (F6)
+- add per-IP concurrent-connection limiter (F6)
+- close TOCTOU/symlink-escape with race-free confined open
+- silence dead_code for still_root_after_drop on non-unix
+- harden connection engine against five HTTP/2 DoS findings
+- add MIN_PROGRESS slow-trickle floor to serve loop
+- fix accept-backoff loop freeze and EINTR shutdown
+- verify gid drop and fail when still root [MED]
+- route on percent-decoded path, reject encoded separators [HIGH]
+- require https:// for the ACME directory URL
+- authoritative host validation at ACME entry points
+- create key temp file with O_EXCL + target mode (no world-readable race)
+- fix percent-decode trailing triplet, canonicalize root once, 404 on symlink escape
+- fix three request-parsing security findings
+- Stop tracking .claude/ (accidentally committed Claude memory)
+- add a default host for SNI-less connections
+- parse the leaf cert for expiry, not the whole chain
+
 ## [0.1.1](https://github.com/KarpelesLab/httpsd/compare/v0.1.0...v0.1.1) - 2026-06-30
 
 ### Fixed
