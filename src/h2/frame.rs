@@ -151,7 +151,9 @@ pub fn parse_settings(payload: &[u8]) -> Option<Vec<(u16, u32)>> {
     }
     Some(
         payload
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| {
                 let id = u16::from_be_bytes([c[0], c[1]]);
                 let value = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
