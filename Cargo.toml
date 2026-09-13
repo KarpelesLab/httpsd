@@ -2,7 +2,7 @@
 name = "httpsd"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A pure-Rust HTTP/HTTPS server — usable as a sans-I/O library with pluggable runtimes (thread pool, tokio, mio) or as a CLI that serves a directory or a TOML config."
 repository = "https://github.com/KarpelesLab/httpsd"
 license = "MIT"
@@ -74,20 +74,20 @@ rt-mio = ["dep:mio"]
 [dependencies]
 # purecrypto's `tls` module pulls in DTLS/QUIC paths that are wired to the
 # default feature set, so we use its defaults rather than cherry-picking.
-purecrypto = { version = "0.6.25", optional = true }
-compcol = { version = "0.6.5", optional = true, default-features = false, features = ["std", "gzip", "deflate", "zlib"] }
-http = { version = "1", optional = true }
-serde = { version = "1", optional = true, features = ["derive"] }
-toml = { version = "0.8", optional = true }
-tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
-mio = { version = "1", optional = true, features = ["os-poll", "net"] }
-rsurl = { version = "0.1.2", optional = true }
+purecrypto = { version = "0.8.3", optional = true }
+compcol = { version = "0.6.11", optional = true, default-features = false, features = ["std", "gzip", "deflate", "zlib"] }
+http = { version = "1.5", optional = true }
+serde = { version = "1.0.229", optional = true, features = ["derive"] }
+toml = { version = "1.1", optional = true }
+tokio = { version = "1.53", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
+mio = { version = "1.2", optional = true, features = ["os-poll", "net"] }
+rsurl = { version = "0.1.12", optional = true }
 # Privilege-dropping syscalls (setuid/setgid/chroot, getpwnam_r/getgrnam_r).
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.186", optional = true }
 
 [dev-dependencies]
-purecrypto = "0.6.25"
-compcol = { version = "0.6.5", default-features = false, features = ["std", "gzip"] }
+purecrypto = "0.8.3"
+compcol = { version = "0.6.11", default-features = false, features = ["std", "gzip"] }
 
 [package.metadata.docs.rs]
 all-features = true
