@@ -85,7 +85,7 @@ jobs:
         run: cargo build --all-features
 
   msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV (Rust 1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -93,8 +93,8 @@ jobs:
       # Keep this pin in sync with `rust-version` in Cargo.toml. The default
       # feature set (no tokio/mio/rsurl) is the surface we promise to build on
       # the declared minimum; compile-only (behavior is covered by `test`).
-      - name: Install Rust 1.88 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.89 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.89
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
