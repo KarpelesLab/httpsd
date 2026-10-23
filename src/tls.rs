@@ -166,8 +166,8 @@ impl TlsAcceptor {
     /// HTTP/3 connection, advertising the `h3` ALPN. A new config (and freshly
     /// parsed signing key) is needed per connection because neither type is
     /// reusable.
-    // `QuicConfig` is `#[non_exhaustive]`, so it can only be built by mutating
-    // a `default()` — hence the field reassignment.
+    // `QuicConfig` and `TransportParameters` are `#[non_exhaustive]`, so they
+    // can only be built by mutating a `default()` — hence the field reassignment.
     #[cfg(feature = "h3")]
     #[allow(clippy::field_reassign_with_default)]
     pub fn quic_config(&self) -> Result<purecrypto::quic::QuicConfig> {
@@ -181,18 +181,16 @@ impl TlsAcceptor {
             .alpn(vec![b"h3".to_vec()])
             .build();
 
-        let transport_params = TransportParameters {
-            max_idle_timeout_ms: Some(30_000),
-            max_udp_payload_size: Some(1500),
-            initial_max_data: Some(8 << 20),
-            initial_max_stream_data_bidi_local: Some(1 << 20),
-            initial_max_stream_data_bidi_remote: Some(1 << 20),
-            initial_max_stream_data_uni: Some(1 << 20),
-            initial_max_streams_bidi: Some(128),
-            initial_max_streams_uni: Some(8),
-            active_connection_id_limit: Some(2),
-            ..TransportParameters::default()
-        };
+        let mut transport_params = TransportParameters::default();
+        transport_params.max_idle_timeout_ms = Some(30_000);
+        transport_params.max_udp_payload_size = Some(1500);
+        transport_params.initial_max_data = Some(8 << 20);
+        transport_params.initial_max_stream_data_bidi_local = Some(1 << 20);
+        transport_params.initial_max_stream_data_bidi_remote = Some(1 << 20);
+        transport_params.initial_max_stream_data_uni = Some(1 << 20);
+        transport_params.initial_max_streams_bidi = Some(128);
+        transport_params.initial_max_streams_uni = Some(8);
+        transport_params.active_connection_id_limit = Some(2);
 
         let mut cfg = QuicConfig::default();
         cfg.tls = tls;

@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 
-use compcol::hpack::{DEFAULT_TABLE_SIZE, HeaderField, HpackDecoder, HpackEncoder};
+use compcol::hpack::{
+    DEFAULT_MAX_HEADER_LIST_SIZE, DEFAULT_TABLE_SIZE, HeaderField, HpackDecoder, HpackEncoder,
+};
 
 use super::frame::{self, CLIENT_PREFACE, FrameHeader, errcode, flag, ftype, settings};
 use crate::proto::{
@@ -164,7 +166,18 @@ impl H2Conn {
             outbuf: Vec::new(),
             limits,
             server_name,
-            hpack_dec: HpackDecoder::new(),
+            // Hard decoded-size cap inside the decoder, well above our own
+            // `max_header_bytes` check in `finish_headers`: a modest overrun is
+            // still decoded in full (HPACK stays in sync) and reset per stream,
+            // while an expansion bomb is cut off mid-decode and, since the
+            // table may then be out of sync, fails the connection.
+            hpack_dec: HpackDecoder::with_limits(
+                DEFAULT_TABLE_SIZE,
+                limits
+                    .max_header_bytes
+                    .saturating_mul(4)
+                    .max(DEFAULT_MAX_HEADER_LIST_SIZE),
+            ),
             hpack_enc: HpackEncoder::new(),
             preface_seen: false,
             our_settings_sent: false,
@@ -968,7 +981,7 @@ mod tests {
         c.respond(1, Response::text("hello h2"));
         let out = c.take_out();
         let (hblock, data) = collect(&out, 1);
-        let fields = HpackDecoder::new()
+        let fields = HpackDecoder::default()
             .decode(&hblock)
             .expect("decode resp headers");
         let status = fields
@@ -1008,7 +1021,7 @@ mod tests {
         // No DATA frames at all for a HEAD response...
         assert!(data.is_empty(), "HEAD must not send a body");
         // ...but the entity Content-Length is still advertised.
-        let fields = HpackDecoder::new().decode(&hblock).expect("decode");
+        let fields = HpackDecoder::default().decode(&hblock).expect("decode");
         let clen = fields
             .iter()
             .find(|f| f.name == b"content-length")

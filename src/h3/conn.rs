@@ -88,7 +88,9 @@ impl H3Conn {
             limits,
             server_name,
             qpack_enc: QpackEncoder::new(),
-            qpack_dec: QpackDecoder::new(),
+            // Match what our SETTINGS advertise: no dynamic table, and the
+            // decoded field section bounded by `max_header_bytes`.
+            qpack_dec: QpackDecoder::with_limits(0, limits.max_header_bytes),
             started: false,
             control_stream: None,
             reqs: BTreeMap::new(),
