@@ -408,8 +408,10 @@ impl Server {
     /// address(es) as the TCP server (but over UDP). HTTP/3 is always encrypted.
     ///
     /// Under ACME, certificates are selected per-connection by peeking the SNI
-    /// from the QUIC Initial (`purecrypto::quic::peek_initial_sni`); the QUIC
-    /// loop serves already-issued certs (the TCP path does the issuing). With a
+    /// from the client's QUIC Initial datagrams (a ClientHello with a
+    /// post-quantum key share spans two, so the first is held until the second
+    /// arrives); the QUIC loop serves already-issued certs (the TCP path does
+    /// the issuing). With a
     /// static [`tls`](Server::tls) acceptor, that one certificate is used.
     /// Blocks the calling thread.
     #[cfg(feature = "h3")]

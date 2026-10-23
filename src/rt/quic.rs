@@ -37,35 +37,71 @@ pub(crate) enum CertSource {
     Acme(AcmeManager),
 }
 
+/// What [`CertSource::acceptor_for`] decided for a new connection.
+#[cfg_attr(not(feature = "acme"), allow(dead_code))]
+enum Choice {
+    /// Serve with this acceptor; the SNI, if the peek recovered it.
+    Ready(Arc<TlsAcceptor>, Option<String>),
+    /// The ClientHello isn't complete in the datagrams so far: keep them and
+    /// retry when the client's next datagram arrives.
+    NeedMore,
+    /// Drop the datagrams (not a readable Initial, host not served, or no cert
+    /// issued yet — the client retries or falls back to TCP).
+    Drop,
+}
+
 impl CertSource {
-    /// Choose the acceptor for a new connection given its first datagram.
-    /// Returns `None` to drop the datagram (SNI not yet available, host not
-    /// permitted, or no cert issued yet — the client retries / falls back).
+    /// Choose the acceptor for a new connection from the client's first
+    /// datagram(s), in arrival order. A ClientHello carrying a post-quantum
+    /// key share (curl, current browsers) spans two datagrams, so the caller
+    /// keeps them on [`Choice::NeedMore`] and calls again with the next one.
     ///
-    /// Returns an `Arc<TlsAcceptor>` so both arms unify: the static source
-    /// hands out the reloadable cell's current acceptor by shared reference,
-    /// while ACME yields a freshly owned one wrapped in an `Arc`.
+    /// The acceptor is an `Arc<TlsAcceptor>` so both arms unify: the static
+    /// source hands out the reloadable cell's current acceptor by shared
+    /// reference, while ACME yields a freshly owned one wrapped in an `Arc`.
     #[cfg_attr(not(feature = "acme"), allow(unused_variables))]
-    fn acceptor_for(&self, peer: SocketAddr, first_datagram: &[u8]) -> Option<Arc<TlsAcceptor>> {
+    fn acceptor_for(&self, peer: SocketAddr, datagrams: &[&[u8]]) -> Choice {
+        // The QUIC ClientHello rides in the encrypted Initial; peek its SNI
+        // without committing to a connection.
+        let peek = purecrypto::quic::peek_initial_sni_datagrams(datagrams);
         match self {
-            CertSource::Static(reloadable) => Some(reloadable.current()),
+            // One certificate for everyone: the SNI is only informational.
+            CertSource::Static(reloadable) => Choice::Ready(
+                reloadable.current(),
+                peek.ok().flatten().and_then(|info| info.server_name),
+            ),
             #[cfg(feature = "acme")]
             CertSource::Acme(mgr) => {
-                // The QUIC ClientHello rides in the encrypted Initial; peek its
-                // SNI without committing to a connection.
-                let info = match purecrypto::quic::peek_initial_sni(first_datagram) {
+                let info = match peek {
                     Ok(Some(info)) => info,
-                    // Need the full Initial, or not a ClientHello — wait for retry.
-                    Ok(None) | Err(_) => return None,
+                    Ok(None) => return Choice::NeedMore,
+                    Err(_) => return Choice::Drop,
                 };
                 match mgr.choose_cached(info.server_name.as_deref(), peer.ip().is_loopback()) {
-                    CertChoice::Serve(acceptor) => Some(Arc::new(acceptor)),
-                    CertChoice::Reject => None,
+                    CertChoice::Serve(acceptor) => {
+                        Choice::Ready(Arc::new(acceptor), info.server_name)
+                    }
+                    CertChoice::Reject => Choice::Drop,
                 }
             }
         }
     }
 }
+
+/// The first datagrams of a client whose ClientHello is not complete yet
+/// (held only while choosing its certificate).
+struct PendingInitial {
+    since: Instant,
+    datagrams: Vec<Vec<u8>>,
+}
+
+/// Cap on clients whose first datagrams are held at once. Each holds at most
+/// [`SNI_PROBE_MAX`] datagrams of at most [`RECV_BUF`] bytes, so the table is
+/// bounded (~8 MiB) even under a flood of spoofed Initials.
+const MAX_PENDING_INITIALS: usize = 1024;
+/// How long held datagrams wait for the rest of their ClientHello. The rest
+/// normally arrives right behind the first datagram.
+const PENDING_INITIAL_TTL: Duration = Duration::from_secs(2);
 
 /// QUIC datagrams must fit a conservative MTU; 1350 is the usual safe ceiling,
 /// we read into a slightly larger buffer.
@@ -143,6 +179,7 @@ pub(crate) fn run(
         let _ = ready.send(());
     }
     let mut conns: HashMap<SocketAddr, Conn> = HashMap::new();
+    let mut pending: HashMap<SocketAddr, PendingInitial> = HashMap::new();
     let mut buf = [0u8; RECV_BUF];
     // Set by stream-body producers (through each H3Conn's waker).
     let stream_dirty = Arc::new(AtomicBool::new(false));
@@ -188,6 +225,7 @@ pub(crate) fn run(
                 if let Err(e) = on_datagram(
                     &socket,
                     &mut conns,
+                    &mut pending,
                     peer,
                     &data,
                     &cfg,
@@ -219,6 +257,7 @@ pub(crate) fn run(
         conns.retain(|_, c| {
             !c.quic.is_closed() && now.saturating_duration_since(c.last_seen) < CONN_IDLE_TIMEOUT
         });
+        pending.retain(|_, p| now.saturating_duration_since(p.since) < PENDING_INITIAL_TTL);
     }
 }
 
@@ -235,19 +274,39 @@ fn bind_first(addrs: &[SocketAddr]) -> Result<UdpSocket> {
         .unwrap_or_else(|| Error::Config("no listen address".into())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn on_datagram(
     socket: &UdpSocket,
     conns: &mut HashMap<SocketAddr, Conn>,
+    pending: &mut HashMap<SocketAddr, PendingInitial>,
     peer: SocketAddr,
     data: &[u8],
     cfg: &SessionConfig,
     certs: &CertSource,
     stream_dirty: &Arc<AtomicBool>,
 ) -> Result<()> {
+    // The datagrams to feed the connection: just this one, or — for a new
+    // connection whose ClientHello spanned several — all of them, in order.
+    let mut feed = vec![data.to_vec()];
     if !conns.contains_key(&peer) {
-        // New connection: pick the certificate from the Initial's SNI.
-        let Some(acceptor) = certs.acceptor_for(peer, data) else {
-            return Ok(()); // SNI unavailable / host not served — drop, client retries
+        // New connection: pick the certificate from the Initial's SNI,
+        // together with any earlier datagrams of an incomplete ClientHello.
+        let mut held = pending
+            .remove(&peer)
+            .map(|p| p.datagrams)
+            .unwrap_or_default();
+        held.push(data.to_vec());
+        if held.len() > SNI_PROBE_MAX {
+            held.remove(0);
+        }
+        let refs: Vec<&[u8]> = held.iter().map(Vec::as_slice).collect();
+        let (acceptor, server_name) = match certs.acceptor_for(peer, &refs) {
+            Choice::Ready(acceptor, server_name) => (acceptor, server_name),
+            Choice::NeedMore => {
+                hold_initial(pending, peer, held);
+                return Ok(());
+            }
+            Choice::Drop => return Ok(()),
         };
         // Bound the connection table so spoofed source addresses can't exhaust
         // memory. At the cap, try to reclaim a closed/stuck connection; if none
@@ -258,11 +317,9 @@ fn on_datagram(
         let qcfg = acceptor.quic_config()?;
         let quic = QuicConnection::server(qcfg).map_err(qerr)?;
         let mut h3 = H3Conn::new(cfg.limits, cfg.server_name.clone());
-        let server_name = purecrypto::quic::peek_initial_sni(data)
-            .ok()
-            .flatten()
-            .and_then(|info| info.server_name);
-        let sni_probe = server_name.is_none().then(|| vec![data.to_vec()]);
+        // With a static cert the connection starts before the SNI is known;
+        // keep peeking at the next datagrams for it.
+        let sni_probe = server_name.is_none().then(|| held.clone());
         h3.set_conn_info(h3_conn_info(peer, socket.local_addr().ok(), server_name));
         {
             let dirty = Arc::clone(stream_dirty);
@@ -279,14 +336,37 @@ fn on_datagram(
                 sni_probe,
             },
         );
+        feed = held;
     } else if let Some(conn) = conns.get_mut(&peer) {
         probe_sni(socket, peer, conn, data);
     }
     let conn = conns.get_mut(&peer).unwrap();
     conn.last_seen = Instant::now();
     conn.quic.set_now_secs(unix_secs());
-    conn.quic.feed_datagram_from(peer, data).map_err(qerr)?;
+    for dg in &feed {
+        conn.quic.feed_datagram_from(peer, dg).map_err(qerr)?;
+    }
     service(socket, peer, conn, cfg)
+}
+
+/// Keep a client's first datagrams until the rest of its ClientHello arrives.
+/// At the cap, the oldest held client is dropped (it falls back to retrying).
+fn hold_initial(
+    pending: &mut HashMap<SocketAddr, PendingInitial>,
+    peer: SocketAddr,
+    datagrams: Vec<Vec<u8>>,
+) {
+    if pending.len() >= MAX_PENDING_INITIALS {
+        let oldest = pending
+            .iter()
+            .min_by_key(|(_, p)| p.since)
+            .map(|(peer, _)| *peer);
+        if let Some(oldest) = oldest {
+            pending.remove(&oldest);
+        }
+    }
+    let since = Instant::now();
+    pending.insert(peer, PendingInitial { since, datagrams });
 }
 
 /// Retry the SNI peek with this datagram added to the ones kept so far, until
@@ -398,4 +478,129 @@ fn unix_secs() -> u64 {
 
 fn qerr<E: std::fmt::Debug>(e: E) -> Error {
     Error::Tls(format!("quic: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use purecrypto::quic::QuicConfig;
+
+    /// A real client first flight from purecrypto's QUIC client. It offers a
+    /// post-quantum key share, so its ClientHello spans two datagrams — like
+    /// curl and current browsers.
+    fn client_flight(server_name: &str) -> Vec<Vec<u8>> {
+        let tls = purecrypto::tls::Config::builder()
+            .rng(Arc::new(purecrypto::rng::OsRng))
+            .tls_only()
+            .server_name(server_name)
+            .verify_certificates(false)
+            .alpn(vec![b"h3".to_vec()])
+            .build();
+        let mut cfg = QuicConfig::default();
+        cfg.tls = tls;
+        let mut client = QuicConnection::client(cfg, server_name).unwrap();
+        let mut flight = Vec::new();
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            flight.push(dg);
+        }
+        assert_eq!(flight.len(), 2, "expected a two-datagram ClientHello");
+        flight
+    }
+
+    #[cfg(feature = "acme")]
+    #[allow(clippy::field_reassign_with_default)] // AcmeConfig is non-exhaustive
+    fn acme_source() -> CertSource {
+        let dir = std::env::temp_dir().join(format!("httpsd-quic-test-{}", std::process::id()));
+        let mut cfg = crate::acme::AcmeConfig::default();
+        cfg.cert_dir = Some(dir);
+        CertSource::Acme(AcmeManager::new(cfg).unwrap())
+    }
+
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_waits_for_the_whole_client_hello() {
+        let flight = client_flight("h3.example");
+        let certs = acme_source();
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        assert!(matches!(
+            certs.acceptor_for(peer, &[&flight[0]]),
+            Choice::NeedMore
+        ));
+        match certs.acceptor_for(peer, &[&flight[0], &flight[1]]) {
+            Choice::Ready(_, sni) => assert_eq!(sni.as_deref(), Some("h3.example")),
+            _ => panic!("both datagrams together must select a certificate"),
+        }
+    }
+
+    /// The whole path: the first datagram is held, the second completes the
+    /// ClientHello, and the connection is created from both (the server
+    /// answers with its handshake).
+    #[cfg(feature = "acme")]
+    #[test]
+    fn two_datagram_initial_opens_a_connection() {
+        let flight = client_flight("localhost");
+        let certs = acme_source();
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = client.local_addr().unwrap();
+        let cfg = SessionConfig::new(Arc::new(|_: &crate::proto::Request| {
+            crate::proto::Response::text("x")
+        }));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let mut conns = HashMap::new();
+        let mut pending = HashMap::new();
+
+        on_datagram(
+            &server,
+            &mut conns,
+            &mut pending,
+            peer,
+            &flight[0],
+            &cfg,
+            &certs,
+            &dirty,
+        )
+        .unwrap();
+        assert!(
+            conns.is_empty(),
+            "no connection before the ClientHello is complete"
+        );
+        assert_eq!(pending.len(), 1);
+
+        on_datagram(
+            &server,
+            &mut conns,
+            &mut pending,
+            peer,
+            &flight[1],
+            &cfg,
+            &certs,
+            &dirty,
+        )
+        .unwrap();
+        assert!(conns.contains_key(&peer), "connection created");
+        assert!(pending.is_empty());
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; RECV_BUF];
+        let (n, from) = client.recv_from(&mut buf).expect("server handshake reply");
+        assert!(n > 0);
+        assert_eq!(from, server.local_addr().unwrap());
+    }
+
+    #[test]
+    fn held_initials_are_capped() {
+        let mut pending = HashMap::new();
+        for i in 0..(MAX_PENDING_INITIALS + 10) {
+            let peer: SocketAddr = format!("10.0.{}.{}:443", i / 256, i % 256).parse().unwrap();
+            hold_initial(&mut pending, peer, vec![vec![0u8; 8]]);
+        }
+        assert_eq!(pending.len(), MAX_PENDING_INITIALS);
+    }
 }
