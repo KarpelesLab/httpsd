@@ -9,6 +9,7 @@
 //! manages directly.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use compcol::hpack::HeaderField;
 use compcol::qpack::{QpackDecoder, QpackEncoder};
@@ -16,7 +17,8 @@ use purecrypto::quic::{QuicConnection, StreamId};
 
 use crate::error::Result;
 use crate::proto::{
-    Body, Limits, Method, OutBody, Request, Response, Version, request_head, response_fields,
+    Avail, Body, ConnInfo, Limits, Method, OutBody, Request, Response, Version, Waker,
+    request_head, response_fields,
 };
 use crate::session::SessionConfig;
 
@@ -79,6 +81,10 @@ pub struct H3Conn {
     started: bool,
     control_stream: Option<u64>,
     reqs: BTreeMap<u64, ReqStream>,
+    /// Connection facts attached to every request.
+    conn_info: Option<Arc<ConnInfo>>,
+    /// Fired when a stream body has new data to send.
+    waker: Option<Waker>,
 }
 
 impl H3Conn {
@@ -94,7 +100,29 @@ impl H3Conn {
             started: false,
             control_stream: None,
             reqs: BTreeMap::new(),
+            conn_info: None,
+            waker: None,
         }
+    }
+
+    /// Attach connection info (addresses, TLS details) to every request this
+    /// connection delivers to the handler.
+    pub fn set_conn_info(&mut self, info: Arc<ConnInfo>) {
+        self.conn_info = Some(info);
+    }
+
+    /// Register a callback fired (from the producer's thread) whenever a
+    /// stream response body ([`Body::channel`]) has new data or ends. The
+    /// runtime should then call [`drive`](Self::drive) again to send it.
+    pub fn set_waker(&mut self, waker: impl Fn() + Send + Sync + 'static) {
+        self.waker = Some(Arc::new(waker));
+    }
+
+    /// Whether a response is streaming a body whose producer has not finished.
+    pub fn is_streaming(&self) -> bool {
+        self.reqs
+            .values()
+            .any(|r| r.body.as_ref().is_some_and(OutBody::is_pending_stream))
     }
 
     /// Service the connection: open our streams once the handshake completes,
@@ -202,7 +230,7 @@ impl H3Conn {
 
     fn handle_request(&mut self, quic: &mut QuicConnection, id: u64, cfg: &SessionConfig) {
         let buf = std::mem::take(&mut self.reqs.get_mut(&id).unwrap().inbuf);
-        let req = match self.parse_request(&buf) {
+        let mut req = match self.parse_request(&buf) {
             Ok(req) => req,
             Err(()) => {
                 let _ = quic.reset(StreamId(id), H3_MESSAGE_ERROR);
@@ -211,11 +239,15 @@ impl H3Conn {
             }
         };
 
+        if let Some(info) = &self.conn_info {
+            req.set_conn_info(Arc::clone(info));
+        }
         let resp = cfg.handler.handle(&req);
         #[cfg(feature = "compress")]
         let resp = compress::compress_response(&req, resp, &cfg.compression);
         // HTTP/3 is always over QUIC's TLS 1.3 — secure by definition.
         let resp = crate::session::apply_edge_headers(cfg, resp, true);
+        resp.body_ref().set_waker(self.waker.as_ref());
 
         let is_head = req.method() == &Method::Head;
         let (bytes, body) = self.encode_response(resp, is_head);
@@ -289,10 +321,14 @@ impl H3Conn {
     fn encode_response(&mut self, resp: Response, is_head: bool) -> (Vec<u8>, OutBody) {
         let (status, mut headers, body) = resp.into_parts();
         // HEAD: report the entity Content-Length but frame no DATA, so a file is
-        // never streamed in answer to a HEAD request.
-        let body = if is_head {
-            if !status.is_bodyless() {
-                headers.set_if_absent("content-length", body.len().to_string());
+        // never streamed in answer to a HEAD request. A 1xx/204/304 never has a
+        // body, and a stream's length is unknown.
+        if body.is_stream() {
+            headers.remove("content-length");
+        }
+        let body = if is_head || status.is_bodyless() {
+            if is_head && !status.is_bodyless() && !body.is_stream() {
+                headers.set_if_absent("content-length", body.len_u64().to_string());
             }
             Body::empty()
         } else {
@@ -333,26 +369,32 @@ impl H3Conn {
                 // Buffer fully written; recycle it and frame the next chunk.
                 r.out.clear();
                 r.out_pos = 0;
-                match &mut r.body {
-                    Some(b) if b.remaining() > 0 => {
-                        let n = (b.remaining() as usize).min(H3_STREAM_CHUNK);
-                        match b.take_chunk(n) {
-                            Ok(chunk) => write_frame(&mut r.out, FRAME_DATA, &chunk),
-                            Err(()) => {
-                                let _ = quic.reset(StreamId(id), H3_REQUEST_INCOMPLETE);
-                                done.push(id);
-                                aborted = true;
-                                break;
-                            }
-                        }
+                let Some(b) = r.body.as_mut() else {
+                    break; // no body
+                };
+                let chunk = match b.poll_avail() {
+                    Avail::Data(n) => b.take_chunk((n as usize).min(H3_STREAM_CHUNK)),
+                    // Nothing more yet (stream) or ever (end of body).
+                    Avail::Pending | Avail::End => break,
+                    Avail::Failed => Err(()),
+                };
+                match chunk {
+                    Ok(chunk) => write_frame(&mut r.out, FRAME_DATA, &chunk),
+                    Err(()) => {
+                        let _ = quic.reset(StreamId(id), H3_REQUEST_INCOMPLETE);
+                        done.push(id);
+                        aborted = true;
+                        break;
                     }
-                    _ => break, // no more body to frame
                 }
             }
             if aborted {
                 continue;
             }
-            let body_done = r.body.as_ref().is_none_or(|b| b.remaining() == 0);
+            let body_done = r
+                .body
+                .as_mut()
+                .is_none_or(|b| matches!(b.poll_avail(), Avail::End));
             if r.finish_after
                 && r.out_pos >= r.out.len()
                 && body_done

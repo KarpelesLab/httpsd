@@ -1,6 +1,12 @@
 //! Parsed HTTP requests.
 
-use super::{Headers, Method, Version};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use super::{ConnInfo, Headers, Method, Version};
+
+/// Returned by [`Request::conn`] when no connection info was attached.
+static NO_CONN: ConnInfo = ConnInfo::new();
 
 /// A fully-received HTTP request: the request line, headers, and a fully
 /// buffered body.
@@ -15,6 +21,9 @@ pub struct Request {
     version: Version,
     headers: Headers,
     body: Vec<u8>,
+    /// Facts about the connection the request arrived on, shared by every
+    /// request on that connection.
+    conn: Option<Arc<ConnInfo>>,
     /// Path parameters captured by the [`Router`](crate::router::Router) (e.g.
     /// `:id`). Empty unless this request was dispatched through a router.
     #[cfg(feature = "router")]
@@ -35,6 +44,7 @@ impl Request {
             version,
             headers,
             body,
+            conn: None,
             #[cfg(feature = "router")]
             params: Vec::new(),
         }
@@ -87,6 +97,38 @@ impl Request {
     /// The request body interpreted as UTF-8 (lossily).
     pub fn body_str(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.body)
+    }
+
+    /// Facts about the connection this request arrived on: peer and local
+    /// addresses, and the TLS parameters on a secure connection. Every field
+    /// is `None`/`false` if the driver attached no info.
+    pub fn conn(&self) -> &ConnInfo {
+        self.conn.as_deref().unwrap_or(&NO_CONN)
+    }
+
+    /// The peer (client) address. Shortcut for `req.conn().peer_addr()`.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.conn().peer_addr()
+    }
+
+    /// The local (server) address. Shortcut for `req.conn().local_addr()`.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.conn().local_addr()
+    }
+
+    /// Whether the request arrived over TLS or QUIC. Shortcut for
+    /// `req.conn().is_secure()`.
+    pub fn is_secure(&self) -> bool {
+        self.conn().is_secure()
+    }
+
+    /// Attach connection info. The bundled runtimes and [`Session`] do this for
+    /// every request; a custom driver using an engine such as
+    /// [`H1Conn`](super::H1Conn) directly can call it itself.
+    ///
+    /// [`Session`]: crate::Session
+    pub fn set_conn_info(&mut self, info: Arc<ConnInfo>) {
+        self.conn = Some(info);
     }
 
     /// Consume the request and return the owned body bytes.

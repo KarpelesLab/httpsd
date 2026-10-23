@@ -54,7 +54,7 @@ impl Coding {
 /// Compress `resp`'s body in place if the client accepts a coding we support
 /// and the body is a worthwhile candidate. Returns the (possibly unchanged)
 /// response.
-pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Response {
+pub fn compress_response(req: &Request, mut resp: Response, opts: &Options) -> Response {
     if !opts.enabled {
         return resp;
     }
@@ -68,9 +68,9 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
     if resp.status_code().code() == 206 || resp.headers().contains("content-range") {
         return resp;
     }
-    // Only buffered byte bodies are compressed; a streamed file body passes
+    // Only buffered byte bodies are compressed; a file or stream body passes
     // through untouched (streaming + compression together is out of scope).
-    if resp.body_ref().is_file() {
+    if resp.body_ref().is_file() || resp.body_ref().is_stream() {
         return resp;
     }
     if resp.body_ref().len() < opts.min_size {
@@ -88,27 +88,24 @@ pub fn compress_response(req: &Request, resp: Response, opts: &Options) -> Respo
         return resp;
     };
 
-    let (status, mut headers, body) = resp.into_parts();
-    // Safe: the non-file guard above means this is the buffered bytes, not a
-    // file read.
-    let body = body.into_bytes();
+    // Safe: the file/stream guard above means this is the buffered bytes, not
+    // a file read or a blocking stream collection. Status and any custom
+    // reason phrase stay on `resp`.
+    let body = resp.take_body().into_bytes();
     let compressed = match coding {
         Coding::Gzip => compcol::vec::compress_to_vec::<Gzip>(&body),
         Coding::Deflate => compcol::vec::compress_to_vec::<Zlib>(&body),
         Coding::Raw => compcol::vec::compress_to_vec::<Deflate>(&body),
     };
 
+    append_vary(resp.headers_mut(), "Accept-Encoding");
     match compressed {
         // Only adopt the compressed form if it is actually smaller.
         Ok(out) if out.len() < body.len() => {
-            headers.set("Content-Encoding", coding.token());
-            append_vary(&mut headers, "Accept-Encoding");
-            Response::from_parts(status, headers, out.into())
+            resp.headers_mut().set("Content-Encoding", coding.token());
+            resp.body(out)
         }
-        _ => {
-            append_vary(&mut headers, "Accept-Encoding");
-            Response::from_parts(status, headers, body.into())
-        }
+        _ => resp.body(body),
     }
 }
 
@@ -240,5 +237,29 @@ mod tests {
             .body(body);
         let out = compress_response(&req, resp, &Options::default());
         assert!(out.headers().contains("content-encoding"));
+    }
+
+    #[test]
+    fn custom_reason_survives_compression() {
+        let req = gzip_request();
+        let resp = Response::new(crate::proto::StatusCode::from(299))
+            .with_reason("My Reason")
+            .header("Content-Type", "text/plain")
+            .body(vec![b'a'; 4096]);
+        let out = compress_response(&req, resp, &Options::default());
+        assert!(out.headers().contains("content-encoding"));
+        assert_eq!(out.reason(), "My Reason");
+    }
+
+    #[test]
+    fn stream_body_is_not_compressed() {
+        let req = gzip_request();
+        let (_tx, body) = crate::proto::Body::channel();
+        let resp = Response::new(crate::proto::StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .body(body);
+        let out = compress_response(&req, resp, &Options::default());
+        assert!(!out.headers().contains("content-encoding"));
+        assert!(out.body_ref().is_stream());
     }
 }

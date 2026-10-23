@@ -89,7 +89,9 @@ pub mod privdrop;
 
 pub use error::{Error, Result};
 pub use handler::Handler;
-pub use proto::{Body, Headers, Method, Request, Response, StatusCode, Version};
+pub use proto::{
+    Body, BodySender, ConnInfo, Headers, Method, Request, Response, StatusCode, Version,
+};
 pub use session::Session;
 pub use static_files::StaticFiles;
 

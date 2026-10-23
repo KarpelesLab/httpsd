@@ -14,8 +14,8 @@ use compcol::hpack::{
 
 use super::frame::{self, CLIENT_PREFACE, FrameHeader, errcode, flag, ftype, settings};
 use crate::proto::{
-    Body, Headers, Limits, Method, OutBody, Request, RequestHead, Response, StatusCode, Version,
-    request_head,
+    Avail, Body, Headers, Limits, Method, OutBody, Request, RequestHead, Response, StatusCode,
+    Version, request_head,
 };
 
 const DEFAULT_WINDOW: i64 = 65_535;
@@ -102,8 +102,8 @@ impl Stream {
         }
     }
 
-    fn out_body_remaining(&self) -> u64 {
-        self.out_body.as_ref().map_or(0, |b| b.remaining())
+    fn has_body(&self) -> bool {
+        self.out_body.as_ref().is_some_and(OutBody::has_body)
     }
 }
 
@@ -201,9 +201,22 @@ impl H2Conn {
         }
     }
 
-    /// Drain and return all serialized frames queued so far.
+    /// Drain and return all serialized frames queued so far, first framing any
+    /// response body that is ready and fits the flow-control windows (such as
+    /// new data from a stream body).
     pub fn take_out(&mut self) -> Vec<u8> {
+        if !self.closed {
+            self.pump_out();
+        }
         std::mem::take(&mut self.outbuf)
+    }
+
+    /// Whether any response is streaming a body from a producer that has not
+    /// finished: more output may appear without input from the peer.
+    pub fn is_streaming(&self) -> bool {
+        self.streams.values().any(|s| {
+            s.out_headers_sent && s.out_body.as_ref().is_some_and(OutBody::is_pending_stream)
+        })
     }
 
     /// Whether there are serialized frames waiting to be written. Body that is
@@ -744,10 +757,15 @@ impl H2Conn {
         let (status, mut headers, body) = resp.into_parts();
         // A HEAD response carries the same headers a GET would — including the
         // entity Content-Length — but no body. Report the length, then drop it
-        // so the file is never streamed in answer to a HEAD.
-        let body = if is_head {
-            if !status.is_bodyless() {
-                headers.set_if_absent("content-length", body.len().to_string());
+        // so the file is never streamed in answer to a HEAD. A 1xx/204/304
+        // never has a body. A stream's length is unknown, so a handler's own
+        // Content-Length can't be trusted for it.
+        if body.is_stream() {
+            headers.remove("content-length");
+        }
+        let body = if is_head || status.is_bodyless() {
+            if is_head && !status.is_bodyless() && !body.is_stream() {
+                headers.set_if_absent("content-length", body.len_u64().to_string());
             }
             Body::empty()
         } else {
@@ -774,10 +792,7 @@ impl H2Conn {
                 return;
             }
             s.out_headers_sent = true;
-            (
-                std::mem::take(&mut s.out_headers),
-                s.out_body_remaining() > 0,
-            )
+            (std::mem::take(&mut s.out_headers), s.has_body())
         };
 
         let max = self.peer_max_frame.max(1);
@@ -812,63 +827,68 @@ impl H2Conn {
     /// send windows allow.
     pub fn pump_out(&mut self) {
         let mut finished = Vec::new();
-        // Streams whose body read failed mid-stream: reset rather than send a
-        // truncated, mis-framed body (never panic).
+        // Streams whose body read failed mid-stream (or whose producer
+        // aborted): reset rather than send a truncated, mis-framed body.
         let mut reset = Vec::new();
         let sids: Vec<u32> = self.streams.keys().copied().collect();
         for sid in sids {
-            loop {
-                let (chunk_len, end) = {
-                    let s = match self.streams.get(&sid) {
-                        Some(s) if s.out_headers_sent => s,
-                        _ => break,
-                    };
-                    let remaining = s.out_body_remaining();
-                    if remaining == 0 {
-                        // Empty body: END_STREAM rode on the HEADERS frame, so
-                        // the response is already complete — retire the stream.
-                        if s.responded && !s.done_sending {
-                            finished.push(sid);
-                        }
-                        break;
-                    }
-                    let budget = self
-                        .conn_send_window
-                        .min(s.send_window)
-                        .min(self.peer_max_frame as i64);
-                    if budget <= 0 {
-                        break;
-                    }
-                    // The chunk is bounded by the available send window (and max
-                    // frame), so a file body is read in window-sized pieces — the
-                    // whole file is never pulled into memory at once.
-                    let n = remaining.min(budget as u64) as usize;
-                    (n, s.out_end_stream && (n as u64) == remaining)
+            while let Some(s) = self.streams.get_mut(&sid) {
+                if !s.out_headers_sent || s.done_sending {
+                    break;
+                }
+                let Some(body) = s.out_body.as_mut() else {
+                    break;
                 };
-
-                let payload = {
-                    let s = self.streams.get_mut(&sid).unwrap();
-                    match s.out_body.as_mut().unwrap().take_chunk(chunk_len) {
-                        Ok(p) => p,
-                        Err(()) => {
+                match body.poll_avail() {
+                    Avail::End => {
+                        // A sized body's END_STREAM rode on its HEADERS (empty
+                        // body) or last DATA frame; a stream learns its end only
+                        // now, so close it with an empty DATA frame.
+                        if body.is_stream() {
+                            frame::write_frame(
+                                &mut self.outbuf,
+                                ftype::DATA,
+                                flag::END_STREAM,
+                                sid,
+                                &[],
+                            );
+                        }
+                        s.done_sending = true;
+                        finished.push(sid);
+                        break;
+                    }
+                    Avail::Pending => break,
+                    Avail::Failed => {
+                        reset.push(sid);
+                        break;
+                    }
+                    Avail::Data(avail) => {
+                        let budget = self
+                            .conn_send_window
+                            .min(s.send_window)
+                            .min(self.peer_max_frame as i64);
+                        if budget <= 0 {
+                            break;
+                        }
+                        // The chunk is bounded by the available send window (and
+                        // max frame), so a file body is read in window-sized
+                        // pieces — the whole file is never pulled into memory.
+                        let n = avail.min(budget as u64) as usize;
+                        let end = s.out_end_stream && body.is_last(n as u64);
+                        let Ok(payload) = body.take_chunk(n) else {
                             reset.push(sid);
+                            break;
+                        };
+                        self.conn_send_window -= n as i64;
+                        s.send_window -= n as i64;
+                        let flags = if end { flag::END_STREAM } else { 0 };
+                        frame::write_frame(&mut self.outbuf, ftype::DATA, flags, sid, &payload);
+                        if end {
+                            s.done_sending = true;
+                            finished.push(sid);
                             break;
                         }
                     }
-                };
-                self.conn_send_window -= chunk_len as i64;
-                {
-                    let s = self.streams.get_mut(&sid).unwrap();
-                    s.send_window -= chunk_len as i64;
-                }
-                let flags = if end { flag::END_STREAM } else { 0 };
-                frame::write_frame(&mut self.outbuf, ftype::DATA, flags, sid, &payload);
-                if end {
-                    if let Some(s) = self.streams.get_mut(&sid) {
-                        s.done_sending = true;
-                    }
-                    finished.push(sid);
-                    break;
                 }
             }
         }
@@ -877,7 +897,7 @@ impl H2Conn {
             self.streams.remove(&sid);
             self.pending_heads.remove(&sid);
         }
-        // Abort streams whose body could not be read.
+        // Abort streams whose body could not be produced.
         for sid in reset {
             frame::write_rst_stream(&mut self.outbuf, sid, errcode::INTERNAL_ERROR);
             self.streams.remove(&sid);

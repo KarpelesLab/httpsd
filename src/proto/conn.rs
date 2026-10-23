@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::response::BodyKind;
 use super::response::STREAM_CHUNK;
+use super::stream::{StreamPoll, StreamReceiver};
 use super::{Headers, Method, Request, Response, StatusCode, Version};
 use crate::error::{Error, Result};
 use crate::proto::read_at_exact;
@@ -45,14 +46,23 @@ struct Pending {
     is_head: bool,
 }
 
-/// A response body being streamed from a file across multiple drains.
+/// A response body being sent across multiple drains.
 #[derive(Debug)]
-struct FileBody {
-    file: Arc<File>,
-    /// Absolute offset of the next byte to read.
-    offset: u64,
-    /// Bytes still to send.
-    remaining: u64,
+enum OutStream {
+    /// A file region.
+    File {
+        file: Arc<File>,
+        /// Absolute offset of the next byte to read.
+        offset: u64,
+        /// Bytes still to send.
+        remaining: u64,
+    },
+    /// A producer-fed stream, framed as HTTP/1.1 chunks or (on HTTP/1.0) sent
+    /// raw and delimited by closing the connection.
+    Channel {
+        rx: Arc<StreamReceiver>,
+        chunked: bool,
+    },
 }
 
 /// A sans-I/O HTTP/1.x server connection.
@@ -60,9 +70,10 @@ struct FileBody {
 pub struct H1Conn {
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
-    /// A file body still being streamed out. While set, [`take_out`](H1Conn::take_out)
-    /// keeps yielding the next `STREAM_CHUNK`-sized slice until EOF.
-    body_stream: Option<FileBody>,
+    /// A file or stream body still being sent. While set,
+    /// [`take_out`](H1Conn::take_out) keeps yielding the next piece until it
+    /// ends, and no further request is parsed (responses must not interleave).
+    body_stream: Option<OutStream>,
     limits: Limits,
     /// The request currently awaiting a response, if any. While set,
     /// `poll_request` yields nothing (one in-flight request at a time).
@@ -129,47 +140,97 @@ impl H1Conn {
     /// any in-progress file body. Returns an empty vec when there is nothing
     /// pending. A mid-stream read error (or a file that shrank) drops the stream
     /// and marks the connection for close rather than panicking.
+    ///
+    /// For a stream body ([`Body::channel`](super::Body::channel)) an empty
+    /// vec may also mean "nothing produced yet" while
+    /// [`is_streaming`](Self::is_streaming) is true: call again once the
+    /// stream's producer has written more.
     pub fn take_out(&mut self) -> Vec<u8> {
         if !self.outbuf.is_empty() {
             return std::mem::take(&mut self.outbuf);
         }
-        let Some(fb) = self.body_stream.as_mut() else {
-            return Vec::new();
-        };
-        let want = (fb.remaining as usize).min(STREAM_CHUNK);
-        let mut buf = vec![0u8; want];
-        match read_at_exact(&fb.file, fb.offset, &mut buf) {
-            Ok(n) => {
-                buf.truncate(n);
-                fb.offset += n as u64;
-                fb.remaining -= n as u64;
-                if n < want {
-                    // The file came up short of the promised Content-Length: the
-                    // response is now corrupt, so close the connection.
-                    self.body_stream = None;
-                    self.closed = true;
-                } else if fb.remaining == 0 {
-                    self.body_stream = None;
+        match self.body_stream.as_mut() {
+            None => Vec::new(),
+            Some(OutStream::File {
+                file,
+                offset,
+                remaining,
+            }) => {
+                let want = (*remaining as usize).min(STREAM_CHUNK);
+                let mut buf = vec![0u8; want];
+                match read_at_exact(file, *offset, &mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        *offset += n as u64;
+                        *remaining -= n as u64;
+                        if n < want {
+                            // The file came up short of the promised
+                            // Content-Length: the response is now corrupt, so
+                            // close the connection.
+                            self.body_stream = None;
+                            self.closed = true;
+                        } else if *remaining == 0 {
+                            self.body_stream = None;
+                        }
+                        buf
+                    }
+                    Err(_) => {
+                        self.body_stream = None;
+                        self.closed = true;
+                        Vec::new()
+                    }
                 }
-                buf
             }
-            Err(_) => {
-                self.body_stream = None;
-                self.closed = true;
-                Vec::new()
+            Some(OutStream::Channel { rx, chunked }) => {
+                let chunked = *chunked;
+                match rx.poll(STREAM_CHUNK) {
+                    StreamPoll::Data(data) if chunked => {
+                        let mut out = Vec::with_capacity(data.len() + 12);
+                        out.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
+                        out.extend_from_slice(&data);
+                        out.extend_from_slice(b"\r\n");
+                        out
+                    }
+                    StreamPoll::Data(data) => data,
+                    StreamPoll::Pending => Vec::new(),
+                    StreamPoll::End => {
+                        self.body_stream = None;
+                        if chunked {
+                            b"0\r\n\r\n".to_vec()
+                        } else {
+                            // HTTP/1.0: the body ends where the connection does
+                            // (`closed` was set when the head was serialized).
+                            Vec::new()
+                        }
+                    }
+                    StreamPoll::Aborted => {
+                        // Leave the chunked body unterminated and close, so the
+                        // client can tell the response is incomplete.
+                        self.body_stream = None;
+                        self.closed = true;
+                        Vec::new()
+                    }
+                }
             }
         }
     }
 
     /// Whether there is output still to be written — queued bytes or an
-    /// in-progress file body that has not reached EOF.
+    /// in-progress file or stream body that has not ended.
     pub fn has_output(&self) -> bool {
         !self.outbuf.is_empty() || self.body_stream.is_some()
     }
 
-    /// Whether the connection should be closed once `outbuf` has been written.
+    /// Whether a stream body is in progress: more output may appear without
+    /// any input from the peer, once the stream's producer writes.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self.body_stream, Some(OutStream::Channel { .. }))
+    }
+
+    /// Whether the connection should be closed once pending output has been
+    /// written. Stays false while a body is still being sent.
     pub fn wants_close(&self) -> bool {
-        self.closed
+        self.closed && self.body_stream.is_none()
     }
 
     /// Whether a request has been delivered and is awaiting [`respond`](Self::respond).
@@ -185,7 +246,9 @@ impl H1Conn {
     /// queued via [`take_out`](Self::take_out) and the connection is marked for
     /// close.
     pub fn poll_request(&mut self) -> Result<Option<Request>> {
-        if self.closed || self.pending.is_some() {
+        // One response at a time: a pipelined request waits until the previous
+        // response's body has been fully handed out.
+        if self.closed || self.pending.is_some() || self.body_stream.is_some() {
             return Ok(None);
         }
 
@@ -349,10 +412,16 @@ impl H1Conn {
         }
     }
 
-    fn serialize(&mut self, meta: Pending, resp: Response) {
+    fn serialize(&mut self, meta: Pending, mut resp: Response) {
+        let reason = resp.take_reason();
         let (status, mut headers, body) = resp.into_parts();
         let bodyless = status.is_bodyless();
         let omit_body = bodyless || meta.is_head;
+        let is_stream = body.is_stream();
+        // A stream's length is unknown: chunked on HTTP/1.1, otherwise the body
+        // runs until the connection closes.
+        let chunked = is_stream && meta.version == Version::Http11;
+        let close_delimited = is_stream && !chunked && !omit_body;
 
         // Strip hop-by-hop / framing headers a handler may have supplied so the
         // engine's own framing (Content-Length / Connection) stays authoritative
@@ -362,14 +431,20 @@ impl H1Conn {
         }
 
         // Framing headers.
-        if !bodyless {
-            // Authoritative Content-Length (handlers should not set their own).
-            headers.set("Content-Length", body.len().to_string());
-        } else {
+        if bodyless {
             headers.remove("Content-Length");
+        } else if is_stream {
+            headers.remove("Content-Length");
+            if chunked {
+                // Also on HEAD, so the headers match what a GET would get.
+                headers.set("Transfer-Encoding", "chunked");
+            }
+        } else {
+            // Authoritative Content-Length (handlers should not set their own).
+            headers.set("Content-Length", body.len_u64().to_string());
         }
 
-        let keep_alive = meta.keep_alive && !self.closed;
+        let keep_alive = meta.keep_alive && !self.closed && !close_delimited;
         headers.set(
             "Connection",
             if keep_alive { "keep-alive" } else { "close" },
@@ -380,29 +455,30 @@ impl H1Conn {
         }
         headers.set_if_absent("Date", http_date(now_secs()));
 
-        // Status line.
-        let line = format!(
-            "{} {} {}\r\n",
-            meta.version.as_str(),
-            status.code(),
-            status.reason()
-        );
+        // Status line. A custom reason phrase is used only if it is a valid
+        // `reason-phrase` (no CR/LF or other controls), so handler-controlled
+        // text can never split the response.
+        let reason = match reason.as_deref() {
+            Some(r) if is_valid_reason(r) => r,
+            _ => status.reason(),
+        };
+        let line = format!("{} {} {}\r\n", meta.version.as_str(), status.code(), reason);
         self.outbuf.extend_from_slice(line.as_bytes());
 
-        for (name, value) in headers.iter() {
+        for (name, value) in headers.iter_bytes() {
             // Never emit a header whose name is not a valid token or whose value
             // carries CR/LF/NUL: that would allow response splitting / header
             // injection from handler-controlled data.
             if !is_token(name)
                 || value
-                    .bytes()
-                    .any(|b| b == b'\r' || b == b'\n' || b == b'\0')
+                    .iter()
+                    .any(|&b| b == b'\r' || b == b'\n' || b == b'\0')
             {
                 continue;
             }
             self.outbuf.extend_from_slice(name.as_bytes());
             self.outbuf.extend_from_slice(b": ");
-            self.outbuf.extend_from_slice(value.as_bytes());
+            self.outbuf.extend_from_slice(value);
             self.outbuf.extend_from_slice(b"\r\n");
         }
         self.outbuf.extend_from_slice(b"\r\n");
@@ -414,15 +490,20 @@ impl H1Conn {
                 // than buffering it. HEAD/bodyless responses fall in the
                 // `omit_body` arm above, so no read happens for them.
                 BodyKind::File { file, offset, len } if len > 0 => {
-                    self.body_stream = Some(FileBody {
+                    self.body_stream = Some(OutStream::File {
                         file,
                         offset,
                         remaining: len,
                     });
                 }
                 BodyKind::File { .. } => {}
+                BodyKind::Stream(rx) => {
+                    self.body_stream = Some(OutStream::Channel { rx, chunked });
+                }
             }
         }
+        // A HEAD/bodyless response drops a stream body here, which tells its
+        // producer (via `BodySender::is_closed`) that nothing will be sent.
 
         if !keep_alive {
             self.closed = true;
@@ -534,10 +615,14 @@ fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)>
         }
     }
 
-    let text = std::str::from_utf8(head).map_err(|_| Error::BadRequest("non-UTF-8 header"))?;
-    let mut lines = text.split("\r\n");
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
 
+    // The request line must be text; header values may carry obs-text bytes.
     let request_line = lines.next().ok_or(Error::BadRequest("empty request"))?;
+    let request_line = std::str::from_utf8(request_line)
+        .map_err(|_| Error::BadRequest("non-UTF-8 request line"))?;
     let mut parts = request_line.split(' ');
     let method = parts.next().ok_or(Error::BadRequest("no method"))?;
     let target = parts.next().ok_or(Error::BadRequest("no target"))?;
@@ -565,28 +650,42 @@ fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)>
             continue;
         }
         // Reject obsolete line folding (leading whitespace continuation).
-        if line.starts_with(' ') || line.starts_with('\t') {
+        if line[0] == b' ' || line[0] == b'\t' {
             return Err(Error::BadRequest("obsolete header folding"));
         }
         if headers.len() >= MAX_HEADER_FIELDS {
             return Err(Error::BadRequest("too many header fields"));
         }
-        let (name, value) = line
-            .split_once(':')
+        let colon = line
+            .iter()
+            .position(|&b| b == b':')
             .ok_or(Error::BadRequest("header without colon"))?;
         // The field name must be a valid RFC 9110 token, validated on the
         // UNtrimmed name: whitespace between the name and the colon is illegal.
-        if !is_token(name) {
-            return Err(Error::BadRequest("invalid header name"));
-        }
-        let value = value.trim();
+        // A token is ASCII, so the conversion cannot fail once it passes.
+        let name = std::str::from_utf8(&line[..colon])
+            .ok()
+            .filter(|n| is_token(n))
+            .ok_or(Error::BadRequest("invalid header name"))?;
+        let value = trim_ows(&line[colon + 1..]);
         if !is_valid_field_value(value) {
             return Err(Error::BadRequest("invalid header value"));
         }
-        headers.append(name, value);
+        headers.append_bytes(name, value);
     }
 
     Ok((method, target.to_owned(), version, headers))
+}
+
+/// Strip optional whitespace (SP / HTAB) from both ends of a field value.
+fn trim_ows(mut v: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = v {
+        v = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = v {
+        v = rest;
+    }
+    v
 }
 
 /// Incremental decoder for a chunked request body.
@@ -805,8 +904,14 @@ fn is_token(s: &str) -> bool {
 
 /// Whether `s` is a valid field value: no control characters (0x00-0x1F) other
 /// than HTAB, and no DEL (0x7F). obs-text (0x80-0xFF) is permitted.
-fn is_valid_field_value(s: &str) -> bool {
-    s.bytes().all(|b| (b >= 0x20 && b != 0x7f) || b == b'\t')
+fn is_valid_field_value(s: &[u8]) -> bool {
+    s.iter().all(|&b| (b >= 0x20 && b != 0x7f) || b == b'\t')
+}
+
+/// Whether `s` is a valid `reason-phrase` (RFC 9112 §4): HTAB, SP, visible
+/// ASCII and obs-text only.
+fn is_valid_reason(s: &str) -> bool {
+    is_valid_field_value(s.as_bytes())
 }
 
 /// Find the first occurrence of `needle` in `haystack`.
@@ -1373,6 +1478,124 @@ mod tests {
         let mut c = H1Conn::default();
         c.feed(b"GET /a\tb HTTP/1.1\r\nHost: a\r\n\r\n");
         assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn custom_reason_phrase_is_sent() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        c.respond(Response::new(StatusCode::from(299)).with_reason("My Reason"));
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 299 My Reason\r\n"), "{out}");
+    }
+
+    #[test]
+    fn reason_with_crlf_falls_back_to_default() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        c.respond(Response::new(StatusCode::OK).with_reason("x\r\nInjected: 1"));
+        let out = String::from_utf8(c.take_out()).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        assert!(!out.contains("Injected"));
+    }
+
+    #[test]
+    fn obs_text_header_values_round_trip() {
+        let mut c = H1Conn::default();
+        let req = drive(&mut c, b"GET / HTTP/1.1\r\nX-Name: caf\xe9\r\n\r\n").unwrap();
+        assert_eq!(req.headers().get_bytes("x-name"), Some(&b"caf\xe9"[..]));
+        let mut resp = Response::new(StatusCode::OK);
+        resp.headers_mut().append_bytes(
+            "Content-Disposition",
+            b"attachment; filename=\"caf\xe9\"".to_vec(),
+        );
+        c.respond(resp);
+        let out = c.take_out();
+        assert!(
+            find_subslice(
+                &out,
+                b"Content-Disposition: attachment; filename=\"caf\xe9\"\r\n"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn stream_body_is_chunked_on_http11() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(Response::new(StatusCode::OK).body(body));
+        let head = String::from_utf8(c.take_out()).unwrap();
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"), "{head}");
+        assert!(!head.contains("Content-Length"));
+        assert!(c.is_streaming());
+        assert!(c.take_out().is_empty(), "nothing produced yet");
+        tx.send("hello").unwrap();
+        assert_eq!(c.take_out(), b"5\r\nhello\r\n");
+        tx.finish();
+        assert_eq!(c.take_out(), b"0\r\n\r\n");
+        assert!(!c.has_output());
+        assert!(!c.wants_close(), "keep-alive survives a chunked body");
+    }
+
+    #[test]
+    fn stream_body_on_http10_closes_to_delimit() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(Response::new(StatusCode::OK).body(body));
+        let head = String::from_utf8(c.take_out()).unwrap();
+        assert!(head.contains("Connection: close\r\n"), "{head}");
+        assert!(!head.contains("chunked"));
+        assert!(!c.wants_close(), "not before the body is done");
+        tx.send("raw").unwrap();
+        assert_eq!(c.take_out(), b"raw");
+        drop(tx);
+        assert!(c.take_out().is_empty());
+        assert!(c.wants_close());
+    }
+
+    #[test]
+    fn aborted_stream_leaves_chunked_body_unterminated() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(Response::new(StatusCode::OK).body(body));
+        let _ = c.take_out();
+        tx.abort();
+        assert!(c.take_out().is_empty());
+        assert!(c.wants_close());
+    }
+
+    #[test]
+    fn head_drops_stream_and_closes_sender() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"HEAD / HTTP/1.1\r\n\r\n").unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(Response::new(StatusCode::OK).body(body));
+        let head = String::from_utf8(c.take_out()).unwrap();
+        assert!(head.ends_with("\r\n\r\n"));
+        assert!(!c.has_output());
+        assert!(tx.is_closed());
+    }
+
+    #[test]
+    fn pipelined_request_waits_for_body_to_finish() {
+        let mut c = H1Conn::default();
+        c.feed(b"GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        let _ = c.poll_request().unwrap().unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(Response::new(StatusCode::OK).body(body));
+        assert!(
+            c.poll_request().unwrap().is_none(),
+            "must wait for /a's body"
+        );
+        let _ = c.take_out();
+        tx.finish();
+        let _ = c.take_out();
+        let next = c.poll_request().unwrap().unwrap();
+        assert_eq!(next.path(), "/b");
     }
 
     #[test]

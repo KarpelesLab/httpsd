@@ -154,10 +154,10 @@ impl TryFrom<&Headers> for http::HeaderMap {
     type Error = HttpConvertError;
     fn try_from(headers: &Headers) -> Result<Self, Self::Error> {
         let mut map = http::HeaderMap::new();
-        for (name, value) in headers.iter() {
+        for (name, value) in headers.iter_bytes() {
             map.append(
                 HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(value)?,
+                HeaderValue::from_bytes(value)?,
             );
         }
         Ok(map)
@@ -168,12 +168,8 @@ impl From<&http::HeaderMap> for Headers {
     fn from(map: &http::HeaderMap) -> Self {
         let mut headers = Headers::new();
         for (name, value) in map.iter() {
-            // Header values are usually ASCII; decode the rare non-UTF-8 ones
-            // lossily rather than failing the whole conversion.
-            headers.append(
-                name.as_str(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            );
+            // Keep the exact bytes: values may carry non-UTF-8 obs-text.
+            headers.append_bytes(name.as_str(), value.as_bytes());
         }
         headers
     }

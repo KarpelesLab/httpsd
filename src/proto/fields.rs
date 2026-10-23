@@ -55,10 +55,9 @@ where
                 _ => {}
             }
             seen_regular = true;
-            headers.append(
-                String::from_utf8_lossy(name).into_owned(),
-                String::from_utf8_lossy(value).into_owned(),
-            );
+            // Values keep their exact bytes (obs-text is legal); names were
+            // checked lowercase above and are ASCII in any sane request.
+            headers.append_bytes(String::from_utf8_lossy(name).into_owned(), value.to_vec());
         }
     }
 
@@ -91,7 +90,7 @@ pub(crate) fn response_fields(
     fields.push((b":status".to_vec(), status.code().to_string().into_bytes()));
 
     let mut has_server = false;
-    for (name, value) in headers.iter() {
+    for (name, value) in headers.iter_bytes() {
         let lower = name.to_ascii_lowercase();
         match lower.as_str() {
             "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" => {
@@ -100,7 +99,7 @@ pub(crate) fn response_fields(
             "server" => has_server = true,
             _ => {}
         }
-        fields.push((lower.into_bytes(), value.as_bytes().to_vec()));
+        fields.push((lower.into_bytes(), value.to_vec()));
     }
     if !has_server && let Some(s) = server {
         fields.push((b"server".to_vec(), s.as_bytes().to_vec()));
