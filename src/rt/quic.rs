@@ -103,6 +103,29 @@ struct Conn {
     deadline: Option<Instant>,
     /// Last time we received a datagram for this connection (for the idle sweep).
     last_seen: Instant,
+    /// The client's first datagrams, kept while its SNI is unknown: a
+    /// ClientHello with a post-quantum key share spans two datagrams.
+    sni_probe: Option<Vec<Vec<u8>>>,
+}
+
+/// Datagrams kept for the SNI peek before giving up on it.
+const SNI_PROBE_MAX: usize = 4;
+
+/// The connection info attached to every HTTP/3 request.
+fn h3_conn_info(
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+    server_name: Option<String>,
+) -> Arc<ConnInfo> {
+    Arc::new(
+        ConnInfo::new()
+            .with_peer_addr(Some(peer))
+            .with_local_addr(local)
+            .with_secure(true)
+            .with_tls_version(Some("TLSv1.3"))
+            .with_alpn(Some(b"h3".to_vec()))
+            .with_server_name(server_name),
+    )
 }
 
 /// Bind a UDP socket and serve HTTP/3 until a fatal socket error.
@@ -239,15 +262,8 @@ fn on_datagram(
             .ok()
             .flatten()
             .and_then(|info| info.server_name);
-        h3.set_conn_info(Arc::new(
-            ConnInfo::new()
-                .with_peer_addr(Some(peer))
-                .with_local_addr(socket.local_addr().ok())
-                .with_secure(true)
-                .with_tls_version(Some("TLSv1.3"))
-                .with_alpn(Some(b"h3".to_vec()))
-                .with_server_name(server_name),
-        ));
+        let sni_probe = server_name.is_none().then(|| vec![data.to_vec()]);
+        h3.set_conn_info(h3_conn_info(peer, socket.local_addr().ok(), server_name));
         {
             let dirty = Arc::clone(stream_dirty);
             h3.set_waker(move || dirty.store(true, Ordering::Release));
@@ -260,14 +276,41 @@ fn on_datagram(
                 created_at: Instant::now(),
                 deadline: None,
                 last_seen: Instant::now(),
+                sni_probe,
             },
         );
+    } else if let Some(conn) = conns.get_mut(&peer) {
+        probe_sni(socket, peer, conn, data);
     }
     let conn = conns.get_mut(&peer).unwrap();
     conn.last_seen = Instant::now();
     conn.quic.set_now_secs(unix_secs());
     conn.quic.feed_datagram_from(peer, data).map_err(qerr)?;
     service(socket, peer, conn, cfg)
+}
+
+/// Retry the SNI peek with this datagram added to the ones kept so far, until
+/// it succeeds, the handshake completes, or enough datagrams were tried.
+fn probe_sni(socket: &UdpSocket, peer: SocketAddr, conn: &mut Conn, data: &[u8]) {
+    let Some(probe) = conn.sni_probe.as_mut() else {
+        return;
+    };
+    if conn.quic.is_handshake_complete() || probe.len() >= SNI_PROBE_MAX {
+        conn.sni_probe = None;
+        return;
+    }
+    probe.push(data.to_vec());
+    let refs: Vec<&[u8]> = probe.iter().map(Vec::as_slice).collect();
+    if let Ok(Some(info)) = purecrypto::quic::peek_initial_sni_datagrams(&refs) {
+        conn.sni_probe = None;
+        if info.server_name.is_some() {
+            conn.h3.set_conn_info(h3_conn_info(
+                peer,
+                socket.local_addr().ok(),
+                info.server_name,
+            ));
+        }
+    }
 }
 
 /// Reclaim one connection to make room at the cap. Prefers a connection that is

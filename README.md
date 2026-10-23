@@ -145,6 +145,35 @@ A custom handler is just `Fn(&Request) -> Response` (or anything implementing
 [`Handler`](src/handler.rs)). Because the core is sans-I/O, one synchronous
 handler works identically under all three runtimes.
 
+Handlers also get what an application server (CGI/PHP-style SAPI) needs:
+
+- `req.peer_addr()`, `req.local_addr()`, `req.is_secure()`, and `req.conn()`
+  for the TLS version, cipher, ALPN and SNI.
+- `Body::channel()` streams a response while it is being generated (chunked on
+  HTTP/1.1, DATA frames on HTTP/2 and HTTP/3). The `BodySender` blocks when the
+  client reads slowly and reports when the client disconnects:
+
+  ```rust
+  use httpsd::{Body, Request, Response, StatusCode};
+
+  fn events(_req: &Request) -> Response {
+      let (tx, body) = Body::channel();
+      std::thread::spawn(move || {
+          while tx.send("data: tick\n\n").is_ok() {
+              std::thread::sleep(std::time::Duration::from_secs(1));
+          }
+      });
+      Response::new(StatusCode::OK)
+          .header("Content-Type", "text/event-stream")
+          .body(body)
+  }
+  ```
+- `Body::file(Arc<File>, offset, len)` / `Body::from_file(file)` send a file the
+  handler opened without reading it into memory.
+- `Response::with_reason("My Reason")` sets a custom HTTP/1.x reason phrase.
+- `Headers::append_bytes` / `get_bytes` carry non-UTF-8 header values
+  (RFC 9110 obs-text) byte for byte.
+
 ## Automatic certificates (ACME)
 
 With `--acme-accept-tos` (you accept the CA's terms of service) the server
@@ -229,6 +258,7 @@ httpsd = { version = "0.1", default-features = false, features = ["rt-tokio", "t
   one connection per peer on a single UDP socket.
 - Request bodies via `Content-Length` and chunked `Transfer-Encoding`
   (buffered), with configurable size limits.
+- Streamed response bodies (`Body::channel`) on every protocol and runtime.
 - `GET`/`HEAD` static file serving with MIME detection, directory `index.html`,
   `ETag`/`Last-Modified` conditional requests, and single-range (`206`) support.
 - Path-traversal protection (rejects `..`, canonicalizes against the root).
@@ -240,8 +270,7 @@ httpsd = { version = "0.1", default-features = false, features = ["rt-tokio", "t
 
 Verified against `curl` for HTTP/1.1, `--http2`, and `--http3-only`.
 
-Out of scope for this version: streaming request/response bodies, HTTP/2 server
-push, QUIC connection migration, and async handler traits (handlers are
+Out of scope for this version: streaming request bodies, HTTP/2 server push, QUIC connection migration, and async handler traits (handlers are
 synchronous by design). HTTP/3 demultiplexes connections by peer address.
 
 ## License
