@@ -3,7 +3,9 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use super::stream::{self, BodySender, StreamPoll, StreamReceiver, Waker};
+#[cfg(any(feature = "h2", feature = "h3"))]
+use super::stream::StreamPoll;
+use super::stream::{self, BodySender, StreamReceiver, Waker};
 use super::{Headers, StatusCode};
 
 /// Bytes pulled from a file per drain when streaming a [`Body::File`]. Bounds
@@ -335,12 +337,14 @@ impl OutBody {
     }
 
     /// Whether this is a producer-fed stream (length unknown up front).
+    #[cfg_attr(not(feature = "h2"), allow(dead_code))]
     pub(crate) fn is_stream(&self) -> bool {
         matches!(self, OutBody::Stream { .. })
     }
 
     /// Whether there is (or, for a stream, may be) any body to send. False for
     /// an empty sized body, whose END_STREAM can ride on the headers.
+    #[cfg_attr(not(feature = "h2"), allow(dead_code))]
     pub(crate) fn has_body(&self) -> bool {
         match self {
             OutBody::Bytes { data, pos } => *pos < data.len(),
@@ -356,6 +360,7 @@ impl OutBody {
 
     /// For a sized body: whether taking `n` more bytes completes it. Always
     /// false for a stream (its end is only known once the producer finishes).
+    #[cfg_attr(not(feature = "h2"), allow(dead_code))]
     pub(crate) fn is_last(&self, n: u64) -> bool {
         match self {
             OutBody::Bytes { data, pos } => (data.len() - *pos) as u64 == n,
@@ -571,8 +576,8 @@ impl Response {
         std::mem::take(&mut self.body)
     }
 
-    // Used by the compression and `http`-interop layers to rebuild a response.
-    #[cfg_attr(not(any(feature = "compress", feature = "http")), allow(dead_code))]
+    // Used by the `http`-interop layer to rebuild a response.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) fn from_parts(status: StatusCode, headers: Headers, body: Body) -> Response {
         Response {
             status,

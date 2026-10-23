@@ -125,6 +125,14 @@ async fn bind_first(addrs: &[SocketAddr]) -> Result<TcpListener> {
 async fn serve(mut stream: TcpStream, shared: &Shared) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut session = build_session(shared)?;
+    session.set_addrs(stream.peer_addr().ok(), stream.local_addr().ok());
+    // Stream bodies are produced on other threads; their producer wakes this
+    // task through the session's waker.
+    let wake = Arc::new(tokio::sync::Notify::new());
+    {
+        let wake = Arc::clone(&wake);
+        session.set_waker(move || wake.notify_one());
+    }
 
     let mut buf = vec![0u8; READ_BUF];
     // Minimum-throughput deadline (the async analogue of the blocking runtime's
@@ -132,26 +140,43 @@ async fn serve(mut stream: TcpStream, shared: &Shared) -> Result<()> {
     // in the current window, and the window only resets once the peer delivers
     // `MIN_PROGRESS` bytes. A read that elapses without meeting the floor — a
     // fully idle peer or a slow-trickle slowloris — closes the connection. This
-    // covers the TLS handshake, the request head, and bodies uniformly.
+    // covers the TLS handshake, the request head, and bodies uniformly. While a
+    // response body is streaming the peer is legitimately quiet, so the window
+    // is held open.
     let mut window_deadline = Instant::now() + IO_TIMEOUT;
     let mut window_bytes: usize = 0;
     loop {
-        let remaining = window_deadline.saturating_duration_since(Instant::now());
-        let n = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
-            Ok(r) => r?,
-            // Window expired without the peer meeting the throughput floor (it is
-            // reset to zero the instant the floor is met below): idle or trickle.
-            Err(_elapsed) => break,
-        };
-        if n == 0 {
-            break;
-        }
-        window_bytes = window_bytes.saturating_add(n);
-        if window_bytes >= MIN_PROGRESS {
+        let streaming = session.is_streaming();
+        if streaming {
             window_deadline = Instant::now() + IO_TIMEOUT;
             window_bytes = 0;
         }
-        session.received(&buf[..n])?;
+        let remaining = window_deadline.saturating_duration_since(Instant::now());
+        tokio::select! {
+            read = tokio::time::timeout(remaining, stream.read(&mut buf)) => {
+                let n = match read {
+                    Ok(r) => r?,
+                    // Window expired without the peer meeting the throughput
+                    // floor (it is reset to zero the instant the floor is met
+                    // below): idle or trickle.
+                    // While streaming, a quiet peer is fine: keep going.
+                    Err(_elapsed) if streaming => continue,
+                    Err(_elapsed) => break,
+                };
+                if n == 0 {
+                    // Peer closed. Mid-stream, dropping the session is what
+                    // tells the producer (`BodySender::is_closed`).
+                    break;
+                }
+                window_bytes = window_bytes.saturating_add(n);
+                if window_bytes >= MIN_PROGRESS {
+                    window_deadline = Instant::now() + IO_TIMEOUT;
+                    window_bytes = 0;
+                }
+                session.received(&buf[..n])?;
+            }
+            _ = wake.notified(), if streaming => {}
+        }
         // Drain fully before the next read: a file body is streamed in bounded
         // chunks across successive `to_send` calls, and a GET client sends
         // nothing more, so a single flush would stall mid-body.

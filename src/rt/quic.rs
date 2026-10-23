@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,7 @@ use purecrypto::quic::QuicConnection;
 
 use crate::error::{Error, Result};
 use crate::h3::H3Conn;
+use crate::proto::ConnInfo;
 use crate::rt::shutdown::Shutdown;
 use crate::session::SessionConfig;
 use crate::tls::{ReloadableAcceptor, TlsAcceptor};
@@ -70,6 +72,10 @@ impl CertSource {
 const RECV_BUF: usize = 2048;
 /// Fallback poll interval when no connection has a pending timer.
 const IDLE_POLL: Duration = Duration::from_millis(200);
+/// Poll interval while some response body is streaming. A blocking UDP read
+/// can't be interrupted by a producer, so the loop checks back this often and
+/// services connections whose stream signalled new data.
+const STREAM_POLL: Duration = Duration::from_millis(10);
 /// Hard cap on concurrently-tracked QUIC connections. UDP source addresses are
 /// trivially spoofable, so an unbounded `conns` map is a memory-exhaustion
 /// vector: an attacker can send one Initial each from a flood of forged
@@ -115,6 +121,8 @@ pub(crate) fn run(
     }
     let mut conns: HashMap<SocketAddr, Conn> = HashMap::new();
     let mut buf = [0u8; RECV_BUF];
+    // Set by stream-body producers (through each H3Conn's waker).
+    let stream_dirty = Arc::new(AtomicBool::new(false));
 
     loop {
         // Graceful shutdown: stop the loop and return. This is best-effort — a
@@ -139,19 +147,30 @@ pub(crate) fn run(
 
         // Wake at the soonest pending timer, or after the idle interval.
         let now = Instant::now();
-        let wait = conns
+        let mut wait = conns
             .values()
             .filter_map(|c| c.deadline)
             .map(|d| d.saturating_duration_since(now))
             .min()
             .unwrap_or(IDLE_POLL)
             .max(Duration::from_millis(1));
+        if conns.values().any(|c| c.h3.is_streaming()) {
+            wait = wait.min(STREAM_POLL);
+        }
         socket.set_read_timeout(Some(wait)).ok();
 
         match socket.recv_from(&mut buf) {
             Ok((n, peer)) => {
                 let data = buf[..n].to_vec();
-                if let Err(e) = on_datagram(&socket, &mut conns, peer, &data, &cfg, &certs) {
+                if let Err(e) = on_datagram(
+                    &socket,
+                    &mut conns,
+                    peer,
+                    &data,
+                    &cfg,
+                    &certs,
+                    &stream_dirty,
+                ) {
                     if cfg!(debug_assertions) {
                         eprintln!("httpsd: h3 connection error from {peer}: {e}");
                     }
@@ -163,6 +182,13 @@ pub(crate) fn run(
         }
 
         fire_timers(&socket, &mut conns, &cfg);
+        if stream_dirty.swap(false, Ordering::AcqRel) {
+            for (peer, conn) in conns.iter_mut() {
+                if conn.h3.is_streaming() {
+                    let _ = service(&socket, *peer, conn, &cfg);
+                }
+            }
+        }
         // Reap closed connections, plus any that have been idle past the
         // backstop timeout (covers half-open / stalled handshakes that an
         // attacker could otherwise pile up faster than they expire).
@@ -193,6 +219,7 @@ fn on_datagram(
     data: &[u8],
     cfg: &SessionConfig,
     certs: &CertSource,
+    stream_dirty: &Arc<AtomicBool>,
 ) -> Result<()> {
     if !conns.contains_key(&peer) {
         // New connection: pick the certificate from the Initial's SNI.
@@ -207,11 +234,29 @@ fn on_datagram(
         }
         let qcfg = acceptor.quic_config()?;
         let quic = QuicConnection::server(qcfg).map_err(qerr)?;
+        let mut h3 = H3Conn::new(cfg.limits, cfg.server_name.clone());
+        let server_name = purecrypto::quic::peek_initial_sni(data)
+            .ok()
+            .flatten()
+            .and_then(|info| info.server_name);
+        h3.set_conn_info(Arc::new(
+            ConnInfo::new()
+                .with_peer_addr(Some(peer))
+                .with_local_addr(socket.local_addr().ok())
+                .with_secure(true)
+                .with_tls_version(Some("TLSv1.3"))
+                .with_alpn(Some(b"h3".to_vec()))
+                .with_server_name(server_name),
+        ));
+        {
+            let dirty = Arc::clone(stream_dirty);
+            h3.set_waker(move || dirty.store(true, Ordering::Release));
+        }
         conns.insert(
             peer,
             Conn {
                 quic,
-                h3: H3Conn::new(cfg.limits, cfg.server_name.clone()),
+                h3,
                 created_at: Instant::now(),
                 deadline: None,
                 last_seen: Instant::now(),

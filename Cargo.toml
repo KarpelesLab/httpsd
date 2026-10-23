@@ -79,7 +79,7 @@ compcol = { version = "0.7.6", optional = true, default-features = false, featur
 http = { version = "1.5", optional = true }
 serde = { version = "1.0.229", optional = true, features = ["derive"] }
 toml = { version = "1.1", optional = true }
-tokio = { version = "1.54", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
+tokio = { version = "1.54", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 mio = { version = "1.2", optional = true, features = ["os-poll", "net"] }
 rsurl = { version = "0.1.19", optional = true }
 # Privilege-dropping syscalls (setuid/setgid/chroot, getpwnam_r/getgrnam_r).

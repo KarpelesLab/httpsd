@@ -1,9 +1,9 @@
 //! Pieces shared across the blocking runtimes.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
@@ -153,32 +153,76 @@ pub(crate) fn note_accept_error(label: &str, e: &io::Error) -> bool {
     exhausted
 }
 
-/// Drive one connection to completion over a blocking byte stream.
+/// While a response body is streaming, how long the blocking loop waits for
+/// the producer before checking the socket for input (h2 WINDOW_UPDATEs, a
+/// closed connection). Stream data itself wakes the loop immediately.
+pub(crate) const STREAM_INPUT_POLL: Duration = Duration::from_millis(50);
+
+/// Read timeout used for the quick socket check while a body is streaming.
+const STREAM_READ_PROBE: Duration = Duration::from_millis(1);
+
+/// A one-shot wake flag a stream producer sets (via the session's waker) and
+/// the blocking loop waits on.
+#[derive(Default)]
+pub(crate) struct Wake {
+    flag: Mutex<bool>,
+    cond: Condvar,
+}
+
+impl Wake {
+    pub(crate) fn notify(&self) {
+        *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cond.notify_one();
+    }
+
+    /// Wait until notified or `timeout` passes, then clear the flag.
+    pub(crate) fn wait(&self, timeout: Duration) {
+        let mut flag = self.flag.lock().unwrap_or_else(|e| e.into_inner());
+        if !*flag {
+            flag = self
+                .cond
+                .wait_timeout(flag, timeout)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *flag = false;
+    }
+}
+
+/// Drive one connection to completion over a blocking socket.
 ///
-/// This is transport-agnostic: `stream` may be a plain `TcpStream` or any
-/// `Read + Write`. TLS is handled inside the [`Session`] (the handshake records
-/// flow through the same read/flush cycle), so the same loop serves HTTP and
-/// HTTPS.
-pub(crate) fn serve_blocking<S: Read + Write>(stream: &mut S, session: &mut Session) -> Result<()> {
+/// TLS is handled inside the [`Session`] (the handshake records flow through
+/// the same read/flush cycle), so the same loop serves HTTP and HTTPS.
+pub(crate) fn serve_blocking(stream: &mut TcpStream, session: &mut Session) -> Result<()> {
     serve_blocking_prefed(stream, session, &[])
 }
 
 /// Like [`serve_blocking`] but first feeds `initial` bytes already read from the
 /// stream (e.g. the ClientHello consumed while choosing a certificate).
-pub(crate) fn serve_blocking_prefed<S: Read + Write>(
-    stream: &mut S,
+pub(crate) fn serve_blocking_prefed(
+    stream: &mut TcpStream,
     session: &mut Session,
     initial: &[u8],
 ) -> Result<()> {
+    session.set_addrs(stream.peer_addr().ok(), stream.local_addr().ok());
+    let wake = Arc::new(Wake::default());
+    {
+        let wake = Arc::clone(&wake);
+        session.set_waker(move || wake.notify());
+    }
+
     let mut buf = [0u8; READ_BUF];
     let mut pending = initial;
+    // Whether the socket currently has the short streaming read timeout.
+    let mut probing = false;
     // Minimum-throughput deadline that defeats slow-trickle slowloris (which the
     // per-read inactivity timeout alone cannot catch — see [`MIN_PROGRESS`]). The
     // peer must deliver at least `MIN_PROGRESS` bytes within each [`IO_TIMEOUT`]
-    // window; the window resets whenever that floor is met. The generic stream
-    // here has no timeout-setting API, so the wake-up cadence is provided by the
-    // socket's own read timeout ([`apply_timeouts`]); the deadline is enforced in
-    // software when a read returns, bounding a trickle to at most ~2× the window.
+    // window; the window resets whenever that floor is met. The wake-up cadence
+    // is provided by the socket's own read timeout ([`apply_timeouts`]); the
+    // deadline is enforced in software when a read returns, bounding a trickle
+    // to at most ~2× the window. While a response body is streaming the peer is
+    // legitimately quiet, so the window is held open.
     let mut window_deadline = Instant::now() + IO_TIMEOUT;
     let mut window_bytes: usize = 0;
     loop {
@@ -187,7 +231,31 @@ pub(crate) fn serve_blocking_prefed<S: Read + Write>(
             window_bytes = window_bytes.saturating_add(pending.len());
             pending = &[];
             r
+        } else if session.is_streaming() {
+            // Wait for the producer (woken at once by new data), then take a
+            // quick look at the socket without blocking on it.
+            wake.wait(STREAM_INPUT_POLL);
+            if !probing {
+                let _ = stream.set_read_timeout(Some(STREAM_READ_PROBE));
+                probing = true;
+            }
+            window_deadline = Instant::now() + IO_TIMEOUT;
+            window_bytes = 0;
+            match stream.read(&mut buf) {
+                Ok(0) => break, // peer closed: drops the stream (producer sees it)
+                Ok(n) => {
+                    window_bytes = n;
+                    session.received(&buf[..n])
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => Ok(()),
+                Err(e) => return Err(e.into()),
+            }
         } else {
+            if probing {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                probing = false;
+            }
             let n = stream.read(&mut buf)?;
             if n == 0 {
                 break; // peer closed

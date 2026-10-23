@@ -8,11 +8,12 @@
 //! performs no I/O itself.
 
 use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::handler::Handler;
-use crate::proto::{H1Conn, Limits, Request, Response};
+use crate::proto::{ConnInfo, H1Conn, Limits, Request, Response, Waker};
 
 #[cfg(feature = "compress")]
 use crate::compress;
@@ -72,6 +73,22 @@ impl Transport {
             Transport::Tls(stream) => stream.alpn_protocol(),
         }
     }
+
+    /// Connection facts known to the transport (TLS parameters), on top of
+    /// the given addresses.
+    fn conn_info(&self, peer: Option<SocketAddr>, local: Option<SocketAddr>) -> ConnInfo {
+        let info = ConnInfo::new().with_peer_addr(peer).with_local_addr(local);
+        match self {
+            Transport::Plain => info,
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => info
+                .with_secure(true)
+                .with_tls_version(stream.protocol_version())
+                .with_cipher_suite(stream.cipher_suite())
+                .with_alpn(stream.alpn_protocol())
+                .with_server_name(stream.server_name()),
+        }
+    }
 }
 
 /// The chosen application protocol engine for a connection.
@@ -123,6 +140,13 @@ pub struct Session {
     engine: Option<Engine>,
     transport: Transport,
     cfg: SessionConfig,
+    peer_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
+    /// Built on the first request (once TLS details are known), then shared by
+    /// every request on the connection.
+    conn_info: Option<Arc<ConnInfo>>,
+    /// Fired when a stream body has new data; see [`Session::set_waker`].
+    waker: Option<Waker>,
 }
 
 impl Session {
@@ -133,6 +157,10 @@ impl Session {
             engine: Some(engine),
             transport: Transport::Plain,
             cfg,
+            peer_addr: None,
+            local_addr: None,
+            conn_info: None,
+            waker: None,
         }
     }
 
@@ -145,7 +173,53 @@ impl Session {
             engine: None,
             transport: Transport::Tls(Box::new(stream)),
             cfg,
+            peer_addr: None,
+            local_addr: None,
+            conn_info: None,
+            waker: None,
         }
+    }
+
+    /// Record the connection's peer and local socket addresses, reported to
+    /// handlers through [`Request::conn`]. The bundled runtimes call this for
+    /// every connection; a custom driver should call it right after creating
+    /// the session.
+    pub fn set_addrs(&mut self, peer: Option<SocketAddr>, local: Option<SocketAddr>) {
+        self.peer_addr = peer;
+        self.local_addr = local;
+        self.conn_info = None;
+    }
+
+    /// Register a callback fired whenever a stream response body
+    /// ([`Body::channel`](crate::Body::channel)) has new data or ends. It runs
+    /// on the producer's thread, so it should only wake the driver (signal a
+    /// condvar, a `mio::Waker`, a tokio `Notify`, …), which then calls
+    /// [`to_send`](Self::to_send) and writes the result. Without a waker a
+    /// driver must poll `to_send` while [`is_streaming`](Self::is_streaming)
+    /// is true.
+    pub fn set_waker(&mut self, waker: impl Fn() + Send + Sync + 'static) {
+        self.waker = Some(Arc::new(waker));
+    }
+
+    /// Whether a response is streaming a body whose producer hasn't finished:
+    /// more output may appear without any input from the peer. While this is
+    /// true, [`to_send`](Self::to_send) returning nothing just means "not yet".
+    pub fn is_streaming(&self) -> bool {
+        match self.engine.as_ref() {
+            Some(Engine::H1(conn)) => conn.is_streaming(),
+            #[cfg(feature = "h2")]
+            Some(Engine::H2(conn)) => conn.is_streaming(),
+            None => false,
+        }
+    }
+
+    /// The shared connection info, built on first use.
+    fn conn_info(&mut self) -> Arc<ConnInfo> {
+        if self.conn_info.is_none() {
+            let info = self.transport.conn_info(self.peer_addr, self.local_addr);
+            self.conn_info = Some(Arc::new(info));
+        }
+        Arc::clone(self.conn_info.as_ref().unwrap())
     }
 
     fn new_h1(cfg: &SessionConfig) -> H1Conn {
@@ -189,33 +263,52 @@ impl Session {
     }
 
     fn drive(&mut self, plaintext: &[u8]) -> Result<()> {
+        match self.engine.as_mut() {
+            Some(Engine::H1(conn)) => conn.feed(plaintext),
+            #[cfg(feature = "h2")]
+            Some(Engine::H2(conn)) => conn.received(plaintext),
+            None => return Ok(()),
+        }
+        self.serve_ready();
+        Ok(())
+    }
+
+    /// Run the handler for every request the engine has ready.
+    fn serve_ready(&mut self) {
         let secure = !matches!(self.transport, Transport::Plain);
-        match self.engine.as_mut().unwrap() {
-            Engine::H1(conn) => {
-                conn.feed(plaintext);
-                while let Ok(Some(req)) = conn.poll_request() {
-                    let resp = Self::run_handler(&self.cfg, &req, secure);
+        let info = self.conn_info();
+        match self.engine.as_mut() {
+            Some(Engine::H1(conn)) => {
+                while let Ok(Some(mut req)) = conn.poll_request() {
+                    req.set_conn_info(Arc::clone(&info));
+                    let resp = Self::run_handler(&self.cfg, &req, secure, self.waker.as_ref());
                     conn.respond(resp);
                 }
             }
             #[cfg(feature = "h2")]
-            Engine::H2(conn) => {
-                conn.received(plaintext);
-                while let Some((sid, req)) = conn.poll_request() {
-                    let resp = Self::run_handler(&self.cfg, &req, secure);
+            Some(Engine::H2(conn)) => {
+                while let Some((sid, mut req)) = conn.poll_request() {
+                    req.set_conn_info(Arc::clone(&info));
+                    let resp = Self::run_handler(&self.cfg, &req, secure, self.waker.as_ref());
                     conn.respond(sid, resp);
                 }
             }
+            None => {}
         }
-        Ok(())
     }
 
     /// Run the handler, apply response compression, and (on secure transports)
     /// the HSTS header.
-    fn run_handler(cfg: &SessionConfig, req: &Request, secure: bool) -> Response {
+    fn run_handler(
+        cfg: &SessionConfig,
+        req: &Request,
+        secure: bool,
+        waker: Option<&Waker>,
+    ) -> Response {
         let resp = cfg.handler.handle(req);
         #[cfg(feature = "compress")]
         let resp = compress::compress_response(req, resp, &cfg.compression);
+        resp.body_ref().set_waker(waker);
         apply_edge_headers(cfg, resp, secure)
     }
 
@@ -223,7 +316,18 @@ impl Session {
     /// (encrypted) response data. May be empty.
     pub fn to_send(&mut self) -> Result<Vec<u8>> {
         let app = match self.engine.as_mut() {
-            Some(Engine::H1(conn)) => conn.take_out(),
+            Some(Engine::H1(conn)) => {
+                let mut out = conn.take_out();
+                // HTTP/1 holds pipelined requests while a body is still being
+                // sent; once it is done, serve any that are already buffered.
+                if !conn.has_output() && !conn.awaiting_response() {
+                    self.serve_ready();
+                    if let Some(Engine::H1(conn)) = self.engine.as_mut() {
+                        out.extend_from_slice(&conn.take_out());
+                    }
+                }
+                out
+            }
             #[cfg(feature = "h2")]
             Some(Engine::H2(conn)) => conn.take_out(),
             None => Vec::new(),
@@ -234,7 +338,9 @@ impl Session {
     /// Whether the engine still has output to produce — queued bytes or a
     /// response body (e.g. a file) being streamed in chunks. Drivers must keep
     /// calling [`to_send`](Self::to_send) while this is true before waiting for
-    /// the next read or closing, so a body is flushed in full.
+    /// the next read or closing, so a body is flushed in full. (For a stream
+    /// body that is waiting on its producer, `to_send` returns nothing; see
+    /// [`is_streaming`](Self::is_streaming).)
     pub fn has_output(&self) -> bool {
         match self.engine.as_ref() {
             Some(Engine::H1(conn)) => conn.has_output(),

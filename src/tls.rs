@@ -338,6 +338,29 @@ impl TlsStream {
         self.conn.alpn_selected().map(|p| p.to_vec())
     }
 
+    /// The negotiated TLS version as a name such as `"TLSv1.3"`, once known.
+    pub fn protocol_version(&self) -> Option<&'static str> {
+        use purecrypto::tls::ProtocolVersion as V;
+        Some(match self.conn.negotiated_version()? {
+            V::TLSv1_3 => "TLSv1.3",
+            V::TLSv1_2 => "TLSv1.2",
+            V::TLSv1_1 => "TLSv1.1",
+            V::TLSv1_0 => "TLSv1",
+            V::SSLv3 => "SSLv3",
+            _ => return None,
+        })
+    }
+
+    /// The negotiated cipher suite's IANA name, once known.
+    pub fn cipher_suite(&self) -> Option<&'static str> {
+        self.conn.negotiated_cipher_suite_name()
+    }
+
+    /// The SNI host name the client sent, if any.
+    pub fn server_name(&self) -> Option<String> {
+        self.conn.peer_server_name().map(str::to_owned)
+    }
+
     /// Begin a clean shutdown (queues a `close_notify`).
     pub fn close(&mut self) -> Result<()> {
         self.conn.close().map_err(tls_err)

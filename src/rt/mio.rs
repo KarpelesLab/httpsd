@@ -10,12 +10,11 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::error::{Error, Result};
 use crate::rt::common::{self, IO_TIMEOUT, MIN_PROGRESS, READ_BUF};
@@ -26,6 +25,29 @@ use crate::session::{Session, SessionConfig};
 use crate::tls::ReloadableAcceptor;
 
 const LISTENER: Token = Token(0);
+/// Token of the [`Waker`] stream-body producers use to wake the loop.
+const WAKER: Token = Token(usize::MAX);
+
+/// Wakes the event loop for connections whose stream body has new data.
+struct Wakeups {
+    waker: Waker,
+    /// Connections to service on the next [`WAKER`] event.
+    pending: Mutex<Vec<Token>>,
+}
+
+impl Wakeups {
+    fn wake(&self, token: Token) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(token);
+        let _ = self.waker.wake();
+    }
+
+    fn take(&self) -> Vec<Token> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 /// Ceiling on simultaneously tracked connections. The connection map would grow
 /// unbounded otherwise, letting a flood exhaust memory and file descriptors.
@@ -139,6 +161,10 @@ pub(crate) fn run(
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
 
+    let wakeups = Arc::new(Wakeups {
+        waker: Waker::new(poll.registry(), WAKER)?,
+        pending: Mutex::new(Vec::new()),
+    });
     let mut events = Events::with_capacity(1024);
     let mut conns: HashMap<Token, Conn> = HashMap::new();
     let mut next_token = 1usize;
@@ -221,13 +247,19 @@ pub(crate) fn run(
                         &limiter,
                         #[cfg(feature = "tls")]
                         &tls,
+                        &wakeups,
                         &mut conns,
                         &mut next_token,
                     ) {
                         accept_backoff_until = Some(backoff);
                     }
                 }
-                token => handle_conn(token, event, &poll, &mut conns),
+                WAKER => {
+                    for token in wakeups.take() {
+                        handle_conn(token, false, &poll, &mut conns);
+                    }
+                }
+                token => handle_conn(token, event.is_readable(), &poll, &mut conns),
             }
         }
 
@@ -242,6 +274,13 @@ pub(crate) fn run(
 /// Evict connections that have failed the minimum-throughput rule (idle or
 /// slow-trickle), deregistering and dropping them to free the descriptor.
 fn sweep_idle(poll: &Poll, conns: &mut HashMap<Token, Conn>, now: Instant) {
+    // A connection streaming a response body is legitimately quiet on input.
+    for conn in conns.values_mut() {
+        if conn.session.is_streaming() {
+            conn.progress_since = now;
+            conn.progress_bytes = 0;
+        }
+    }
     let stale: Vec<Token> = conns
         .iter()
         .filter(|(_, c)| c.is_idle(now))
@@ -271,12 +310,14 @@ fn bind_first(addrs: &[SocketAddr]) -> Result<TcpListener> {
 /// exhaustion error asks the caller to back off accepting until that instant
 /// (see [`note_accept_error`]); the caller must skip the listener until then
 /// rather than sleeping the whole single-thread loop.
+#[allow(clippy::too_many_arguments)]
 fn accept_ready(
     listener: &TcpListener,
     poll: &Poll,
     cfg: &SessionConfig,
     limiter: &Arc<common::PeerLimiter>,
     #[cfg(feature = "tls")] tls: &Option<ReloadableAcceptor>,
+    wakeups: &Arc<Wakeups>,
     conns: &mut HashMap<Token, Conn>,
     next_token: &mut usize,
 ) -> Option<Instant> {
@@ -298,7 +339,7 @@ fn accept_ready(
                         continue;
                     }
                 };
-                let session = match build_session(
+                let mut session = match build_session(
                     cfg,
                     #[cfg(feature = "tls")]
                     tls,
@@ -311,6 +352,11 @@ fn accept_ready(
                 };
                 let token = Token(*next_token);
                 *next_token += 1;
+                session.set_addrs(stream.peer_addr().ok(), stream.local_addr().ok());
+                {
+                    let wakeups = Arc::clone(wakeups);
+                    session.set_waker(move || wakeups.wake(token));
+                }
                 if poll
                     .registry()
                     .register(&mut stream, token, Interest::READABLE)
@@ -347,12 +393,12 @@ fn accept_ready(
     None
 }
 
-fn handle_conn(token: Token, event: &Event, poll: &Poll, conns: &mut HashMap<Token, Conn>) {
+fn handle_conn(token: Token, readable: bool, poll: &Poll, conns: &mut HashMap<Token, Conn>) {
     let Some(conn) = conns.get_mut(&token) else {
         return;
     };
 
-    let result = drive(conn, event);
+    let result = drive(conn, readable);
 
     let finished = result.is_err() || conn.is_done();
     if finished {
@@ -369,9 +415,9 @@ fn handle_conn(token: Token, event: &Event, poll: &Poll, conns: &mut HashMap<Tok
         .reregister(&mut conn.stream, token, interest);
 }
 
-/// Process one readiness event for a connection.
-fn drive(conn: &mut Conn, event: &Event) -> Result<()> {
-    if event.is_readable() && !conn.read_closed {
+/// Process one readiness event (or a stream-body wakeup) for a connection.
+fn drive(conn: &mut Conn, readable: bool) -> Result<()> {
+    if readable && !conn.read_closed {
         let mut buf = [0u8; READ_BUF];
         loop {
             match conn.stream.read(&mut buf) {
@@ -411,7 +457,9 @@ fn pump_writes(conn: &mut Conn) -> Result<()> {
         if conn.pending_out() {
             break; // socket full; wait for the next WRITABLE event
         }
-        if !conn.session.has_output() {
+        // A streaming body (notably on HTTP/2, where new DATA is framed only
+        // inside `to_send`) may have output even when none is queued yet.
+        if !conn.session.has_output() && !conn.session.is_streaming() {
             break;
         }
         let out = conn.session.to_send()?;

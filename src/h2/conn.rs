@@ -1012,6 +1012,80 @@ mod tests {
         assert_eq!(data, b"hello h2");
     }
 
+    /// Whether `out` holds a frame of type `ty` on `sid` with END_STREAM set.
+    fn has_end_stream(out: &[u8], ty: u8, sid: u32) -> bool {
+        let mut pos = 0;
+        while pos + 9 <= out.len() {
+            let h = FrameHeader::parse(&out[pos..pos + 9]);
+            if h.ftype == ty && h.stream_id == sid && h.has(flag::END_STREAM) {
+                return true;
+            }
+            pos += 9 + h.length;
+        }
+        false
+    }
+
+    #[test]
+    fn stream_body_is_sent_as_data_then_end_stream() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        wire.extend_from_slice(&client_request(&mut enc, 1, &req_fields(b"/s"), None));
+        c.received(&wire);
+        let (sid, _) = c.poll_request().unwrap();
+
+        let (tx, body) = Body::channel();
+        c.respond(
+            sid,
+            Response::new(StatusCode::OK)
+                .header("content-length", "999")
+                .body(body),
+        );
+        let out = c.take_out();
+        let (hblock, data) = collect(&out, 1);
+        let fields = HpackDecoder::default().decode(&hblock).unwrap();
+        assert!(
+            !fields.iter().any(|f| f.name == b"content-length"),
+            "a stream's length is unknown"
+        );
+        assert!(data.is_empty());
+        assert!(!has_end_stream(&out, ftype::HEADERS, 1));
+        assert!(c.is_streaming());
+
+        tx.send("part one").unwrap();
+        let out = c.take_out();
+        assert_eq!(collect(&out, 1).1, b"part one");
+        assert!(!has_end_stream(&out, ftype::DATA, 1));
+
+        tx.finish();
+        let out = c.take_out();
+        assert!(has_end_stream(&out, ftype::DATA, 1));
+        assert!(!c.is_streaming());
+    }
+
+    #[test]
+    fn aborted_stream_body_resets_the_stream() {
+        let mut c = H2Conn::new(Limits::default(), None);
+        let mut enc = HpackEncoder::new();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(CLIENT_PREFACE);
+        frame::write_settings(&mut wire, &[]);
+        wire.extend_from_slice(&client_request(&mut enc, 1, &req_fields(b"/s"), None));
+        c.received(&wire);
+        let (sid, _) = c.poll_request().unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(sid, Response::new(StatusCode::OK).body(body));
+        let _ = c.take_out();
+        tx.abort();
+        let out = c.take_out();
+        assert_eq!(
+            frame_code(&out, ftype::RST_STREAM, 1),
+            Some(errcode::INTERNAL_ERROR)
+        );
+    }
+
     #[test]
     fn head_response_has_length_but_no_body() {
         let mut c = H2Conn::new(Limits::default(), Some("httpsd".into()));

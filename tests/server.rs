@@ -327,10 +327,18 @@ fn tls_handshake_and_request_in_process() {
 
     // Server side: a self-signed identity + an HTTP handler, wrapped in a TLS session.
     let acceptor = TlsAcceptor::self_signed(&["localhost"]).unwrap();
-    let cfg = SessionConfig::new(Arc::new(|_: &httpsd::Request| {
-        Response::text("secure hello")
+    let cfg = SessionConfig::new(Arc::new(|req: &httpsd::Request| {
+        let c = req.conn();
+        Response::text(format!(
+            "secure hello secure={} version={} sni={} peer={:?}",
+            c.is_secure(),
+            c.tls_version().unwrap_or("-"),
+            c.server_name().unwrap_or("-"),
+            c.peer_addr(),
+        ))
     }));
     let mut server = Session::tls(cfg, acceptor.accept().unwrap());
+    server.set_addrs(Some("192.0.2.7:4242".parse().unwrap()), None);
 
     // Client side: a purecrypto TLS client that trusts anything (test only).
     let client_cfg = Config::builder()
@@ -380,6 +388,13 @@ fn tls_handshake_and_request_in_process() {
     let text = String::from_utf8_lossy(&plaintext);
     assert!(text.contains("200 OK"), "decrypted: {text}");
     assert!(text.contains("secure hello"), "decrypted: {text}");
+    assert!(text.contains("secure=true"), "decrypted: {text}");
+    assert!(text.contains("version=TLSv1.3"), "decrypted: {text}");
+    assert!(text.contains("sni=localhost"), "decrypted: {text}");
+    assert!(
+        text.contains("peer=Some(192.0.2.7:4242)"),
+        "decrypted: {text}"
+    );
 }
 
 #[test]
