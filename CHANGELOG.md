@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/httpsd/compare/v0.1.3...v0.1.4) - 2026-10-24
+
+### Other
+
+- require purecrypto 0.10.3
+- select ACME certificates from ClientHellos that span two datagrams
+- report SNI when the ClientHello spans two datagrams; README: SAPI features
+- connection info and streamed bodies on every runtime
+- public Body::file, custom reason phrase, byte header values, stream bodies
+- update to purecrypto 0.10, compcol 0.7, rsurl 0.1.19; MSRV 1.95
+
 ## [0.1.3](https://github.com/KarpelesLab/httpsd/compare/v0.1.2...v0.1.3) - 2026-09-27
 
 ### Other
