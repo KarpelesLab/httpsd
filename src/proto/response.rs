@@ -459,6 +459,8 @@ pub struct Response {
     reason: Option<String>,
     headers: Headers,
     body: Body,
+    /// A verbatim HTTP/1 head overriding the serialized status and headers.
+    raw_head: Option<Vec<u8>>,
 }
 
 impl Response {
@@ -469,6 +471,7 @@ impl Response {
             reason: None,
             headers: Headers::new(),
             body: Body::empty(),
+            raw_head: None,
         }
     }
 
@@ -535,6 +538,38 @@ impl Response {
         self
     }
 
+    /// Send `head` verbatim as this response's HTTP/1 head (builder style): the
+    /// status line and every header line, including the blank line that ends
+    /// the head (`b"HTTP/1.0 200 OK\r\nX-A: 1\r\n\r\n"`).
+    ///
+    /// This is a low-level escape hatch for emulating another server byte for
+    /// byte. On HTTP/1 the engine writes `head` exactly as given — no status
+    /// line of its own, no `Server`, `Date`, `Content-Length`, `Connection` or
+    /// other added headers, no header validation, and no compression — then
+    /// the body as-is (never chunked, and even for `HEAD`: return an empty body
+    /// if none should be sent), and closes the connection to delimit it.
+    ///
+    /// The caller is fully responsible for `head` being well-formed: in
+    /// particular, never put unvalidated client data in it, or it can split the
+    /// response.
+    ///
+    /// HTTP/2 and HTTP/3 have no textual head, so there this is ignored and the
+    /// response's [status](Self::status_code) and [headers](Self::headers) are
+    /// sent as usual.
+    pub fn with_raw_head(mut self, head: impl Into<Vec<u8>>) -> Response {
+        self.raw_head = Some(head.into());
+        self
+    }
+
+    /// The verbatim HTTP/1 head set with [`with_raw_head`](Self::with_raw_head).
+    pub fn raw_head(&self) -> Option<&[u8]> {
+        self.raw_head.as_deref()
+    }
+
+    pub(crate) fn take_raw_head(&mut self) -> Option<Vec<u8>> {
+        self.raw_head.take()
+    }
+
     /// The reason phrase to send: the custom one if set, else the status's
     /// default.
     pub fn reason(&self) -> &str {
@@ -584,6 +619,7 @@ impl Response {
             reason: None,
             headers,
             body,
+            raw_head: None,
         }
     }
 }

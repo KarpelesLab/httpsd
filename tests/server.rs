@@ -440,3 +440,64 @@ fn graceful_shutdown_returns_after_trigger() {
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
+
+#[test]
+fn lenient_h1_with_raw_head_round_trip() {
+    let addr = free_addr();
+    std::thread::spawn(move || {
+        Server::bind(addr)
+            .unwrap()
+            .lenient_h1(true)
+            .handler(|req: &httpsd::Request| {
+                // Echo the head as received, under a verbatim HTTP/1.0 head.
+                Response::new(StatusCode::OK)
+                    .with_raw_head(
+                        &b"HTTP/1.0 500 Internal Server Error\r\nX-Powered-By: t\r\n\r\n"[..],
+                    )
+                    .body(req.raw_head().unwrap_or_default().to_vec())
+            })
+            .workers(1)
+            .run()
+            .unwrap();
+    });
+
+    // Bare-LF line endings and a colon-less header line.
+    let resp = request(addr, b"GET / HTTP/1.1\nHost: a\nUser-Agent\n\n");
+    assert_eq!(
+        resp,
+        b"HTTP/1.0 500 Internal Server Error\r\nX-Powered-By: t\r\n\r\nGET / HTTP/1.1\nHost: a\nUser-Agent"
+    );
+}
+
+#[test]
+fn max_body_bytes_is_enforced() {
+    let addr = free_addr();
+    std::thread::spawn(move || {
+        Server::bind(addr)
+            .unwrap()
+            .max_body_bytes(8)
+            .handler(|req: &httpsd::Request| Response::text(format!("{}", req.body().len())))
+            .workers(1)
+            .run()
+            .unwrap();
+    });
+
+    let small = request(
+        addr,
+        b"POST / HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Length: 8\r\n\r\n12345678",
+    );
+    assert!(
+        small.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&small)
+    );
+    let big = request(
+        addr,
+        b"POST / HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Length: 9\r\n\r\n123456789",
+    );
+    assert!(
+        big.starts_with(b"HTTP/1.1 413"),
+        "{}",
+        String::from_utf8_lossy(&big)
+    );
+}

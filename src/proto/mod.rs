@@ -17,7 +17,7 @@ mod status;
 mod stream;
 mod version;
 
-pub use conn::{H1Conn, Limits};
+pub use conn::{H1Conn, Limits, http_date};
 pub use headers::Headers;
 pub use info::ConnInfo;
 pub use method::Method;
@@ -27,7 +27,6 @@ pub use status::StatusCode;
 pub use stream::BodySender;
 pub use version::Version;
 
-pub(crate) use conn::http_date;
 #[cfg(any(feature = "h2", feature = "h3"))]
 pub(crate) use fields::{RequestHead, request_head, response_fields};
 pub(crate) use response::read_at_exact;

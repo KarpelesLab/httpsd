@@ -63,6 +63,10 @@ pub fn compress_response(req: &Request, mut resp: Response, opts: &Options) -> R
     if resp.headers().contains("content-encoding") {
         return resp;
     }
+    // A verbatim head can't gain a `Content-Encoding`: leave the body alone.
+    if resp.raw_head().is_some() {
+        return resp;
+    }
     // Never compress partial-content responses: re-encoding a byte range would
     // corrupt the `Content-Range` semantics (and can poison shared caches).
     if resp.status_code().code() == 206 || resp.headers().contains("content-range") {
@@ -213,6 +217,19 @@ mod tests {
         let out = compress_response(&req, resp, &Options::default());
         assert!(!out.headers().contains("content-encoding"));
         assert_eq!(out.body_ref().len(), body.len());
+    }
+
+    #[test]
+    fn raw_head_response_is_not_compressed() {
+        let req = gzip_request();
+        let body = vec![b'a'; 4096];
+        let resp = Response::new(crate::proto::StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .with_raw_head(&b"HTTP/1.1 200 OK\r\n\r\n"[..])
+            .body(body.clone());
+        let out = compress_response(&req, resp, &Options::default());
+        assert!(!out.headers().contains("content-encoding"));
+        assert_eq!(out.body_ref().as_bytes(), &body[..]);
     }
 
     #[test]

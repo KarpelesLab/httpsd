@@ -96,6 +96,10 @@ pub struct H1Conn {
     interim_sent: bool,
     /// Optional `Server` header value advertised on responses.
     server_name: Option<String>,
+    /// Lenient (compatibility) parsing: accept bare-LF line endings and
+    /// colon-less header lines, and keep the raw head on each request. See
+    /// [`set_lenient`](H1Conn::set_lenient).
+    lenient: bool,
 }
 
 impl Default for H1Conn {
@@ -118,12 +122,34 @@ impl H1Conn {
             closed: false,
             interim_sent: false,
             server_name: Some(concat!("httpsd/", env!("CARGO_PKG_VERSION")).to_owned()),
+            lenient: false,
         }
     }
 
     /// Set the `Server` header value (or `None` to omit it).
     pub fn set_server_name(&mut self, name: Option<String>) {
         self.server_name = name;
+    }
+
+    /// Enable lenient request parsing, for compatibility with clients (and test
+    /// suites) that send not-quite-conforming HTTP/1 — e.g. to emulate PHP's
+    /// built-in server. Off by default. When on:
+    ///
+    /// - lines may end in a bare LF instead of CRLF (including the blank line
+    ///   that ends the head);
+    /// - a header line without a colon is kept rather than rejected, as a field
+    ///   with that line as its name and an empty value;
+    /// - each request carries its head exactly as received, via
+    ///   [`Request::raw_head`].
+    ///
+    /// Everything else stays strict: bare CR, control characters, obsolete
+    /// line folding, and ambiguous body framing are still refused.
+    ///
+    /// **Do not enable this behind a proxy or load balancer**: accepting line
+    /// endings the front end parses differently is the classic recipe for
+    /// request smuggling.
+    pub fn set_lenient(&mut self, on: bool) {
+        self.lenient = on;
     }
 
     /// Push freshly received plaintext bytes into the engine.
@@ -257,14 +283,19 @@ impl H1Conn {
         // re-scanned from the start (which would be O(n²)). Back up by 3 bytes
         // so a `\r\n\r\n` straddling the previous boundary is still found.
         let search_from = self.head_scanned.saturating_sub(3);
-        let head_end = match find_subslice(&self.inbuf[search_from..], b"\r\n\r\n") {
-            Some(rel) => {
-                let end = search_from + rel;
+        let found = if self.lenient {
+            find_head_end_lenient(&self.inbuf, search_from)
+        } else {
+            find_subslice(&self.inbuf[search_from..], b"\r\n\r\n")
+                .map(|rel| (search_from + rel, search_from + rel + 4))
+        };
+        let (head_end, body_start) = match found {
+            Some((end, body_start)) => {
                 // Resume future scans right at the terminator: while we wait for
                 // the body, re-finding it then costs O(1) instead of re-scanning
                 // the (possibly large) buffered body for the header terminator.
                 self.head_scanned = end + 3;
-                end
+                (end, body_start)
             }
             None => {
                 self.head_scanned = self.inbuf.len();
@@ -278,11 +309,11 @@ impl H1Conn {
         if header_block_len > self.limits.max_header_bytes {
             return Err(self.fail(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "headers"));
         }
-        let body_start = head_end + 4;
 
         // Parse request line + headers from the header block.
         let head = &self.inbuf[..header_block_len];
-        let (method, target, version, headers) = match parse_head(head) {
+        let raw_head = self.lenient.then(|| head.to_vec());
+        let (method, target, version, headers) = match parse_head(head, self.lenient) {
             Ok(parts) => parts,
             Err(e) => {
                 // Map parse errors to the right status, then fail the connection.
@@ -368,7 +399,9 @@ impl H1Conn {
             is_head,
         });
 
-        Ok(Some(Request::new(method, target, version, headers, body)))
+        let mut req = Request::new(method, target, version, headers, body);
+        req.set_raw_head(raw_head);
+        Ok(Some(req))
     }
 
     /// Serialize `resp` for the request most recently returned by
@@ -413,6 +446,10 @@ impl H1Conn {
     }
 
     fn serialize(&mut self, meta: Pending, mut resp: Response) {
+        if let Some(head) = resp.take_raw_head() {
+            self.serialize_raw(head, resp);
+            return;
+        }
         let reason = resp.take_reason();
         let (status, mut headers, body) = resp.into_parts();
         let bodyless = status.is_bodyless();
@@ -511,6 +548,55 @@ impl H1Conn {
     }
 }
 
+impl H1Conn {
+    /// Send a handler-supplied head verbatim, then the body as-is, and close —
+    /// see [`Response::with_raw_head`].
+    fn serialize_raw(&mut self, head: Vec<u8>, resp: Response) {
+        let (_, _, body) = resp.into_parts();
+        self.outbuf.extend_from_slice(&head);
+        match body.into_kind() {
+            BodyKind::Bytes(bytes) => self.outbuf.extend_from_slice(&bytes),
+            BodyKind::File { file, offset, len } if len > 0 => {
+                self.body_stream = Some(OutStream::File {
+                    file,
+                    offset,
+                    remaining: len,
+                });
+            }
+            BodyKind::File { .. } => {}
+            BodyKind::Stream(rx) => {
+                self.body_stream = Some(OutStream::Channel { rx, chunked: false });
+            }
+        }
+        // The body is delimited by closing the connection.
+        self.closed = true;
+    }
+}
+
+/// Lenient end-of-head search: the first blank line, where lines may end in
+/// CRLF or a bare LF. Scans from `from` and returns `(head_end, body_start)`:
+/// the head is `buf[..head_end]` (without the final line's terminator) and the
+/// body starts at `body_start`.
+fn find_head_end_lenient(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i < buf.len() {
+        let lf = i + buf[i..].iter().position(|&b| b == b'\n')?;
+        // The line before this LF ends here (dropping its CR, if any).
+        let line_end = if lf > 0 && buf[lf - 1] == b'\r' {
+            lf - 1
+        } else {
+            lf
+        };
+        match buf.get(lf + 1) {
+            Some(b'\n') => return Some((line_end, lf + 2)),
+            Some(b'\r') if buf.get(lf + 2) == Some(&b'\n') => return Some((line_end, lf + 3)),
+            _ => {}
+        }
+        i = lf + 1;
+    }
+    None
+}
+
 /// How a request body is delimited.
 enum BodyFraming {
     None,
@@ -600,17 +686,21 @@ fn negotiate_keep_alive(version: Version, headers: &Headers) -> bool {
 
 /// Parse the request line and header fields from the header block (the bytes
 /// before the terminating CRLFCRLF).
-fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)> {
+///
+/// With `lenient`, bare LF line endings and colon-less header lines are accepted
+/// (see [`H1Conn::set_lenient`]).
+fn parse_head(head: &[u8], lenient: bool) -> Result<(Method, String, Option<Version>, Headers)> {
     // Reject any bare CR or bare LF in the header block: every CR must be
     // immediately followed by LF and every LF immediately preceded by CR.
     // A stray `\n`/`\r` inside a field would otherwise enable request
-    // smuggling / response splitting downstream (RFC 9112 §2.2).
+    // smuggling / response splitting downstream (RFC 9112 §2.2). Lenient mode
+    // tolerates bare LF line endings but never a bare CR.
     for (i, &b) in head.iter().enumerate() {
         if b == b'\r' {
             if head.get(i + 1) != Some(&b'\n') {
                 return Err(Error::BadRequest("bare CR in header block"));
             }
-        } else if b == b'\n' && (i == 0 || head[i - 1] != b'\r') {
+        } else if !lenient && b == b'\n' && (i == 0 || head[i - 1] != b'\r') {
             return Err(Error::BadRequest("bare LF in header block"));
         }
     }
@@ -656,10 +746,15 @@ fn parse_head(head: &[u8]) -> Result<(Method, String, Option<Version>, Headers)>
         if headers.len() >= MAX_HEADER_FIELDS {
             return Err(Error::BadRequest("too many header fields"));
         }
-        let colon = line
-            .iter()
-            .position(|&b| b == b':')
-            .ok_or(Error::BadRequest("header without colon"))?;
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            if lenient && is_valid_field_value(line) {
+                // Keep the whole line as a valueless field; the exact bytes
+                // remain available through `Request::raw_head`.
+                headers.append_bytes(String::from_utf8_lossy(line).into_owned(), Vec::new());
+                continue;
+            }
+            return Err(Error::BadRequest("header without colon"));
+        };
         // The field name must be a valid RFC 9110 token, validated on the
         // UNtrimmed name: whitespace between the name and the colon is illegal.
         // A token is ASCII, so the conversion cannot fail once it passes.
@@ -947,9 +1042,10 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Format a Unix timestamp as an RFC 9110 IMF-fixdate, e.g.
-/// `Sun, 06 Nov 1994 08:49:37 GMT`.
-pub(crate) fn http_date(secs: u64) -> String {
+/// Format a Unix timestamp (seconds since the epoch) as an RFC 9110
+/// IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT` — the format of the `Date`,
+/// `Last-Modified` and `Expires` headers.
+pub fn http_date(secs: u64) -> String {
     const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MON: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1551,6 +1647,113 @@ mod tests {
         assert!(!c.wants_close(), "not before the body is done");
         tx.send("raw").unwrap();
         assert_eq!(c.take_out(), b"raw");
+        drop(tx);
+        assert!(c.take_out().is_empty());
+        assert!(c.wants_close());
+    }
+
+    fn lenient() -> H1Conn {
+        let mut c = H1Conn::default();
+        c.set_lenient(true);
+        c
+    }
+
+    #[test]
+    fn lenient_accepts_bare_lf_and_colonless_lines() {
+        let mut c = lenient();
+        let head = b"GET /x HTTP/1.1\nHost: a\nUser-Agent\nAccept: */*";
+        let mut input = head.to_vec();
+        input.extend_from_slice(b"\n\n");
+        let req = drive(&mut c, &input).expect("parses");
+        assert_eq!(req.path(), "/x");
+        assert_eq!(req.headers().get("host"), Some("a"));
+        assert_eq!(req.headers().get("user-agent"), Some(""));
+        assert_eq!(req.headers().get("accept"), Some("*/*"));
+        assert_eq!(req.raw_head(), Some(&head[..]));
+    }
+
+    #[test]
+    fn lenient_mixed_endings_and_body() {
+        let mut c = lenient();
+        // CRLF lines ending in a bare-LF blank line, then a body.
+        let req = drive(
+            &mut c,
+            b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\nabcGET /next HTTP/1.1\n\r\n",
+        )
+        .expect("parses");
+        assert_eq!(req.body(), b"abc");
+        assert_eq!(
+            req.raw_head(),
+            Some(&b"POST / HTTP/1.1\r\nContent-Length: 3"[..])
+        );
+        c.respond(Response::new(StatusCode::OK));
+        drain_all(&mut c);
+        let next = c.poll_request().unwrap().expect("pipelined request");
+        assert_eq!(next.path(), "/next");
+    }
+
+    #[test]
+    fn lenient_byte_by_byte_matches() {
+        let mut c = lenient();
+        let input = b"GET / HTTP/1.1\nHost: a\n\n";
+        let mut got = None;
+        for &b in input.iter() {
+            got = drive(&mut c, &[b]);
+            if got.is_some() {
+                break;
+            }
+        }
+        assert_eq!(got.expect("parses").headers().get("host"), Some("a"));
+    }
+
+    #[test]
+    fn lenient_still_rejects_bare_cr() {
+        let mut c = lenient();
+        c.feed(b"GET / HTTP/1.1\nHost: a\rX: y\n\n");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn strict_mode_has_no_raw_head_and_rejects_colonless() {
+        let mut c = H1Conn::default();
+        let req = drive(&mut c, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        assert!(req.raw_head().is_none());
+        let mut c = H1Conn::default();
+        c.feed(b"GET / HTTP/1.1\r\nUser-Agent\r\n\r\n");
+        assert!(c.poll_request().is_err());
+    }
+
+    #[test]
+    fn raw_head_is_sent_verbatim_then_closes() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        let head = b"HTTP/1.0 500 Internal Server Error\r\nHost: a\r\nNoColon\r\n\r\n";
+        c.respond(
+            Response::new(StatusCode::OK)
+                .header("X-Ignored", "1")
+                .with_raw_head(&head[..])
+                .body("oops"),
+        );
+        let mut want = head.to_vec();
+        want.extend_from_slice(b"oops");
+        assert_eq!(drain_all(&mut c), want);
+        assert!(c.wants_close());
+    }
+
+    #[test]
+    fn raw_head_stream_body_is_close_delimited() {
+        let mut c = H1Conn::default();
+        let _ = drive(&mut c, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        let (tx, body) = Body::channel();
+        c.respond(
+            Response::new(StatusCode::OK)
+                .with_raw_head(&b"HTTP/1.1 200 OK\r\n\r\n"[..])
+                .body(body),
+        );
+        assert_eq!(c.take_out(), b"HTTP/1.1 200 OK\r\n\r\n");
+        tx.send("raw").unwrap();
+        assert_eq!(c.take_out(), b"raw", "not chunked");
+        assert!(!c.wants_close(), "not before the body is done");
         drop(tx);
         assert!(c.take_out().is_empty());
         assert!(c.wants_close());

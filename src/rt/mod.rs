@@ -106,6 +106,8 @@ pub struct Server {
     max_conns_per_ip: u32,
     /// Request size limits (header block, buffered body) for every protocol.
     limits: crate::proto::Limits,
+    /// Lenient HTTP/1 request parsing.
+    lenient_h1: bool,
     #[cfg(feature = "tls")]
     tls: Option<ReloadableAcceptor>,
     #[cfg(feature = "compress")]
@@ -146,6 +148,7 @@ impl Server {
             workers: default_workers(),
             max_conns_per_ip: 0,
             limits: crate::proto::Limits::default(),
+            lenient_h1: false,
             #[cfg(feature = "tls")]
             tls: None,
             #[cfg(feature = "compress")]
@@ -207,6 +210,17 @@ impl Server {
     /// adjusting [`limits`](Server::limits).
     pub fn max_body_bytes(mut self, max: usize) -> Server {
         self.limits.max_body_bytes = max;
+        self
+    }
+
+    /// Parse HTTP/1 requests leniently (off by default): accept bare-LF line
+    /// endings and colon-less header lines, and expose each request's head as
+    /// received via [`Request::raw_head`](crate::Request::raw_head). Meant for
+    /// emulating servers with looser parsers, such as PHP's built-in server.
+    /// Don't enable it behind a proxy — see
+    /// [`H1Conn::set_lenient`](crate::proto::H1Conn::set_lenient).
+    pub fn lenient_h1(mut self, on: bool) -> Server {
+        self.lenient_h1 = on;
         self
     }
 
@@ -323,6 +337,7 @@ impl Server {
             alt_svc: self.alt_svc.clone(),
             #[cfg(feature = "compress")]
             compression: self.compression,
+            lenient_h1: self.lenient_h1,
         }
     }
 

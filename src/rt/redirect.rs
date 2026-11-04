@@ -59,6 +59,8 @@ pub(crate) fn serve(stream: &mut TcpStream, ctx: &Arc<HttpCtx>) -> Result<()> {
         alt_svc: None,
         #[cfg(feature = "compress")]
         compression: ctx.compression,
+        // The redirect/ACME listener always parses strictly.
+        lenient_h1: false,
     };
     let mut session = Session::plain(cfg);
     serve_blocking(stream, &mut session)

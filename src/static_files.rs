@@ -148,6 +148,21 @@ pub struct StaticFiles {
     /// work). If the root cannot be canonicalized yet (e.g. it does not exist),
     /// the cell stays empty and confinement fails closed.
     root_canon: OnceLock<PathBuf>,
+    /// Content-Type lookup overriding [`mime::from_path`], if set.
+    content_type: Option<ContentTypeFn>,
+}
+
+/// The signature of a Content-Type lookup.
+type ContentTypeLookup = dyn Fn(&Path) -> Option<String> + Send + Sync;
+
+/// A user-supplied Content-Type lookup (see [`StaticFiles::content_type`]).
+#[derive(Clone)]
+struct ContentTypeFn(Arc<ContentTypeLookup>);
+
+impl std::fmt::Debug for ContentTypeFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ContentTypeFn(..)")
+    }
 }
 
 impl StaticFiles {
@@ -157,6 +172,7 @@ impl StaticFiles {
             root: root.into(),
             index: "index.html".to_owned(),
             root_canon: OnceLock::new(),
+            content_type: None,
         }
     }
 
@@ -172,6 +188,30 @@ impl StaticFiles {
             Ok(root) => Some(self.root_canon.get_or_init(|| root).as_path()),
             Err(_) => None,
         }
+    }
+
+    /// Replace the built-in extension-to-MIME table ([`mime::from_path`]) with
+    /// `lookup`, called with the path of each file served. Returning `None`
+    /// sends no `Content-Type` header at all. Call [`mime::from_path`] from
+    /// `lookup` to fall back to the built-in table.
+    ///
+    /// ```
+    /// use httpsd::StaticFiles;
+    ///
+    /// let files = StaticFiles::new("public").content_type(|path| {
+    ///     match path.extension()?.to_str()? {
+    ///         "js" => Some("application/javascript".into()),
+    ///         "bin" => None, // no Content-Type
+    ///         _ => Some(httpsd::mime::from_path(&path.to_string_lossy()).into()),
+    ///     }
+    /// });
+    /// ```
+    pub fn content_type(
+        mut self,
+        lookup: impl Fn(&Path) -> Option<String> + Send + Sync + 'static,
+    ) -> StaticFiles {
+        self.content_type = Some(ContentTypeFn(Arc::new(lookup)));
+        self
     }
 
     /// Override the directory index file name (default `index.html`).
@@ -317,7 +357,10 @@ impl StaticFiles {
             Err(_) => return Response::status(StatusCode::NOT_FOUND),
         };
 
-        let content_type = mime::from_path(path.to_string_lossy().as_ref());
+        let content_type = match &self.content_type {
+            Some(lookup) => (lookup.0)(&path),
+            None => Some(mime::from_path(path.to_string_lossy().as_ref()).to_owned()),
+        };
         let len = meta.len();
         let mtime_secs = meta
             .modified()
@@ -347,12 +390,12 @@ impl StaticFiles {
         // the requested span off disk.
         if let Some(range) = req.headers().get("range") {
             if let Some((start, end)) = parse_single_range(range, len) {
-                let mut resp = Response::new(StatusCode::PARTIAL_CONTENT)
-                    .header("Content-Type", content_type)
-                    .header("Accept-Ranges", "bytes")
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Content-Range", format!("bytes {start}-{end}/{len}"))
-                    .header("ETag", etag);
+                let mut resp =
+                    with_content_type(Response::new(StatusCode::PARTIAL_CONTENT), content_type)
+                        .header("Accept-Ranges", "bytes")
+                        .header("X-Content-Type-Options", "nosniff")
+                        .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+                        .header("ETag", etag);
                 if let Some(lm) = last_modified {
                     resp = resp.header("Last-Modified", lm);
                 }
@@ -364,8 +407,7 @@ impl StaticFiles {
             }
         }
 
-        let mut resp = Response::new(StatusCode::OK)
-            .header("Content-Type", content_type)
+        let mut resp = with_content_type(Response::new(StatusCode::OK), content_type)
             .header("Accept-Ranges", "bytes")
             .header("X-Content-Type-Options", "nosniff")
             .header("ETag", etag);
@@ -383,6 +425,14 @@ impl Handler for StaticFiles {
 }
 
 /// Whether a conditional request's preconditions say "not modified".
+/// Add a `Content-Type` header when there is one to send.
+fn with_content_type(resp: Response, content_type: Option<String>) -> Response {
+    match content_type {
+        Some(ct) => resp.header("Content-Type", ct),
+        None => resp,
+    }
+}
+
 fn conditional_hit(req: &Request, etag: &str, last_modified: Option<&str>) -> bool {
     if let Some(inm) = req.headers().get("if-none-match") {
         return inm == "*" || inm.split(',').any(|t| t.trim() == etag);
@@ -574,6 +624,35 @@ mod tests {
             404
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn content_type_override() {
+        let root = scratch_dir("ctype");
+        fs::write(root.join("a.js"), b"x").unwrap();
+        fs::write(root.join("b.bin"), b"x").unwrap();
+        fs::write(root.join("c.txt"), b"x").unwrap();
+        let sf = StaticFiles::new(&root).content_type(|path| match path.extension()?.to_str()? {
+            "js" => Some("application/javascript".into()),
+            "bin" => None,
+            _ => Some(mime::from_path(&path.to_string_lossy()).into()),
+        });
+        let ct = |p: &str| {
+            sf.serve(&get(p))
+                .headers()
+                .get("content-type")
+                .map(str::to_owned)
+        };
+        assert_eq!(ct("/a.js").as_deref(), Some("application/javascript"));
+        assert_eq!(ct("/b.bin"), None);
+        assert_eq!(ct("/c.txt").as_deref(), Some(mime::from_path("c.txt")));
+        // The default table is untouched without an override.
+        let plain = StaticFiles::new(&root);
+        assert_eq!(
+            plain.serve(&get("/a.js")).headers().get("content-type"),
+            Some(mime::from_path("a.js"))
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

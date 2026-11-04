@@ -12,6 +12,9 @@ server_name = "httpsd"
 # Optional: worker thread count (thread-pool runtime). Defaults to CPU count.
 # workers = 8
 
+# Optional: maximum buffered request body, in bytes. Defaults to 16 MiB.
+# max_body_bytes = 16777216
+
 # Uncomment to enable HTTPS with a real certificate:
 # [tls]
 # cert = "cert.pem"   # PEM chain, leaf first

@@ -24,6 +24,9 @@ pub struct Request {
     /// Facts about the connection the request arrived on, shared by every
     /// request on that connection.
     conn: Option<Arc<ConnInfo>>,
+    /// The request line and header block exactly as received (without the
+    /// final blank line). Only kept by an HTTP/1 engine in lenient mode.
+    raw_head: Option<Vec<u8>>,
     /// Path parameters captured by the [`Router`](crate::router::Router) (e.g.
     /// `:id`). Empty unless this request was dispatched through a router.
     #[cfg(feature = "router")]
@@ -45,9 +48,26 @@ impl Request {
             headers,
             body,
             conn: None,
+            raw_head: None,
             #[cfg(feature = "router")]
             params: Vec::new(),
         }
+    }
+
+    /// The request line and header lines exactly as received, line endings
+    /// included, up to (not including) the blank line that ends the head.
+    ///
+    /// Only available on HTTP/1 connections with lenient parsing enabled
+    /// ([`Server::lenient_h1`](crate::rt::Server::lenient_h1),
+    /// [`H1Conn::set_lenient`](crate::proto::H1Conn::set_lenient)); `None`
+    /// otherwise. Useful when the exact bytes matter, such as reproducing
+    /// another server's header handling.
+    pub fn raw_head(&self) -> Option<&[u8]> {
+        self.raw_head.as_deref()
+    }
+
+    pub(crate) fn set_raw_head(&mut self, head: Option<Vec<u8>>) {
+        self.raw_head = head;
     }
 
     /// The request method.

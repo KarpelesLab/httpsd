@@ -117,6 +117,9 @@ pub struct SessionConfig {
     /// Response compression options.
     #[cfg(feature = "compress")]
     pub compression: compress::Options,
+    /// Lenient HTTP/1 request parsing (see [`H1Conn::set_lenient`]). Off by
+    /// default.
+    pub lenient_h1: bool,
 }
 
 impl SessionConfig {
@@ -130,6 +133,7 @@ impl SessionConfig {
             alt_svc: None,
             #[cfg(feature = "compress")]
             compression: compress::Options::default(),
+            lenient_h1: false,
         }
     }
 }
@@ -225,6 +229,7 @@ impl Session {
     fn new_h1(cfg: &SessionConfig) -> H1Conn {
         let mut conn = H1Conn::new(cfg.limits);
         conn.set_server_name(cfg.server_name.clone());
+        conn.set_lenient(cfg.lenient_h1);
         conn
     }
 

@@ -173,6 +173,26 @@ Handlers also get what an application server (CGI/PHP-style SAPI) needs:
 - `Response::with_reason("My Reason")` sets a custom HTTP/1.x reason phrase.
 - `Headers::append_bytes` / `get_bytes` carry non-UTF-8 header values
   (RFC 9110 obs-text) byte for byte.
+- `Server::max_body_bytes(n)` (or `Server::limits(Limits { .. })`) raises or
+  lowers the buffered request-body cap (16 MiB by default). Time a handler
+  spends running never counts against the connection's idle/slowloris timers,
+  so a handler may take minutes.
+- `StaticFiles::content_type(|path| ..)` replaces the built-in MIME table
+  (returning `None` sends no `Content-Type`); `httpsd::proto::http_date`
+  formats `Date`/`Last-Modified` values.
+
+To emulate another server byte for byte (for example PHP's built-in `php -S`,
+whose test suite compares raw responses), two opt-in escape hatches exist:
+
+- `Server::lenient_h1(true)` accepts bare-LF line endings and colon-less header
+  lines, and exposes each request's head exactly as received via
+  `req.raw_head()`. Don't enable it behind a proxy: lenient parsing is what
+  request smuggling feeds on.
+- `Response::with_raw_head(bytes)` sends the given status line and headers
+  verbatim on HTTP/1 (caller-chosen version, header order and names; no
+  `Server`, `Date` or framing headers added), then the body as-is, and closes
+  the connection to delimit it. HTTP/2 and HTTP/3 ignore it and use the
+  response's status and headers.
 
 ## Automatic certificates (ACME)
 
@@ -212,6 +232,7 @@ listen = "0.0.0.0:8080"        # or ["127.0.0.1:8080", "[::1]:8080"]
 root = "./public"              # document root for static file serving
 server_name = "httpsd"
 workers = 8
+# max_body_bytes = 16777216    # buffered request-body cap (default 16 MiB)
 
 [tls]
 cert = "cert.pem"              # PEM chain, leaf first
