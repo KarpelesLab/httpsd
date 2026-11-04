@@ -173,7 +173,11 @@ async fn serve(mut stream: TcpStream, shared: &Shared) -> Result<()> {
                     window_deadline = Instant::now() + IO_TIMEOUT;
                     window_bytes = 0;
                 }
+                // Don't charge the session's processing time (the handler runs
+                // synchronously inside `received`) against the peer's window.
+                let started = Instant::now();
                 session.received(&buf[..n])?;
+                window_deadline += started.elapsed();
             }
             _ = wake.notified(), if streaming => {}
         }

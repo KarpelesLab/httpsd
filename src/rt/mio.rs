@@ -426,8 +426,14 @@ fn drive(conn: &mut Conn, readable: bool) -> Result<()> {
                     break;
                 }
                 Ok(n) => {
-                    conn.note_progress(n, Instant::now());
+                    let started = Instant::now();
+                    conn.note_progress(n, started);
                     conn.session.received(&buf[..n])?;
+                    // The handler runs synchronously inside `received`; that
+                    // time is ours, not the peer's, so it must not count toward
+                    // the idle sweep (a slow handler would otherwise get its
+                    // connection evicted before the response is written).
+                    conn.progress_since += started.elapsed();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,

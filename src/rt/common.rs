@@ -204,6 +204,17 @@ pub(crate) fn serve_blocking_prefed(
     session: &mut Session,
     initial: &[u8],
 ) -> Result<()> {
+    serve_blocking_window(stream, session, initial, IO_TIMEOUT)
+}
+
+/// The blocking drive loop, with the inactivity/throughput `window` as a
+/// parameter (always [`IO_TIMEOUT`] in production; shortened by tests).
+fn serve_blocking_window(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    initial: &[u8],
+    window: Duration,
+) -> Result<()> {
     session.set_addrs(stream.peer_addr().ok(), stream.local_addr().ok());
     let wake = Arc::new(Wake::default());
     {
@@ -223,11 +234,23 @@ pub(crate) fn serve_blocking_prefed(
     // deadline is enforced in software when a read returns, bounding a trickle
     // to at most ~2× the window. While a response body is streaming the peer is
     // legitimately quiet, so the window is held open.
-    let mut window_deadline = Instant::now() + IO_TIMEOUT;
+    let mut window_deadline = Instant::now() + window;
     let mut window_bytes: usize = 0;
+    // Feed bytes to the session without charging its processing time to the
+    // peer: `received` runs the handler synchronously, and a handler that
+    // takes longer than the window (a slow upstream, minutes of inference)
+    // must not make a well-behaved client look like a slow-trickle attacker —
+    // that would drop the finished response unsent. Only time spent waiting on
+    // the socket counts against the throughput floor.
+    let feed = |session: &mut Session, data: &[u8], deadline: &mut Instant| {
+        let started = Instant::now();
+        let r = session.received(data);
+        *deadline += started.elapsed();
+        r
+    };
     loop {
         let received = if !pending.is_empty() {
-            let r = session.received(pending);
+            let r = feed(session, pending, &mut window_deadline);
             window_bytes = window_bytes.saturating_add(pending.len());
             pending = &[];
             r
@@ -239,13 +262,13 @@ pub(crate) fn serve_blocking_prefed(
                 let _ = stream.set_read_timeout(Some(STREAM_READ_PROBE));
                 probing = true;
             }
-            window_deadline = Instant::now() + IO_TIMEOUT;
+            window_deadline = Instant::now() + window;
             window_bytes = 0;
             match stream.read(&mut buf) {
                 Ok(0) => break, // peer closed: drops the stream (producer sees it)
                 Ok(n) => {
                     window_bytes = n;
-                    session.received(&buf[..n])
+                    feed(session, &buf[..n], &mut window_deadline)
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::Interrupted => Ok(()),
@@ -253,7 +276,7 @@ pub(crate) fn serve_blocking_prefed(
             }
         } else {
             if probing {
-                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_read_timeout(Some(window));
                 probing = false;
             }
             let n = stream.read(&mut buf)?;
@@ -261,14 +284,14 @@ pub(crate) fn serve_blocking_prefed(
                 break; // peer closed
             }
             window_bytes = window_bytes.saturating_add(n);
-            session.received(&buf[..n])
+            feed(session, &buf[..n], &mut window_deadline)
         };
 
         // Enforce the minimum-throughput deadline. A peer that has not delivered
         // `MIN_PROGRESS` bytes by the end of a window is a slow-trickle attacker;
         // drop it. Meeting the floor opens a fresh window.
         if window_bytes >= MIN_PROGRESS {
-            window_deadline = Instant::now() + IO_TIMEOUT;
+            window_deadline = Instant::now() + window;
             window_bytes = 0;
         } else if Instant::now() >= window_deadline {
             break; // trickle: closed without making real progress
@@ -304,8 +327,68 @@ pub(crate) fn serve_blocking_prefed(
 
 #[cfg(test)]
 mod tests {
-    use super::PeerLimiter;
-    use std::net::{IpAddr, Ipv4Addr};
+    use super::{PeerLimiter, serve_blocking_window};
+    use crate::proto::{Request, Response, StatusCode};
+    use crate::session::{Session, SessionConfig};
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Serve one plain-HTTP connection on a loopback socket with a shortened
+    /// throughput `window`, send `request` from the client side, and return
+    /// everything the server wrote before closing.
+    fn exchange(window: Duration, handler_delay: Duration, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Mirror `apply_timeouts`, with the shortened window.
+            stream.set_read_timeout(Some(window)).unwrap();
+            let handler = move |_req: &Request| {
+                std::thread::sleep(handler_delay);
+                Response::new(StatusCode::OK).body("done\n")
+            };
+            let mut session = Session::plain(SessionConfig::new(Arc::new(handler)));
+            let _ = serve_blocking_window(&mut stream, &mut session, &[], window);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client.write_all(request).unwrap();
+        let mut out = Vec::new();
+        let _ = client.read_to_end(&mut out);
+        server.join().unwrap();
+        out
+    }
+
+    /// Issue #7: a handler that runs longer than the throughput window on a
+    /// small (< MIN_PROGRESS) request must still get its response delivered —
+    /// time spent in the handler is not the peer trickling.
+    #[test]
+    fn slow_handler_response_is_not_dropped() {
+        let out = exchange(
+            Duration::from_millis(200),
+            Duration::from_millis(600),
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 200"), "got: {text:?}");
+        assert!(text.ends_with("done\n"), "got: {text:?}");
+    }
+
+    /// The trickle rule still applies to the socket: a peer that sends a
+    /// partial head and then goes quiet is dropped once the window passes.
+    #[test]
+    fn stalled_peer_is_still_dropped() {
+        let out = exchange(
+            Duration::from_millis(200),
+            Duration::ZERO,
+            b"GET / HTTP/1.1\r\nHost: x\r\n",
+        );
+        assert!(out.is_empty(), "got: {:?}", String::from_utf8_lossy(&out));
+    }
 
     fn ip(n: u8) -> Option<IpAddr> {
         Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
