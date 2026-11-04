@@ -104,6 +104,8 @@ pub struct Server {
     workers: usize,
     /// Cap on concurrent connections from a single client IP (0 = unlimited).
     max_conns_per_ip: u32,
+    /// Request size limits (header block, buffered body) for every protocol.
+    limits: crate::proto::Limits,
     #[cfg(feature = "tls")]
     tls: Option<ReloadableAcceptor>,
     #[cfg(feature = "compress")]
@@ -143,6 +145,7 @@ impl Server {
             server_name: Some(concat!("httpsd/", env!("CARGO_PKG_VERSION")).to_owned()),
             workers: default_workers(),
             max_conns_per_ip: 0,
+            limits: crate::proto::Limits::default(),
             #[cfg(feature = "tls")]
             tls: None,
             #[cfg(feature = "compress")]
@@ -188,6 +191,22 @@ impl Server {
     /// dropped so it cannot exhaust the global connection budget.
     pub fn max_conns_per_ip(mut self, max: u32) -> Server {
         self.max_conns_per_ip = max;
+        self
+    }
+
+    /// Set the request size [`Limits`](crate::proto::Limits) (request line +
+    /// header block, and buffered request body) applied on every protocol and
+    /// runtime. Defaults to 64 KiB of headers and a 16 MiB body.
+    pub fn limits(mut self, limits: crate::proto::Limits) -> Server {
+        self.limits = limits;
+        self
+    }
+
+    /// Set the maximum buffered request body size, in bytes (default 16 MiB).
+    /// A larger body is refused with `413 Content Too Large`. Shorthand for
+    /// adjusting [`limits`](Server::limits).
+    pub fn max_body_bytes(mut self, max: usize) -> Server {
+        self.limits.max_body_bytes = max;
         self
     }
 
@@ -298,7 +317,7 @@ impl Server {
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
             handler: Arc::clone(&self.handler),
-            limits: crate::proto::Limits::default(),
+            limits: self.limits,
             server_name: self.server_name.clone(),
             hsts: self.hsts.clone(),
             alt_svc: self.alt_svc.clone(),
@@ -312,7 +331,7 @@ impl Server {
         redirect::HttpCtx {
             allow_http: self.allow_http,
             server_name: self.server_name.clone(),
-            limits: crate::proto::Limits::default(),
+            limits: self.limits,
             content: self.allow_http.then(|| Arc::clone(&self.handler)),
             #[cfg(feature = "acme")]
             acme: self.acme.clone(),

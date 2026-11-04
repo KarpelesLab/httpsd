@@ -177,6 +177,9 @@ pub struct ServerConfig {
     /// the default). Bounds any single source's share of the connection budget.
     #[serde(default)]
     pub max_conns_per_ip: Option<u32>,
+    /// Maximum buffered request body size in bytes (default 16 MiB).
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
     /// TLS settings.
     pub tls: Option<TlsConfig>,
     /// Compression settings.
@@ -267,6 +270,9 @@ impl ServerConfig {
         }
         if let Some(n) = self.max_conns_per_ip {
             server = server.max_conns_per_ip(n);
+        }
+        if let Some(n) = self.max_body_bytes {
+            server = server.max_body_bytes(n);
         }
         if self.no_server_header {
             server = server.server_name(None);
