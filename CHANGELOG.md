@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/httpsd/compare/v0.1.4...v0.2.0) - 2026-11-04
+
+### Other
+
+- make SessionConfig non_exhaustive
+- keep StaticFiles UnwindSafe + RefUnwindSafe
+- warning-free builds and passing tests on every feature set
+- opt-in compatibility mode for emulating other servers (php -S)
+- make request Limits configurable on Server
+- don't count handler time against the slowloris throughput window
+
 ## [0.1.4](https://github.com/KarpelesLab/httpsd/compare/v0.1.3...v0.1.4) - 2026-10-24
 
 ### Other
