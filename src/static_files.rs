@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io;
+use std::panic::RefUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
@@ -153,7 +154,8 @@ pub struct StaticFiles {
 }
 
 /// The signature of a Content-Type lookup.
-type ContentTypeLookup = dyn Fn(&Path) -> Option<String> + Send + Sync;
+/// `RefUnwindSafe` keeps `StaticFiles` itself `UnwindSafe` + `RefUnwindSafe`.
+type ContentTypeLookup = dyn Fn(&Path) -> Option<String> + Send + Sync + RefUnwindSafe;
 
 /// A user-supplied Content-Type lookup (see [`StaticFiles::content_type`]).
 #[derive(Clone)]
@@ -208,7 +210,7 @@ impl StaticFiles {
     /// ```
     pub fn content_type(
         mut self,
-        lookup: impl Fn(&Path) -> Option<String> + Send + Sync + 'static,
+        lookup: impl Fn(&Path) -> Option<String> + Send + Sync + RefUnwindSafe + 'static,
     ) -> StaticFiles {
         self.content_type = Some(ContentTypeFn(Arc::new(lookup)));
         self
@@ -625,6 +627,12 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn static_files_is_unwind_safe() {
+        fn assert_auto<T: Send + Sync + std::panic::UnwindSafe + RefUnwindSafe>() {}
+        assert_auto::<StaticFiles>();
     }
 
     #[test]
