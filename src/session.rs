@@ -99,7 +99,11 @@ enum Engine {
 }
 
 /// Shared, per-server settings a [`Session`] needs. Cheap to clone.
+///
+/// Non-exhaustive so settings can be added without a breaking change: build
+/// one with [`SessionConfig::new`], then adjust its public fields.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct SessionConfig {
     /// The request handler, shared across all connections.
     pub handler: Arc<dyn Handler>,
