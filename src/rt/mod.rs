@@ -14,6 +14,12 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::handler::Handler;
 use crate::proto::{Request, Response, StatusCode};
+#[cfg(any(
+    feature = "rt-threadpool",
+    feature = "rt-tokio",
+    feature = "rt-mio",
+    feature = "h3"
+))]
 use crate::session::SessionConfig;
 use crate::static_files::StaticFiles;
 
@@ -22,9 +28,11 @@ use crate::compress;
 #[cfg(feature = "tls")]
 use crate::tls::{ReloadableAcceptor, TlsAcceptor};
 
+#[cfg(any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio"))]
 pub(crate) mod common;
+#[cfg(feature = "rt-threadpool")]
 pub(crate) mod redirect;
-#[cfg(feature = "acme")]
+#[cfg(all(feature = "acme", feature = "rt-threadpool"))]
 pub(crate) mod route;
 pub(crate) mod shutdown;
 
@@ -98,6 +106,16 @@ fn not_found(_req: &Request) -> Response {
 /// [`serve_dir`](Server::serve_dir)), optionally enable TLS, then call one of
 /// the `run*` methods for the runtime you compiled in.
 pub struct Server {
+    // Only read by the `run*` methods, which need a runtime feature.
+    #[cfg_attr(
+        not(any(
+            feature = "rt-threadpool",
+            feature = "rt-tokio",
+            feature = "rt-mio",
+            feature = "h3"
+        )),
+        allow(dead_code)
+    )]
     addrs: Vec<std::net::SocketAddr>,
     handler: Arc<dyn Handler>,
     server_name: Option<String>,
@@ -328,6 +346,12 @@ impl Server {
     }
 
     /// Build the shared session configuration.
+    #[cfg(any(
+        feature = "rt-threadpool",
+        feature = "rt-tokio",
+        feature = "rt-mio",
+        feature = "h3"
+    ))]
     fn session_config(&self) -> SessionConfig {
         SessionConfig {
             handler: Arc::clone(&self.handler),
@@ -342,6 +366,7 @@ impl Server {
     }
 
     /// Build the context for the plain-HTTP listener.
+    #[cfg(feature = "rt-threadpool")]
     fn http_ctx(&self) -> redirect::HttpCtx {
         redirect::HttpCtx {
             allow_http: self.allow_http,

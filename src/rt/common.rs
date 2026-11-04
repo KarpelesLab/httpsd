@@ -1,12 +1,21 @@
 //! Pieces shared across the blocking runtimes.
 
 use std::collections::HashMap;
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, TcpStream};
-use std::sync::{Arc, Condvar, Mutex};
+use std::io;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "rt-threadpool")]
+use std::io::{ErrorKind, Read, Write};
+#[cfg(feature = "rt-threadpool")]
+use std::net::TcpStream;
+#[cfg(feature = "rt-threadpool")]
+use std::sync::Condvar;
+
+#[cfg(feature = "rt-threadpool")]
 use crate::error::Result;
+#[cfg(feature = "rt-threadpool")]
 use crate::session::Session;
 
 /// Bounds concurrent connections per client IP so one source cannot consume the
@@ -89,6 +98,7 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// keep-alive requests without ever penalizing bulk transfer.
 pub(crate) const MIN_PROGRESS: usize = 256;
 
+#[cfg(feature = "rt-threadpool")]
 /// Apply [`IO_TIMEOUT`] to a freshly accepted stream. Errors are ignored: a
 /// socket that won't take a timeout will still be bounded by the read/write
 /// loop, and failing the connection here would be worse than serving it.
@@ -153,14 +163,17 @@ pub(crate) fn note_accept_error(label: &str, e: &io::Error) -> bool {
     exhausted
 }
 
+#[cfg(feature = "rt-threadpool")]
 /// While a response body is streaming, how long the blocking loop waits for
 /// the producer before checking the socket for input (h2 WINDOW_UPDATEs, a
 /// closed connection). Stream data itself wakes the loop immediately.
 pub(crate) const STREAM_INPUT_POLL: Duration = Duration::from_millis(50);
 
+#[cfg(feature = "rt-threadpool")]
 /// Read timeout used for the quick socket check while a body is streaming.
 const STREAM_READ_PROBE: Duration = Duration::from_millis(1);
 
+#[cfg(feature = "rt-threadpool")]
 /// A one-shot wake flag a stream producer sets (via the session's waker) and
 /// the blocking loop waits on.
 #[derive(Default)]
@@ -169,6 +182,7 @@ pub(crate) struct Wake {
     cond: Condvar,
 }
 
+#[cfg(feature = "rt-threadpool")]
 impl Wake {
     pub(crate) fn notify(&self) {
         *self.flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -189,6 +203,7 @@ impl Wake {
     }
 }
 
+#[cfg(feature = "rt-threadpool")]
 /// Drive one connection to completion over a blocking socket.
 ///
 /// TLS is handled inside the [`Session`] (the handshake records flow through
@@ -197,6 +212,7 @@ pub(crate) fn serve_blocking(stream: &mut TcpStream, session: &mut Session) -> R
     serve_blocking_prefed(stream, session, &[])
 }
 
+#[cfg(feature = "rt-threadpool")]
 /// Like [`serve_blocking`] but first feeds `initial` bytes already read from the
 /// stream (e.g. the ClientHello consumed while choosing a certificate).
 pub(crate) fn serve_blocking_prefed(
@@ -207,6 +223,7 @@ pub(crate) fn serve_blocking_prefed(
     serve_blocking_window(stream, session, initial, IO_TIMEOUT)
 }
 
+#[cfg(feature = "rt-threadpool")]
 /// The blocking drive loop, with the inactivity/throughput `window` as a
 /// parameter (always [`IO_TIMEOUT`] in production; shortened by tests).
 fn serve_blocking_window(
@@ -327,14 +344,20 @@ fn serve_blocking_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerLimiter, serve_blocking_window};
-    use crate::proto::{Request, Response, StatusCode};
-    use crate::session::{Session, SessionConfig};
-    use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use super::PeerLimiter;
+    use std::net::{IpAddr, Ipv4Addr};
+    #[cfg(feature = "rt-threadpool")]
+    use {
+        super::serve_blocking_window,
+        crate::proto::{Request, Response, StatusCode},
+        crate::session::{Session, SessionConfig},
+        std::io::{Read, Write},
+        std::net::{TcpListener, TcpStream},
+        std::sync::Arc,
+        std::time::Duration,
+    };
 
+    #[cfg(feature = "rt-threadpool")]
     /// Serve one plain-HTTP connection on a loopback socket with a shortened
     /// throughput `window`, send `request` from the client side, and return
     /// everything the server wrote before closing.
@@ -363,6 +386,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "rt-threadpool")]
     /// Issue #7: a handler that runs longer than the throughput window on a
     /// small (< MIN_PROGRESS) request must still get its response delivered —
     /// time spent in the handler is not the peer trickling.
@@ -378,6 +402,7 @@ mod tests {
         assert!(text.ends_with("done\n"), "got: {text:?}");
     }
 
+    #[cfg(feature = "rt-threadpool")]
     /// The trickle rule still applies to the socket: a peer that sends a
     /// partial head and then goes quiet is dropped once the window passes.
     #[test]

@@ -188,6 +188,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub allow_http: bool,
     /// Plain-HTTP listener address(es) for redirects + ACME HTTP-01.
+    #[cfg_attr(
+        not(any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio")),
+        allow(dead_code)
+    )]
     http_listen: Option<OneOrMany>,
     /// Automatic certificate management.
     pub acme: Option<AcmeFileConfig>,

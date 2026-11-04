@@ -27,8 +27,10 @@ pub use status::StatusCode;
 pub use stream::BodySender;
 pub use version::Version;
 
+#[cfg(feature = "h2")]
+pub(crate) use fields::RequestHead;
 #[cfg(any(feature = "h2", feature = "h3"))]
-pub(crate) use fields::{RequestHead, request_head, response_fields};
+pub(crate) use fields::{request_head, response_fields};
 pub(crate) use response::read_at_exact;
 #[cfg(any(feature = "h2", feature = "h3"))]
 pub(crate) use response::{Avail, OutBody};

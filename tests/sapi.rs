@@ -2,6 +2,7 @@
 //! connection info in the handler, streamed response bodies, custom reason
 //! phrases and byte-valued headers. Each streaming test runs on every runtime
 //! compiled in.
+#![cfg(any(feature = "rt-threadpool", feature = "rt-tokio", feature = "rt-mio"))]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

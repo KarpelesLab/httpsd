@@ -11,10 +11,10 @@
 //! ## As a library
 //!
 //! ```no_run
-//! use httpsd::{Server, Response};
-//!
 //! # #[cfg(feature = "rt-threadpool")]
 //! # fn main() -> httpsd::Result<()> {
+//! use httpsd::{Server, Response};
+//!
 //! let server = Server::bind("127.0.0.1:8080")?
 //!     .handler(|req: &httpsd::Request| Response::text(format!("you asked for {}", req.path())));
 //! server.run()?;

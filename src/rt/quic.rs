@@ -483,11 +483,13 @@ fn qerr<E: std::fmt::Debug>(e: E) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "acme")]
     use purecrypto::quic::QuicConfig;
 
     /// A real client first flight from purecrypto's QUIC client. It offers a
     /// post-quantum key share, so its ClientHello spans two datagrams — like
     /// curl and current browsers.
+    #[cfg(feature = "acme")]
     fn client_flight(server_name: &str) -> Vec<Vec<u8>> {
         let tls = purecrypto::tls::Config::builder()
             .rng(Arc::new(purecrypto::rng::OsRng))

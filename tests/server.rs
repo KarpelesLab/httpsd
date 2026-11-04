@@ -1,4 +1,5 @@
 //! End-to-end tests that exercise the whole stack.
+#![cfg(feature = "rt-threadpool")]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
