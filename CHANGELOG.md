@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/KarpelesLab/httpsd/compare/v0.2.0...v0.2.1) - 2026-11-13
+
+### Other
+
+- gate the signal numbers with the handlers that use them
+- build, test and release the binary with fullrust
+- Support the libc-free fullrust target (x86_64-unknown-linux-fullrust)
+
 ## [0.2.0](https://github.com/KarpelesLab/httpsd/compare/v0.1.4...v0.2.0) - 2026-11-04
 
 ### Other
