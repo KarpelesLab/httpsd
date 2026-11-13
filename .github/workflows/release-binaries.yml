@@ -1,0 +1,58 @@
+name: Release binaries
+
+# Attach the `httpsd` binary to each GitHub Release. It is built with fullrust
+# (https://github.com/KarpelesLab/fullrust): a fully static x86-64 Linux ELF
+# that links no libc and needs nothing but the kernel, so one file runs on any
+# distribution.
+on:
+  release:
+    types: [published]
+  # Build for an existing release, e.g. one published before this workflow.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach to (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write # upload release assets
+
+jobs:
+  linux-x86_64:
+    name: Linux x86-64 (fullrust static)
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      # The workflow (and so the packaging below) comes from the triggering
+      # ref; the sources come from the release tag.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
+      # Keep the image in step with the `fullrust` job in ci.yml.
+      - name: Build
+        uses: KarpelesLab/fullrust@master
+        with:
+          image: ghcr.io/karpeleslab/fullrust:1.100
+          args: --release --bin httpsd
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-fullrust/release/httpsd
+          file "$bin"
+          if readelf -lW "$bin" | grep -Eq 'INTERP|DYNAMIC'; then
+            echo "::error::$bin is not a static binary"; exit 1
+          fi
+          "$bin" --help >/dev/null
+          name="httpsd-$TAG-linux-x86_64"
+          mkdir "$name"
+          cp "$bin" README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" httpsd-"$TAG"-linux-x86_64.tar.gz* --clobber

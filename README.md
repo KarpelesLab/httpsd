@@ -32,6 +32,12 @@ or as a command-line server that serves a directory or a TOML config file.
 
 ## Quick start (CLI)
 
+Install with `cargo install httpsd`, or take the prebuilt Linux x86-64 binary
+attached to each [release](https://github.com/KarpelesLab/httpsd/releases). The
+release binary is built with [fullrust](https://github.com/KarpelesLab/fullrust):
+a fully static executable that links no libc and needs only the kernel, so the
+same file runs on any distribution.
+
 ```sh
 # Serve the current directory over HTTP on 127.0.0.1:8080
 httpsd
@@ -269,6 +275,30 @@ To use httpsd as a lean embeddable library — say, tokio HTTPS without the CLI:
 [dependencies]
 httpsd = { version = "0.1", default-features = false, features = ["rt-tokio", "tls", "compress"] }
 ```
+
+## Static, libc-free builds (fullrust)
+
+httpsd builds unmodified for
+[fullrust](https://github.com/KarpelesLab/fullrust)'s
+`x86_64-unknown-linux-fullrust` target, whose standard library talks to the
+kernel through raw syscalls instead of libc. This is how the release binaries
+are made:
+
+```sh
+docker run --rm -v "$PWD":/src ghcr.io/karpeleslab/fullrust:1.100 build --release --bin httpsd
+# -> target/x86_64-unknown-linux-fullrust/release/httpsd
+```
+
+CI builds and tests the default feature set on that target. Two things differ
+from a libc build:
+
+- `--user NAME` / `[privdrop]` resolve user and group names from `/etc/passwd`
+  and `/etc/group` only (no NSS — LDAP/SSSD accounts need a numeric id), and the
+  privilege drop needs `/proc` mounted, since httpsd applies it to every thread
+  itself.
+- The `rt-tokio` and `rt-mio` runtimes depend on fullrust's patched tokio/mio,
+  which currently trail the versions httpsd requires; use the default
+  thread-pool runtime.
 
 ## Capabilities & limits
 

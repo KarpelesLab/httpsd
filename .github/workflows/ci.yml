@@ -84,6 +84,40 @@ jobs:
       - name: Everything
         run: cargo build --all-features
 
+  # The release binaries are built with fullrust (libc-free, fully static:
+  # https://github.com/KarpelesLab/fullrust), so the default feature set must
+  # keep building and passing its tests on `x86_64-unknown-linux-fullrust`.
+  # That target is not in the `unix` family and has no libc: unix-only code has
+  # to name `target_os = "fullrust"` too. Keep the image in step with
+  # release-binaries.yml.
+  fullrust:
+    name: fullrust (libc-free static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test (default features)
+        uses: KarpelesLab/fullrust@master
+        with:
+          image: ghcr.io/karpeleslab/fullrust:1.100
+          command: test
+          args: --release --lib --bins --tests
+
+      - name: Build the binary
+        uses: KarpelesLab/fullrust@master
+        with:
+          image: ghcr.io/karpeleslab/fullrust:1.100
+          args: --release --bin httpsd
+
+      - name: The binary is static and runs
+        run: |
+          bin=target/x86_64-unknown-linux-fullrust/release/httpsd
+          file "$bin"
+          if readelf -lW "$bin" | grep -Eq 'INTERP|DYNAMIC'; then
+            echo "::error::$bin is not a static binary"; exit 1
+          fi
+          "$bin" --help >/dev/null
+
   msrv:
     name: MSRV (Rust 1.95)
     runs-on: ubuntu-latest
