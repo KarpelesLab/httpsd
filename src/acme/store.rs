@@ -182,7 +182,7 @@ fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         // Create the temp file atomically with the target mode and O_EXCL, so a
         // private key never exists on disk with a wider mode even briefly, and so
         // an existing symlink at `tmp` is refused rather than followed.
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fullrust"))]
         let mut f = {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
@@ -191,7 +191,7 @@ fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
                 .mode(mode)
                 .open(&tmp)?
         };
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, target_os = "fullrust")))]
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -213,14 +213,14 @@ fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     result
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "fullrust")))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
@@ -272,7 +272,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[test]
     fn key_files_are_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[test]
     fn cert_chain_is_0644() {
         use std::os::unix::fs::PermissionsExt;

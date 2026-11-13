@@ -82,7 +82,11 @@ toml = { version = "1.1", optional = true }
 tokio = { version = "1.54", optional = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 mio = { version = "1.2", optional = true, features = ["os-poll", "net"] }
 rsurl = { version = "0.1.19", optional = true }
-# Privilege-dropping syscalls (setuid/setgid/chroot, getpwnam_r/getgrnam_r).
+
+# Privilege-dropping syscalls (setuid/setgid/chroot, getpwnam_r/getgrnam_r) and
+# `openat2`. Unix only: Windows has no use for it, and the libc-free `fullrust`
+# target (not in the `unix` family) makes the same calls as raw syscalls.
+[target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.191", optional = true }
 
 [dev-dependencies]
@@ -91,3 +95,9 @@ compcol = { version = "0.7.6", default-features = false, features = ["std", "gzi
 
 [package.metadata.docs.rs]
 all-features = true
+
+# `target_os = "fullrust"` is the libc-free static Linux target
+# (https://github.com/KarpelesLab/fullrust). It is not in the `unix` family, so
+# unix-only code paths name it explicitly; stock rustc doesn't know the value.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("fullrust"))'] }

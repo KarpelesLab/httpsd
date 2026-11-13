@@ -459,7 +459,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// key is far more damaging than a leaked certificate, so over-permissive key
 /// files deserve a visible operator warning. Non-fatal so existing deployments
 /// keep working. No-op on non-Unix platforms (permission bits differ).
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 fn warn_if_key_world_readable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
@@ -476,7 +476,7 @@ fn warn_if_key_world_readable(path: &std::path::Path) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "fullrust")))]
 fn warn_if_key_world_readable(_path: &std::path::Path) {}
 
 /// Collect every `CERTIFICATE` block's DER, in order.

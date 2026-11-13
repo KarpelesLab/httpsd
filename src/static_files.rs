@@ -21,12 +21,14 @@ use crate::proto::{Body, Method, Request, Response, StatusCode};
 ///
 /// This module is the other scoped `unsafe` user besides `privdrop`; it opts
 /// back in under the crate's `deny(unsafe_code)` with a local `allow`.
-#[cfg(all(feature = "hardened-fs", target_os = "linux"))]
+#[cfg(all(
+    feature = "hardened-fs",
+    any(target_os = "linux", target_os = "fullrust")
+))]
 #[allow(unsafe_code)]
 mod confined {
     use std::ffi::CString;
     use std::io;
-    use std::mem::size_of;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::path::Path;
@@ -35,9 +37,99 @@ mod confined {
     /// `RESOLVE_BENEATH`: reject any resolution step that would escape the
     /// dirfd (`..` above it, absolute paths, out-of-tree symlink targets).
     const RESOLVE_BENEATH: u64 = 0x08;
-    /// `openat2(2)` syscall number — identical (437) across all Linux
-    /// architectures, hardcoded because a matching libc const may be absent.
-    const SYS_OPENAT2: libc::c_long = 437;
+
+    /// The two raw kernel calls this module needs, behind one signature per
+    /// backend: `libc` on Linux proper, raw `syscall` instructions on the
+    /// libc-free `fullrust` target (x86-64 only, hence the literal flag values).
+    #[cfg(target_os = "linux")]
+    mod sys {
+        use super::OpenHow;
+        use std::ffi::CStr;
+        use std::io;
+        use std::mem::size_of;
+
+        pub const O_PATH_DIR: u64 = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+        pub const O_READ: u64 = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+        pub const ENOSYS: i32 = libc::ENOSYS;
+        /// `openat2(2)` syscall number — identical (437) across all Linux
+        /// architectures, hardcoded because a matching libc const may be absent.
+        const SYS_OPENAT2: libc::c_long = 437;
+
+        /// `open(path, flags)`, returning the raw fd.
+        pub fn open(path: &CStr, flags: u64) -> io::Result<i32> {
+            // SAFETY: `path` is a valid NUL-terminated C string; the return
+            // value is checked before use.
+            let fd = unsafe { libc::open(path.as_ptr(), flags as libc::c_int) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(fd)
+        }
+
+        /// `openat2(dirfd, rel, how, sizeof how)`, returning the raw fd.
+        pub fn openat2(dirfd: i32, rel: &CStr, how: &OpenHow) -> io::Result<i32> {
+            // SAFETY: `dirfd` is a valid open directory fd; `rel` is a valid
+            // NUL-terminated C string; `how` points to a live, correctly
+            // laid-out `struct open_how` and we pass its exact size.
+            let ret = unsafe {
+                libc::syscall(
+                    SYS_OPENAT2,
+                    dirfd,
+                    rel.as_ptr(),
+                    how as *const OpenHow,
+                    size_of::<OpenHow>(),
+                )
+            };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(ret as i32)
+        }
+    }
+
+    #[cfg(target_os = "fullrust")]
+    mod sys {
+        use super::OpenHow;
+        use std::ffi::CStr;
+        use std::io;
+        use std::mem::size_of;
+        use std::os::fullrust::syscall::{self, errno, nr};
+
+        // x86-64 Linux values (fullrust is x86-64 only).
+        const O_RDONLY: u64 = 0;
+        const O_DIRECTORY: u64 = 0o200_000;
+        const O_CLOEXEC: u64 = 0o2_000_000;
+        const O_PATH: u64 = 0o10_000_000;
+        pub const O_PATH_DIR: u64 = O_PATH | O_DIRECTORY | O_CLOEXEC;
+        pub const O_READ: u64 = O_RDONLY | O_CLOEXEC;
+        pub const ENOSYS: i32 = errno::ENOSYS;
+
+        /// `open(path, flags)`, returning the raw fd.
+        pub fn open(path: &CStr, flags: u64) -> io::Result<i32> {
+            // SAFETY: `path` is a valid NUL-terminated C string that outlives
+            // the call; the kernel only reads it.
+            let fd =
+                unsafe { syscall::syscall3(nr::OPEN, path.as_ptr() as usize, flags as usize, 0) }?;
+            Ok(fd as i32)
+        }
+
+        /// `openat2(dirfd, rel, how, sizeof how)`, returning the raw fd.
+        pub fn openat2(dirfd: i32, rel: &CStr, how: &OpenHow) -> io::Result<i32> {
+            // SAFETY: `dirfd` is a valid open directory fd; `rel` is a valid
+            // NUL-terminated C string; `how` points to a live, correctly
+            // laid-out `struct open_how` and we pass its exact size.
+            let fd = unsafe {
+                syscall::syscall4(
+                    nr::OPENAT2,
+                    dirfd as usize,
+                    rel.as_ptr() as usize,
+                    how as *const OpenHow as usize,
+                    size_of::<OpenHow>(),
+                )
+            }?;
+            Ok(fd as i32)
+        }
+    }
 
     /// Whether `openat2` is available on the running kernel: 0 = unknown,
     /// 1 = yes, 2 = no. Caches an `ENOSYS` result so an old kernel is probed
@@ -73,54 +165,30 @@ mod confined {
         let root_c = path_to_cstring(root)?;
         let rel_c = path_to_cstring(rel)?;
 
-        // Open the root as an `O_PATH` directory fd. SAFETY: `root_c` is a valid
-        // NUL-terminated C string; the flags are valid; the return value is
-        // checked below.
-        let raw_dir = unsafe {
-            libc::open(
-                root_c.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if raw_dir < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Wrap immediately so the dirfd is closed (RAII) on every return path.
+        // Open the root as an `O_PATH` directory fd, wrapped immediately so
+        // it is closed (RAII) on every return path.
+        let raw_dir = sys::open(&root_c, sys::O_PATH_DIR)?;
         // SAFETY: `raw_dir` is a fresh, owned, valid fd we just obtained.
         let dirfd = unsafe { std::fs::File::from_raw_fd(raw_dir) };
 
         let how = OpenHow {
-            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            flags: sys::O_READ,
             mode: 0,
             resolve: RESOLVE_BENEATH,
         };
 
-        // SAFETY: `dirfd` is a valid open directory fd; `rel_c` is a valid
-        // NUL-terminated C string; `&how` points to a live, correctly laid-out
-        // `struct open_how` and we pass its exact size. The return value is
-        // checked below before any use.
-        let ret = unsafe {
-            libc::syscall(
-                SYS_OPENAT2,
-                dirfd.as_raw_fd(),
-                rel_c.as_ptr(),
-                &how as *const OpenHow,
-                size_of::<OpenHow>(),
-            )
-        };
-
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOSYS) {
+        let raw = match sys::openat2(dirfd.as_raw_fd(), &rel_c, &how) {
+            Ok(fd) => fd,
+            Err(err) if err.raw_os_error() == Some(sys::ENOSYS) => {
                 SUPPORTED.store(2, Ordering::Relaxed);
                 return Ok(None);
             }
-            return Err(err);
-        }
+            Err(err) => return Err(err),
+        };
 
         SUPPORTED.store(1, Ordering::Relaxed);
-        // SAFETY: `ret` is a fresh, owned, valid fd returned by openat2.
-        let file = unsafe { std::fs::File::from_raw_fd(ret as libc::c_int) };
+        // SAFETY: `raw` is a fresh, owned, valid fd returned by openat2.
+        let file = unsafe { std::fs::File::from_raw_fd(raw) };
         Ok(Some(file))
     }
 }
@@ -264,7 +332,10 @@ impl StaticFiles {
     /// confined beneath the root so no symlink/rename race can escape. Returns
     /// Ok(None) when confined open is unavailable (non-Linux build, or a kernel
     /// without openat2) so the caller uses the canonicalize-based fallback.
-    #[cfg(all(feature = "hardened-fs", target_os = "linux"))]
+    #[cfg(all(
+        feature = "hardened-fs",
+        any(target_os = "linux", target_os = "fullrust")
+    ))]
     fn open_confined(&self, path: &Path) -> io::Result<Option<fs::File>> {
         // `resolve` builds `root + segments`, so stripping the root yields the
         // relative path to open beneath the root dirfd. If it somehow fails,
@@ -277,7 +348,10 @@ impl StaticFiles {
 
     /// Fallback stub on non-Linux builds or without `hardened-fs`: confined open
     /// is unavailable, so always fall back to the canonicalize-based path.
-    #[cfg(not(all(feature = "hardened-fs", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "hardened-fs",
+        any(target_os = "linux", target_os = "fullrust")
+    )))]
     fn open_confined(&self, path: &Path) -> io::Result<Option<fs::File>> {
         let _ = path;
         Ok(None)
@@ -664,7 +738,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fullrust"))]
     #[test]
     fn symlink_escape_is_404_not_403() {
         // A symlink inside the root that points to a real file OUTSIDE the root
@@ -712,7 +786,10 @@ mod tests {
 
     // --- confined-open (openat2 RESOLVE_BENEATH) tests -----------------------
 
-    #[cfg(all(feature = "hardened-fs", target_os = "linux"))]
+    #[cfg(all(
+        feature = "hardened-fs",
+        any(target_os = "linux", target_os = "fullrust")
+    ))]
     #[test]
     fn confined_serves_in_root_file() {
         // A normal in-root file is served (200) through the confined open path.
@@ -723,7 +800,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[cfg(all(feature = "hardened-fs", target_os = "linux"))]
+    #[cfg(all(
+        feature = "hardened-fs",
+        any(target_os = "linux", target_os = "fullrust")
+    ))]
     #[test]
     fn confined_symlink_escape_is_404() {
         // A symlink inside the root pointing OUTSIDE the root must be rejected
@@ -744,7 +824,10 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    #[cfg(all(feature = "hardened-fs", target_os = "linux"))]
+    #[cfg(all(
+        feature = "hardened-fs",
+        any(target_os = "linux", target_os = "fullrust")
+    ))]
     #[test]
     fn confined_allows_in_root_symlink() {
         // RESOLVE_BENEATH still permits legitimate symlinks that stay inside the
@@ -758,7 +841,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[cfg(all(feature = "hardened-fs", target_os = "linux"))]
+    #[cfg(all(
+        feature = "hardened-fs",
+        any(target_os = "linux", target_os = "fullrust")
+    ))]
     #[test]
     fn open_confined_unit() {
         // Direct unit test of open_confined / confined::open_beneath: an

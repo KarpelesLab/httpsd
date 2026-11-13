@@ -252,7 +252,7 @@ impl From<&str> for Body {
 /// Uses the platform positioned-read syscall so the file's own cursor is never
 /// touched (no shared-cursor race when an `Arc<File>` is streamed) and `offset`
 /// is always honored.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fullrust"))]
 fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buf, offset)

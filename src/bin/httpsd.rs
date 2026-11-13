@@ -56,13 +56,17 @@ static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
 /// which then reloads the ACME certificate cache.
 static RELOAD_REQ: AtomicBool = AtomicBool::new(false);
 
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+
 /// Signal handler. Runs in async-signal context, so it does ONLY
 /// async-signal-safe work: atomic stores (no allocation, no locks, no I/O).
-#[cfg(all(unix, feature = "privdrop"))]
-extern "C" fn handle_signal(sig: libc::c_int) {
+#[cfg(any(all(unix, feature = "privdrop"), target_os = "fullrust"))]
+extern "C" fn handle_signal(sig: i32) {
     match sig {
-        libc::SIGTERM | libc::SIGINT => SHUTDOWN_REQ.store(true, Ordering::SeqCst),
-        libc::SIGHUP => RELOAD_REQ.store(true, Ordering::SeqCst),
+        SIGTERM | SIGINT => SHUTDOWN_REQ.store(true, Ordering::SeqCst),
+        SIGHUP => RELOAD_REQ.store(true, Ordering::SeqCst),
         _ => {}
     }
 }
@@ -73,6 +77,9 @@ extern "C" fn handle_signal(sig: libc::c_int) {
 /// every CLI build; the no-op fallback below covers any exotic feature combo.
 #[cfg(all(unix, feature = "privdrop"))]
 fn install_signal_handlers() {
+    // The handler matches on the POSIX-universal numbers above.
+    const _: () =
+        assert!(libc::SIGHUP == SIGHUP && libc::SIGINT == SIGINT && libc::SIGTERM == SIGTERM);
     // SAFETY: `sigaction` with a valid, initialized `struct sigaction` whose
     // `sa_sigaction` points at our `extern "C"` handler. The handler only does
     // atomic stores, which are async-signal-safe. `SA_RESTART` transparently
@@ -82,15 +89,62 @@ fn install_signal_handlers() {
         action.sa_sigaction = handle_signal as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = libc::SA_RESTART;
-        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
             libc::sigaction(sig, &action, std::ptr::null_mut());
         }
     }
 }
 
+/// The libc-free `fullrust` target (x86-64 Linux, raw syscalls): the same
+/// handlers, installed with `rt_sigaction` directly.
+#[cfg(target_os = "fullrust")]
+fn install_signal_handlers() {
+    use std::os::fullrust::syscall::{self, nr};
+
+    const SA_RESTART: usize = 0x1000_0000;
+    const SA_RESTORER: usize = 0x0400_0000;
+
+    /// `rt_sigreturn` trampoline: x86-64 has no kernel-provided one, so every
+    /// handler must supply `sa_restorer`.
+    #[unsafe(naked)]
+    unsafe extern "C" fn restorer() -> ! {
+        core::arch::naked_asm!("mov eax, 15", "syscall", "ud2")
+    }
+
+    /// The kernel's `struct sigaction` on x86-64.
+    #[repr(C)]
+    struct KSigaction {
+        handler: usize,
+        flags: usize,
+        restorer: usize,
+        mask: u64,
+    }
+
+    let action = KSigaction {
+        handler: handle_signal as *const () as usize,
+        flags: SA_RESTART | SA_RESTORER,
+        restorer: restorer as *const () as usize,
+        mask: 0,
+    };
+    for sig in [SIGTERM, SIGINT, SIGHUP] {
+        // SAFETY: `action` is a live, correctly laid-out kernel sigaction and
+        // the last argument is the kernel sigset size (8 bytes). The handler
+        // only does atomic stores, which are async-signal-safe.
+        let _ = unsafe {
+            syscall::syscall4(
+                nr::RT_SIGACTION,
+                sig as usize,
+                &action as *const KSigaction as usize,
+                0,
+                8,
+            )
+        };
+    }
+}
+
 /// No-op fallback when `libc` is unavailable (e.g. `privdrop` disabled) or on a
 /// non-Unix target: the server simply runs without signal-driven shutdown.
-#[cfg(not(all(unix, feature = "privdrop")))]
+#[cfg(not(any(all(unix, feature = "privdrop"), target_os = "fullrust")))]
 fn install_signal_handlers() {}
 
 /// Spawn the watcher thread that owns the shutdown handle and the servers'
