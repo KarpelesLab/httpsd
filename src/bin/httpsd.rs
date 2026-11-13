@@ -56,8 +56,11 @@ static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
 /// which then reloads the ACME certificate cache.
 static RELOAD_REQ: AtomicBool = AtomicBool::new(false);
 
+#[cfg(any(all(unix, feature = "privdrop"), target_os = "fullrust"))]
 const SIGHUP: i32 = 1;
+#[cfg(any(all(unix, feature = "privdrop"), target_os = "fullrust"))]
 const SIGINT: i32 = 2;
+#[cfg(any(all(unix, feature = "privdrop"), target_os = "fullrust"))]
 const SIGTERM: i32 = 15;
 
 /// Signal handler. Runs in async-signal context, so it does ONLY
